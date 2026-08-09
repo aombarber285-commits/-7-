@@ -1,30 +1,17 @@
 from pathlib import Path
-import zipfile
-import py_compile
-import textwrap
 
-base = Path("/mnt/data/railway_bot_v24_3")
-base.mkdir(parents=True, exist_ok=True)
-
-main_code = r'''import os
+main_code = r'''import time
 import json
-import time
+import os
 import urllib.request
-import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime
 
 # ============================================================
-# RAILWAY BOT V24.3
-# 1m CLOSED-CANDLE + REAL 3-NEXT-CANDLE TRACKING
-# PAPER MODE + MEMORY + DISCORD
-#
+# RAILWAY BOT V24.2
 # IMPORTANT:
-# - ไม่ใช้ /mnt/data
-# - ไม่ส่งคำสั่งซื้อขายจริง
-# - ใช้แท่ง CLOSED เท่านั้นในการตัดสินใจ
-# - หลังเกิด SIGNAL จะติดตาม "3 แท่งปิดถัดไปจริง"
-# - ถ้าชนะในแท่งใดแท่งหนึ่ง => WIN ทันที
-# - ครบ 3 แท่งแล้วยังไม่ชนะ => LOSS
+# - ไฟล์นี้คือ BOT จริงสำหรับ Railway
+# - ห้ามใช้ /mnt/data ในไฟล์นี้
+# - Paper mode เท่านั้น ไม่ส่งออเดอร์จริง
 # ============================================================
 
 SYMBOLS = [
@@ -35,97 +22,74 @@ SYMBOLS = [
     "BNBUSDT",
 ]
 
-# สแกนทุก 15 วินาที เพื่อไม่พลาดตอนแท่ง 1m ปิด
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "15"))
-
-MIN_SCORE_THRESHOLD = float(os.getenv("MIN_SCORE_THRESHOLD", "80"))
-MIN_SCORE_GAP = float(os.getenv("MIN_SCORE_GAP", "15"))
-
-# Discord webhook ใส่ใน Railway Variables
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-
-DATA_DIR = os.getenv("DATA_DIR", ".")
-os.makedirs(DATA_DIR, exist_ok=True)
-
-MEMORY_FILE = os.path.join(DATA_DIR, "bot_memory_v24_3.json")
-
-BINANCE_BASE = "https://api.binance.com/api/v3/klines"
+PAPER_INTERVAL_SECONDS = 180
+MIN_SCORE_THRESHOLD = 80.0
+MIN_SCORE_GAP = 15.0
+MEMORY_FILE = "bot_memory_v24_3candles.json"
 
 
-# ============================================================
-# HTTP / DISCORD
-# ============================================================
-
-def http_get_json(url, timeout=15):
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Railway-Bot-V24.3",
-            "Accept": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def fetch_binance_klines(symbol, limit=120):
+def fetch_binance_klines(symbol, limit=100):
     try:
         url = (
-            f"{BINANCE_BASE}?symbol={symbol}"
-            f"&interval=1m&limit={limit}"
+            "https://api.binance.com/api/v3/klines"
+            f"?symbol={symbol}&interval=1m&limit={limit}"
         )
-        data = http_get_json(url, timeout=15)
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
 
-        candles = []
-        for row in data:
-            candles.append({
-                "timestamp": int(row[0]),
+        with urllib.request.urlopen(req, timeout=15) as response:
+            data = json.loads(response.read().decode("utf-8"))
+
+        return [
+            {
+                "timestamp": row[0],
                 "open": float(row[1]),
                 "high": float(row[2]),
                 "low": float(row[3]),
                 "close": float(row[4]),
                 "volume": float(row[5]),
-            })
-
-        return candles
+            }
+            for row in data
+        ]
 
     except Exception as e:
         print(f"[BINANCE ERROR] {symbol}: {e}", flush=True)
         return None
 
 
-def send_discord(message):
-    if not DISCORD_WEBHOOK_URL:
-        return
-
+def save_memory(memory):
     try:
-        payload = json.dumps({
-            "content": message[:1900]
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            DISCORD_WEBHOOK_URL,
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "Railway-Bot-V24.3",
-            },
-            method="POST",
-        )
-
-        with urllib.request.urlopen(req, timeout=10) as response:
-            response.read()
-
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(memory, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        print(f"[DISCORD ERROR] {e}", flush=True)
+        print(f"[MEMORY SAVE ERROR] {e}", flush=True)
 
 
-# ============================================================
-# MEMORY
-# ============================================================
+def init_memory():
+    if os.path.exists(MEMORY_FILE):
+        try:
+            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                memory = json.load(f)
 
-def default_memory():
-    return {
+            memory.setdefault("stats", {})
+            memory["stats"].setdefault("total_trades", 0)
+            memory["stats"].setdefault("wins", 0)
+            memory["stats"].setdefault("losses", 0)
+            memory["stats"].setdefault("draws", 0)
+            memory["stats"].setdefault("win_streak", 0)
+            memory["stats"].setdefault("loss_streak", 0)
+            memory["stats"].setdefault("best_win_streak", 0)
+            memory["stats"].setdefault("best_loss_streak", 0)
+            memory.setdefault("direction_memory", {})
+            memory.setdefault("recent_logs", [])
+            return memory
+
+        except Exception as e:
+            print(f"[MEMORY] โหลดไฟล์เดิมไม่ได้: {e}", flush=True)
+
+    memory = {
         "stats": {
             "total_trades": 0,
             "wins": 0,
@@ -140,275 +104,158 @@ def default_memory():
         "recent_logs": [],
     }
 
-
-def save_memory(memory):
-    try:
-        tmp = MEMORY_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(memory, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, MEMORY_FILE)
-    except Exception as e:
-        print(f"[MEMORY SAVE ERROR] {e}", flush=True)
-
-
-def load_memory():
-    if os.path.exists(MEMORY_FILE):
-        try:
-            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-                memory = json.load(f)
-
-            # กัน memory เก่าขาด key
-            base = default_memory()
-            base["stats"].update(memory.get("stats", {}))
-            base["direction_memory"].update(
-                memory.get("direction_memory", {})
-            )
-            base["recent_logs"] = memory.get("recent_logs", [])
-            return base
-
-        except Exception as e:
-            print(f"[MEMORY] โหลดไม่ได้: {e}", flush=True)
-
-    memory = default_memory()
     save_memory(memory)
-    print(">> 🧠 สร้าง Memory ใหม่", flush=True)
+    print(">> 🧠 เริ่มต้น Memory 3 แท่ง / 3 โอกาส", flush=True)
     return memory
 
 
-def record_trade_result(memory, trade, result, exit_price, exit_ts):
-    stats = memory["stats"]
-
-    stats["total_trades"] += 1
+def record_trade_result(memory, symbol, action, trend_key, result):
+    s = memory["stats"]
+    s["total_trades"] += 1
 
     if result == "WIN":
-        stats["wins"] += 1
-        stats["win_streak"] += 1
-        stats["loss_streak"] = 0
-        stats["best_win_streak"] = max(
-            stats["best_win_streak"],
-            stats["win_streak"],
+        s["wins"] += 1
+        s["win_streak"] += 1
+        s["loss_streak"] = 0
+        s["best_win_streak"] = max(
+            s["best_win_streak"], s["win_streak"]
         )
-    elif result == "LOSS":
-        stats["losses"] += 1
-        stats["loss_streak"] += 1
-        stats["win_streak"] = 0
-        stats["best_loss_streak"] = max(
-            stats["best_loss_streak"],
-            stats["loss_streak"],
-        )
-    else:
-        stats["draws"] += 1
 
-    key = (
-        f"{trade['symbol']}|"
-        f"{trade['action']}|"
-        f"{trade['trend_key']}"
-    )
+    elif result == "LOSS":
+        s["losses"] += 1
+        s["loss_streak"] += 1
+        s["win_streak"] = 0
+        s["best_loss_streak"] = max(
+            s["best_loss_streak"], s["loss_streak"]
+        )
+
+    else:
+        s["draws"] += 1
+
+    key = f"{symbol}|{action}|{trend_key}"
 
     row = memory["direction_memory"].setdefault(
         key,
         {"WIN": 0, "LOSS": 0, "DRAW": 0},
     )
+
     row[result] = int(row.get(result, 0)) + 1
 
-    decided = stats["wins"] + stats["losses"]
+    save_memory(memory)
+
+    decided = s["wins"] + s["losses"]
     win_rate = (
-        stats["wins"] / decided * 100.0
+        s["wins"] / decided * 100.0
         if decided
         else 0.0
     )
 
-    log = {
-        "time": datetime.now().isoformat(),
-        "symbol": trade["symbol"],
-        "action": trade["action"],
-        "entry": trade["entry_price"],
-        "exit": exit_price,
-        "signal_score": trade["score"],
-        "result": result,
-        "candles_used": trade["current_candle"],
-        "trend": trade["trend_key"],
-        "entry_timestamp": trade["entry_timestamp"],
-        "exit_timestamp": exit_ts,
-    }
-
-    memory["recent_logs"].append(log)
-    memory["recent_logs"] = memory["recent_logs"][-100:]
-
-    save_memory(memory)
-
-    print("\n" + "=" * 62, flush=True)
+    print("\n==================================================", flush=True)
+    print(f"📊 {symbol} | {action} => {result}", flush=True)
     print(
-        f"📊 RESULT | {trade['symbol']} | "
-        f"{trade['action']} | {result}",
+        f"ยอดรวม: {s['total_trades']} | "
+        f"ชนะ: {s['wins']} | แพ้: {s['losses']}",
         flush=True,
     )
     print(
-        f"Entry={trade['entry_price']} | Exit={exit_price} | "
-        f"Score={trade['score']}",
+        f"Win Rate: {win_rate:.2f}% | "
+        f"Win Streak: {s['win_streak']} | "
+        f"Loss Streak: {s['loss_streak']}",
         flush=True,
     )
-    print(
-        f"TOTAL={stats['total_trades']} | "
-        f"W={stats['wins']} | L={stats['losses']} | "
-        f"WR={win_rate:.2f}%",
-        flush=True,
-    )
-    print(
-        f"Streak W={stats['win_streak']} / "
-        f"L={stats['loss_streak']}",
-        flush=True,
-    )
-    print("=" * 62, flush=True)
-
-    emoji = "🟢" if result == "WIN" else "🔴"
-    send_discord(
-        f"{emoji} **V24.3 RESULT**\n"
-        f"**{trade['symbol']} {trade['action']}** → **{result}**\n"
-        f"Entry: `{trade['entry_price']}`\n"
-        f"Exit: `{exit_price}`\n"
-        f"Signal score: `{trade['score']}`\n"
-        f"Checked candles: `{trade['current_candle']}/3`\n"
-        f"Win Rate: `{win_rate:.2f}%`\n"
-        f"Total: `{stats['total_trades']}` | "
-        f"W `{stats['wins']}` / L `{stats['losses']}`"
-    )
+    print("==================================================", flush=True)
 
 
-# ============================================================
-# INDICATORS
-# ============================================================
-
-def ema_series(values, period):
-    if not values:
-        return []
-
-    alpha = 2.0 / (period + 1.0)
-    out = [values[0]]
-
-    for value in values[1:]:
-        out.append(
-            value * alpha + out[-1] * (1.0 - alpha)
-        )
-
-    return out
-
-
-def ema(values, period):
-    if not values:
+def ema(data, period):
+    if not data:
         return 0.0
 
-    period = min(period, len(values))
-    series = ema_series(values, period)
-    return series[-1]
+    multiplier = 2.0 / (period + 1.0)
+    value = data[0]
+
+    for price in data[1:]:
+        value = price * multiplier + value * (1.0 - multiplier)
+
+    return value
 
 
-def calculate_rsi(closes, period=14):
-    if len(closes) <= period:
-        return 50.0
+def calculate_indicators(candles):
+    # Binance แท่งสุดท้ายเป็นแท่งที่ยังวิ่งอยู่
+    # จึงตัดออก และวิเคราะห์เฉพาะ CLOSED candles
+    if len(candles) < 55:
+        return None
 
-    gains = []
-    losses = []
+    closed = candles[:-1]
 
-    for i in range(len(closes) - period, len(closes)):
+    closes = [x["close"] for x in closed]
+    highs = [x["high"] for x in closed]
+    lows = [x["low"] for x in closed]
+    volumes = [x["volume"] for x in closed]
+
+    ema20 = ema(closes[-20:], 20)
+    ema50 = ema(closes[-50:], 50)
+
+    ema200_period = min(len(closes), 200)
+    ema200 = ema(closes[-ema200_period:], ema200_period)
+
+    gains = 0.0
+    losses = 0.0
+
+    for i in range(-14, 0):
         diff = closes[i] - closes[i - 1]
-        gains.append(max(diff, 0.0))
-        losses.append(max(-diff, 0.0))
 
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
+        if diff > 0:
+            gains += diff
+        else:
+            losses -= diff
 
-    if avg_loss == 0:
-        return 100.0
+    avg_gain = gains / 14.0
+    avg_loss = losses / 14.0
 
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+    if avg_loss > 0:
+        rs = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+    else:
+        rsi = 100.0
 
+    # Lightweight MACD
+    fast_ema = ema(closes[-12:], 12)
+    slow_ema = ema(closes[-26:], 26)
+    macd_val = fast_ema - slow_ema
 
-def calculate_atr(candles, period=14):
-    if len(candles) < period + 1:
-        return 0.0
+    prev_fast = ema(closes[-13:-1], 12)
+    prev_slow = ema(closes[-27:-1], 26)
+    macd_sig = prev_fast - prev_slow
 
-    trs = []
+    atr = highs[-1] - lows[-1]
+    momentum = closes[-1] - closes[-5]
 
-    for i in range(len(candles) - period, len(candles)):
-        current = candles[i]
-        previous_close = candles[i - 1]["close"]
-
-        tr = max(
-            current["high"] - current["low"],
-            abs(current["high"] - previous_close),
-            abs(current["low"] - previous_close),
-        )
-        trs.append(tr)
-
-    return sum(trs) / len(trs)
-
-
-def calculate_indicators(all_candles):
-    # Binance ตัวท้ายสุด = current/open candle
-    # ดังนั้นตัดตัวท้ายทิ้งก่อนวิเคราะห์
-    if len(all_candles) < 80:
-        return None
-
-    closed = all_candles[:-1]
-
-    if len(closed) < 60:
-        return None
-
-    closes = [c["close"] for c in closed]
-    highs = [c["high"] for c in closed]
-    lows = [c["low"] for c in closed]
-    volumes = [c["volume"] for c in closed]
-
-    ema20_series = ema_series(closes, 20)
-    ema50_series = ema_series(closes, 50)
-    ema200_series = ema_series(closes, 200)
-
-    ema20 = ema20_series[-1]
-    ema50 = ema50_series[-1]
-    ema200 = ema200_series[-1]
-
-    # MACD 12/26 + signal 9
-    fast = ema_series(closes, 12)
-    slow = ema_series(closes, 26)
-
-    macd_line = [
-        fast[i] - slow[i]
-        for i in range(len(closes))
-    ]
-
-    signal_line = ema_series(macd_line, 9)
-
-    macd = macd_line[-1]
-    macd_signal = signal_line[-1]
-
-    rsi = calculate_rsi(closes, 14)
-    atr = calculate_atr(closed, 14)
-
-    momentum_5 = closes[-1] - closes[-6]
-    momentum_3 = closes[-1] - closes[-4]
-
-    avg_volume = (
-        sum(volumes[-20:]) / 20.0
-        if len(volumes) >= 20
-        else sum(volumes) / len(volumes)
-    )
-
+    vol_mean = sum(volumes[-10:]) / 10.0
     volume_ratio = (
-        volumes[-1] / avg_volume
-        if avg_volume > 0
+        volumes[-1] / vol_mean
+        if vol_mean > 0
         else 1.0
     )
 
-    # โครงสร้าง 3 จุดล่าสุด
-    hh = highs[-1] > highs[-2] > highs[-3]
-    hl = lows[-1] > lows[-2] > lows[-3]
-    lh = highs[-1] < highs[-2] < highs[-3]
-    ll = lows[-1] < lows[-2] < lows[-3]
+    hh = (
+        highs[-1] > highs[-2]
+        and highs[-2] > highs[-3]
+    )
 
-    bullish_body = closes[-1] > closed[-1]["open"]
-    bearish_body = closes[-1] < closed[-1]["open"]
+    hl = (
+        lows[-1] > lows[-2]
+        and lows[-2] > lows[-3]
+    )
+
+    lh = (
+        highs[-1] < highs[-2]
+        and highs[-2] < highs[-3]
+    )
+
+    ll = (
+        lows[-1] < lows[-2]
+        and lows[-2] < lows[-3]
+    )
 
     return {
         "price": closes[-1],
@@ -416,140 +263,112 @@ def calculate_indicators(all_candles):
         "ema50": ema50,
         "ema200": ema200,
         "rsi": rsi,
-        "macd": macd,
-        "macd_signal": macd_signal,
+        "macd_val": macd_val,
+        "macd_sig": macd_sig,
         "atr": atr,
-        "momentum_5": momentum_5,
-        "momentum_3": momentum_3,
+        "momentum": momentum,
         "volume_ratio": volume_ratio,
         "hh": hh,
         "hl": hl,
         "lh": lh,
         "ll": ll,
-        "bullish_body": bullish_body,
-        "bearish_body": bearish_body,
         "closed_timestamp": closed[-1]["timestamp"],
     }
-
-
-# ============================================================
-# SCORING BRAIN
-# ============================================================
-
-def memory_score(memory, symbol, action, trend_key):
-    key = f"{symbol}|{action}|{trend_key}"
-    hist = memory["direction_memory"].get(
-        key,
-        {"WIN": 0, "LOSS": 0},
-    )
-
-    wins = int(hist.get("WIN", 0))
-    losses = int(hist.get("LOSS", 0))
-    total = wins + losses
-
-    # ก่อนมีข้อมูล ให้ neutral 50
-    if total == 0:
-        return 50.0
-
-    # Laplace smoothing กัน memory ตัวอย่างเดียวทำคะแนนสุดโต่ง
-    return (wins + 1.0) / (total + 2.0) * 100.0
 
 
 def evaluate_brain(ind, symbol, memory):
     call = {}
     put = {}
 
-    # 1) Major trend
+    # Trend
     if ind["ema20"] > ind["ema50"] > ind["ema200"]:
-        call["TREND"] = 96
-        put["TREND"] = 8
-        trend_key = "BULL"
+        call["TREND"] = 95
+        put["TREND"] = 10
+
     elif ind["ema20"] < ind["ema50"] < ind["ema200"]:
-        call["TREND"] = 8
-        put["TREND"] = 96
-        trend_key = "BEAR"
-    elif ind["ema20"] > ind["ema50"]:
-        call["TREND"] = 72
-        put["TREND"] = 28
-        trend_key = "BULL"
-    elif ind["ema20"] < ind["ema50"]:
-        call["TREND"] = 28
-        put["TREND"] = 72
-        trend_key = "BEAR"
+        call["TREND"] = 10
+        put["TREND"] = 95
+
     else:
         call["TREND"] = 50
         put["TREND"] = 50
-        trend_key = "NEUTRAL"
 
-    # 2) Price vs EMA20
-    call["EMA"] = 92 if ind["price"] > ind["ema20"] else 25
-    put["EMA"] = 92 if ind["price"] < ind["ema20"] else 25
+    # EMA
+    call["EMA"] = 90 if ind["price"] > ind["ema20"] else 25
+    put["EMA"] = 90 if ind["price"] < ind["ema20"] else 25
 
-    # 3) MACD
-    if ind["macd"] > ind["macd_signal"]:
-        call["MACD"] = 90
-        put["MACD"] = 25
-    elif ind["macd"] < ind["macd_signal"]:
-        call["MACD"] = 25
-        put["MACD"] = 90
-    else:
-        call["MACD"] = 50
-        put["MACD"] = 50
+    # MACD
+    call["MACD"] = 88 if ind["macd_val"] > ind["macd_sig"] else 30
+    put["MACD"] = 88 if ind["macd_val"] < ind["macd_sig"] else 30
 
-    # 4) Momentum
-    if ind["momentum_5"] > 0 and ind["momentum_3"] > 0:
-        call["MOMENTUM"] = 92
-        put["MOMENTUM"] = 20
-    elif ind["momentum_5"] < 0 and ind["momentum_3"] < 0:
-        call["MOMENTUM"] = 20
-        put["MOMENTUM"] = 92
-    else:
-        call["MOMENTUM"] = 50
-        put["MOMENTUM"] = 50
+    # Momentum
+    call["MOMENTUM"] = 88 if ind["momentum"] > 0 else 25
+    put["MOMENTUM"] = 88 if ind["momentum"] < 0 else 25
 
-    # 5) Volume confirmation
-    volume = max(
+    # Volume
+    volume_score = max(
         20.0,
         min(100.0, ind["volume_ratio"] * 50.0),
     )
-    call["VOLUME"] = volume
-    put["VOLUME"] = volume
+    call["VOLUME"] = volume_score
+    put["VOLUME"] = volume_score
 
-    # 6) Market structure
+    # Structure
     if ind["hh"] and ind["hl"]:
-        call["STRUCTURE"] = 95
+        call["STRUCTURE"] = 92
         put["STRUCTURE"] = 15
+
     elif ind["lh"] and ind["ll"]:
         call["STRUCTURE"] = 15
-        put["STRUCTURE"] = 95
+        put["STRUCTURE"] = 92
+
     else:
         call["STRUCTURE"] = 50
         put["STRUCTURE"] = 50
 
-    # 7) RSI / exhaustion
-    if ind["rsi"] < 30:
+    # RSI / Pattern
+    if ind["rsi"] < 35:
         call["PATTERN"] = 88
-        put["PATTERN"] = 35
-    elif ind["rsi"] > 70:
-        call["PATTERN"] = 35
+        put["PATTERN"] = 30
+
+    elif ind["rsi"] > 65:
+        call["PATTERN"] = 30
         put["PATTERN"] = 88
-    elif 45 <= ind["rsi"] <= 60:
-        call["PATTERN"] = 65 if ind["momentum_3"] > 0 else 45
-        put["PATTERN"] = 65 if ind["momentum_3"] < 0 else 45
+
     else:
         call["PATTERN"] = 50
         put["PATTERN"] = 50
 
-    # 8) Candle body confirmation
-    call["CANDLE"] = 78 if ind["bullish_body"] else 35
-    put["CANDLE"] = 78 if ind["bearish_body"] else 35
-
-    # 9) Learned memory
-    call["MEMORY"] = memory_score(
-        memory, symbol, "CALL", trend_key
+    # Memory
+    trend_key = (
+        "BULL"
+        if ind["ema20"] > ind["ema50"]
+        else "BEAR"
     )
-    put["MEMORY"] = memory_score(
-        memory, symbol, "PUT", trend_key
+
+    c_hist = memory["direction_memory"].get(
+        f"{symbol}|CALL|{trend_key}",
+        {"WIN": 1, "LOSS": 1},
+    )
+
+    p_hist = memory["direction_memory"].get(
+        f"{symbol}|PUT|{trend_key}",
+        {"WIN": 1, "LOSS": 1},
+    )
+
+    c_total = c_hist.get("WIN", 0) + c_hist.get("LOSS", 0)
+    p_total = p_hist.get("WIN", 0) + p_hist.get("LOSS", 0)
+
+    call["MEMORY"] = (
+        c_hist.get("WIN", 0) / c_total * 100
+        if c_total
+        else 50
+    )
+
+    put["MEMORY"] = (
+        p_hist.get("WIN", 0) / p_total * 100
+        if p_total
+        else 50
     )
 
     call_final = sum(call.values()) / len(call)
@@ -559,13 +378,11 @@ def evaluate_brain(ind, symbol, memory):
         round(call_final, 2),
         round(put_final, 2),
         trend_key,
-        call,
-        put,
     )
 
 
 def analyze_market(symbol, memory):
-    candles = fetch_binance_klines(symbol, 120)
+    candles = fetch_binance_klines(symbol, 100)
 
     if not candles:
         return None
@@ -575,13 +392,11 @@ def analyze_market(symbol, memory):
     if not ind:
         return None
 
-    (
-        call_score,
-        put_score,
-        trend_key,
-        call_details,
-        put_details,
-    ) = evaluate_brain(ind, symbol, memory)
+    call_score, put_score, trend_key = evaluate_brain(
+        ind,
+        symbol,
+        memory,
+    )
 
     action = "WAIT"
     score = 0.0
@@ -609,345 +424,185 @@ def analyze_market(symbol, memory):
         "trend_key": trend_key,
         "price": ind["price"],
         "closed_timestamp": ind["closed_timestamp"],
-        "call_details": call_details,
-        "put_details": put_details,
     }
 
 
-# ============================================================
-# ACTIVE TRADE TRACKER
-# ============================================================
+def scan_all_symbols(memory):
+    results = []
 
-def check_active_trades(active_trades, memory):
-    finished = []
-
-    for symbol, trade in list(active_trades.items()):
-        candles = fetch_binance_klines(symbol, 5)
-
-        if not candles:
-            continue
-
-        closed = candles[:-1]
-
-        if not closed:
-            continue
-
-        latest = closed[-1]
-        latest_ts = latest["timestamp"]
-
-        # ต้องเป็น "แท่งใหม่จริง"
-        if latest_ts <= trade["last_checked_timestamp"]:
-            continue
-
-        trade["last_checked_timestamp"] = latest_ts
-        trade["current_candle"] += 1
-
-        current_price = latest["close"]
-        entry = trade["entry_price"]
-
-        if trade["action"] == "CALL":
-            candle_win = current_price > entry
-        else:
-            candle_win = current_price < entry
-
-        if candle_win:
-            trade["success_count"] += 1
-            status = "WIN"
-            emoji = "🟢"
-        else:
-            trade["fail_count"] += 1
-            status = "LOSS"
-            emoji = "🔴"
-
-        print(
-            f"{emoji} [{symbol}] "
-            f"{trade['action']} | "
-            f"NEXT CANDLE {trade['current_candle']}/3 | "
-            f"{status} | "
-            f"entry={entry} | close={current_price}",
-            flush=True,
-        )
-
-        # ชนะในแท่งใดก็ถือว่าไม้สำเร็จ
-        if candle_win:
-            record_trade_result(
-                memory,
-                trade,
-                "WIN",
-                current_price,
-                latest_ts,
-            )
-            finished.append(symbol)
-
-        # ครบ 3 แท่งแล้วไม่เคยชนะ = LOSS
-        elif trade["current_candle"] >= 3:
-            record_trade_result(
-                memory,
-                trade,
-                "LOSS",
-                current_price,
-                latest_ts,
-            )
-            finished.append(symbol)
-
-    for symbol in finished:
-        active_trades.pop(symbol, None)
-
-
-# ============================================================
-# SIGNAL SCANNER
-# ============================================================
-
-def send_signal(result):
-    action_emoji = "🟢" if result["action"] == "CALL" else "🔴"
-
-    message = (
-        f"{action_emoji} **V24.3 HIGH-SCORE SIGNAL**\n"
-        f"**{result['symbol']} — {result['action']}**\n"
-        f"Score: **{result['score']}**\n"
-        f"CALL: `{result['call_score']}` | "
-        f"PUT: `{result['put_score']}`\n"
-        f"Trend: `{result['trend_key']}`\n"
-        f"Entry: `{result['price']}`\n"
-        f"Closed candle: `{result['closed_timestamp']}`\n"
-        f"Mode: `PAPER / 3 NEXT CLOSED CANDLES`"
-    )
-
-    print("\n🚨 " + message.replace("\n", " | "), flush=True)
-    send_discord(message)
-
-
-def scan_for_signals(active_trades, memory, signal_history):
     for symbol in SYMBOLS:
         result = analyze_market(symbol, memory)
 
-        if not result:
-            continue
+        if result:
+            results.append(result)
 
-        print(
-            f"📡 {symbol} | "
-            f"CALL={result['call_score']} | "
-            f"PUT={result['put_score']} | "
-            f"FINAL={result['score'] if result['score'] else 'WAIT'} | "
-            f"CLOSED={result['closed_timestamp']}",
-            flush=True,
-        )
-
-        if result["action"] == "WAIT":
-            continue
-
-        if symbol in active_trades:
-            continue
-
-        # ป้องกัน signal ซ้ำบน closed candle เดิม
-        last_signal_ts = signal_history.get(symbol)
-
-        if last_signal_ts == result["closed_timestamp"]:
-            continue
-
-        signal_history[symbol] = result["closed_timestamp"]
-
-        trade = {
-            "symbol": symbol,
-            "action": result["action"],
-            "score": result["score"],
-            "entry_price": result["price"],
-            "trend_key": result["trend_key"],
-            "entry_timestamp": result["closed_timestamp"],
-
-            # สำคัญ:
-            # เริ่มนับจาก "แท่งถัดไป"
-            "current_candle": 0,
-            "success_count": 0,
-            "fail_count": 0,
-
-            # กันไม่ให้แท่ง signal ถูกนับเป็นแท่งผล
-            "last_checked_timestamp": result["closed_timestamp"],
-        }
-
-        active_trades[symbol] = trade
-
-        send_signal(result)
-
-        print(
-            f"🎯 [{symbol}] "
-            f"เริ่มติดตาม 3 แท่งถัดไปจริง | "
-            f"ENTRY={result['price']}",
-            flush=True,
-        )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def print_startup():
-    print("=" * 70, flush=True)
-    print("🤖 RAILWAY BOT V24.3", flush=True)
-    print("🧠 CLOSED-CANDLE + REAL 3-NEXT-CANDLE TRACKER", flush=True)
-    print("📚 PAPER MODE + MEMORY + DISCORD", flush=True)
-    print("=" * 70, flush=True)
-    print(f"Pairs: {', '.join(SYMBOLS)}", flush=True)
-    print(
-        f"Threshold={MIN_SCORE_THRESHOLD} | "
-        f"Gap={MIN_SCORE_GAP}",
-        flush=True,
-    )
-    print(
-        f"Scan every {SCAN_INTERVAL_SECONDS}s",
-        flush=True,
-    )
-    print(
-        f"Discord={'ON' if DISCORD_WEBHOOK_URL else 'OFF'}",
-        flush=True,
-    )
-    print(
-        f"Memory file={MEMORY_FILE}",
-        flush=True,
-    )
-    print("=" * 70, flush=True)
+    return results
 
 
 def run_bot():
-    print_startup()
+    print("==================================================", flush=True)
+    print("🤖 V24.2 RAILWAY BOT", flush=True)
+    print("🧠 CLOSED-CANDLE / 3-CANDLE / PAPER MODE", flush=True)
+    print("==================================================", flush=True)
+    print(f"Pairs: {', '.join(SYMBOLS)}", flush=True)
+    print(
+        f"Threshold: {MIN_SCORE_THRESHOLD} | "
+        f"Gap: {MIN_SCORE_GAP}",
+        flush=True,
+    )
+    print(
+        f"Scan interval: {PAPER_INTERVAL_SECONDS}s",
+        flush=True,
+    )
+    print("==================================================", flush=True)
 
-    memory = load_memory()
+    memory = init_memory()
     active_trades = {}
-    signal_history = {}
 
     while True:
-        try:
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        print(f"\n[🔍 {now}] SCAN START", flush=True)
+
+        # ====================================================
+        # 1. ตรวจผลสัญญาณที่กำลังติดตาม
+        # ====================================================
+        finished = []
+
+        for symbol, trade in list(active_trades.items()):
+            candles = fetch_binance_klines(symbol, 5)
+
+            if not candles:
+                continue
+
+            closed = candles[:-1]
+
+            if not closed:
+                continue
+
+            current = closed[-1]
+            current_price = current["close"]
+            current_ts = current["timestamp"]
+
+            # ไม่ตรวจแท่งเดิมซ้ำ
+            if current_ts == trade.get("last_checked_timestamp"):
+                continue
+
+            trade["last_checked_timestamp"] = current_ts
+            trade["current_candle"] += 1
+
+            entry_price = trade["price"]
+
+            if trade["action"] == "CALL":
+                candle_win = current_price > entry_price
+            else:
+                candle_win = current_price < entry_price
+
+            if candle_win:
+                trade["success_count"] += 1
+
+                print(
+                    f"🟢 [{symbol}] "
+                    f"แท่ง {trade['current_candle']}/3 WIN "
+                    f"price={current_price}",
+                    flush=True,
+                )
+
+            else:
+                trade["fail_count"] += 1
+
+                print(
+                    f"🔴 [{symbol}] "
+                    f"แท่ง {trade['current_candle']}/3 LOSS "
+                    f"price={current_price}",
+                    flush=True,
+                )
+
+            # ชนะในแท่งใดแท่งหนึ่ง = WIN
+            if candle_win:
+                record_trade_result(
+                    memory,
+                    symbol,
+                    trade["action"],
+                    trade["trend_key"],
+                    "WIN",
+                )
+                finished.append(symbol)
+
+            # ครบ 3 แท่งแล้วยังไม่ชนะ = LOSS
+            elif trade["current_candle"] >= 3:
+                record_trade_result(
+                    memory,
+                    symbol,
+                    trade["action"],
+                    trade["trend_key"],
+                    "LOSS",
+                )
+                finished.append(symbol)
+
+        for symbol in finished:
+            active_trades.pop(symbol, None)
+
+        # ====================================================
+        # 2. สแกน SIGNAL ใหม่
+        # ====================================================
+        for result in scan_all_symbols(memory):
+            symbol = result["symbol"]
+
+            display_final = (
+                result["score"]
+                if result["score"] > 0
+                else "WAIT"
+            )
 
             print(
-                f"\n[{now}] 🔍 NEW SCAN CYCLE | "
-                f"ACTIVE={len(active_trades)}",
+                f"📡 {symbol} | "
+                f"CALL={result['call_score']} | "
+                f"PUT={result['put_score']} | "
+                f"FINAL={display_final}",
                 flush=True,
             )
 
-            # 1. เช็คผลไม้ที่กำลังติดตาม
-            check_active_trades(
-                active_trades,
-                memory,
-            )
+            if (
+                result["action"] != "WAIT"
+                and symbol not in active_trades
+            ):
+                print("\n🚨 HIGH-SCORE SIGNAL", flush=True)
+                print(
+                    f"📌 {symbol} | "
+                    f"{result['action']} | "
+                    f"SCORE {result['score']} | "
+                    f"ENTRY {result['price']}",
+                    flush=True,
+                )
 
-            # 2. หา signal ใหม่
-            scan_for_signals(
-                active_trades,
-                memory,
-                signal_history,
-            )
+                active_trades[symbol] = {
+                    "symbol": symbol,
+                    "action": result["action"],
+                    "price": result["price"],
+                    "trend_key": result["trend_key"],
+                    "current_candle": 0,
+                    "success_count": 0,
+                    "fail_count": 0,
+                    # สำคัญ: ไม่ให้นับแท่งสัญญาณเป็นผลลัพธ์ซ้ำ
+                    "last_checked_timestamp": result["closed_timestamp"],
+                }
 
-            print(
-                f"⏳ Next scan in {SCAN_INTERVAL_SECONDS}s | "
-                f"ACTIVE={len(active_trades)}",
-                flush=True,
-            )
+        print(
+            f"⏳ รอรอบถัดไป {PAPER_INTERVAL_SECONDS} วินาที...",
+            flush=True,
+        )
 
-        except KeyboardInterrupt:
-            print("🛑 Stopped by user", flush=True)
-            break
-
-        except Exception as e:
-            print(
-                f"[MAIN LOOP ERROR] {type(e).__name__}: {e}",
-                flush=True,
-            )
-
-        time.sleep(SCAN_INTERVAL_SECONDS)
+        time.sleep(PAPER_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
     run_bot()
 '''
 
-dockerfile = """FROM python:3.12-slim
+path = Path("/mnt/data/main_v15_RAILWAY_READY.py")
+path.write_text(main_code, encoding="utf-8")
 
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
-
-WORKDIR /app
-
-COPY main_v15.py /app/main_v15.py
-
-CMD ["python", "-u", "/app/main_v15.py"]
-"""
-
-requirements = """# Standard library only
-"""
-
-dockerignore = """__pycache__/
-*.pyc
-.git/
-.env
-"""
-
-readme = """# Railway Bot V24.3
-
-## สิ่งที่แก้จาก V24.2
-
-1. ไม่ใช้ `/mnt/data`
-2. ใช้ Binance 1m
-3. วิเคราะห์เฉพาะ CLOSED candle
-4. Scan ทุก 15 วินาทีเพื่อรอจับแท่ง 1m ที่ปิด
-5. เมื่อเกิด SIGNAL จะเริ่มนับผลจาก "3 แท่งปิดถัดไปจริง"
-6. ไม่เอาแท่ง SIGNAL มานับเป็นผล
-7. ถ้าชนะในแท่งที่ 1/2/3 => WIN และปิดการติดตาม
-8. ถ้าครบ 3 แท่งแล้วยังไม่ชนะ => LOSS
-9. มี Memory JSON
-10. มี Discord webhook
-11. Paper mode เท่านั้น ไม่มีคำสั่งซื้อขายจริง
-
-## Railway Variables
-
-ใส่ตัวแปรนี้ถ้าต้องการ Discord:
-
-DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
-
-เลือกได้:
-
-SCAN_INTERVAL_SECONDS=15
-MIN_SCORE_THRESHOLD=80
-MIN_SCORE_GAP=15
-DATA_DIR=.
-
-## Discord
-
-ถ้าไม่ใส่ `DISCORD_WEBHOOK_URL` บอทยังรันได้ แต่จะไม่ส่ง Discord
-
-## สำคัญ
-
-Score 80-99 คือ "คะแนนจากระบบ" ไม่ใช่การรับประกัน win rate 80-99%
-"""
-
-files = {
-    "main_v15.py": main_code,
-    "Dockerfile": dockerfile,
-    "requirements.txt": requirements,
-    ".dockerignore": dockerignore,
-    "README.txt": readme,
-}
-
-for name, content in files.items():
-    (base / name).write_text(content, encoding="utf-8")
-
-# Compile test
-py_compile.compile(
-    str(base / "main_v15.py"),
-    doraise=True,
-)
-
-zip_path = Path("/mnt/data/railway_bot_v24_3_DEPLOY_READY.zip")
-with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-    for p in sorted(base.iterdir()):
-        z.write(p, p.name)
-
-print("✅ สร้าง V24.3 สำเร็จ")
-print(f"📦 {zip_path}")
-print("✅ Python compile ผ่าน")
-print("✅ ไม่มี /mnt/data อยู่ใน main_v15.py")
-print("✅ 1m CLOSED candle")
-print("✅ 3 แท่งถัดไปจริง")
-print("✅ Memory")
-print("✅ Discord webhook")
-print("✅ Dockerfile พร้อม Railway")
+print(f"สร้างไฟล์พร้อมทับแล้ว: {path}")
+print(f"ขนาด: {path.stat().st_size:,} bytes")
+print("นี่คือ main_v15.py ของ BOT จริง ไม่ใช่สคริปต์สร้าง ZIP")
