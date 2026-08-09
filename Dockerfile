@@ -1,10 +1,7 @@
-FROM python:3.12-slim
-
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY main_v15.py /app/main_v15.py
+COPY main_v15.py .
 
 CMD ["python", "-u", "main_v15.py"]
