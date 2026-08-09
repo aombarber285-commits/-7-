@@ -1,6 +1,10 @@
 from pathlib import Path
+import zipfile
 
-code = '''import os
+out = Path("/mnt/data/v15_railway_discord_fixed")
+out.mkdir(exist_ok=True)
+
+main_code = r'''import os
 import json
 import time
 import sqlite3
@@ -10,26 +14,22 @@ import urllib.parse
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import numpy as np
-
-
 # ============================================================
-# V15 ADAPTIVE PAPER TRAINER - FIXED V2
-# REAL ORDER IS ALWAYS OFF
-#
-# PAPER:
-# - เปิด PAPER ทุก 30 นาที
-# - วัดผลหลัง 2 นาที
-# - ถ้ามี V15 SIGNAL จะใช้ SIGNAL ก่อน
-# - ถ้าไม่มี SIGNAL และ FORCE_PAPER_TEST=True
-#   จะบังคับสร้าง PAPER TEST เพื่อทดสอบระบบ
+# V15 ADAPTIVE PAPER TRAINER - RAILWAY / DISCORD FIX
+# IMPORTANT:
+# - This file is the ACTUAL bot.
+# - Do NOT wrap this file inside: code = '''...'''
+# - REAL ORDERS ARE ALWAYS OFF.
 # ============================================================
 
 REAL_ORDER_ENABLED = False
 PAPER_TRAINING_ENABLED = True
 
-PAPER_INTERVAL_SECONDS = 30 * 60       # ทุก 30 นาที
-PAPER_HORIZON_SECONDS = 2 * 60         # เป้าหมายวัดผล 2 นาที
+# Test paper every 30 minutes.
+PAPER_INTERVAL_SECONDS = 30 * 60
+
+# Resolve after 2 minutes.
+PAPER_HORIZON_SECONDS = 2 * 60
 
 FORCE_PAPER_TEST = True
 AVOID_DUPLICATE_ACTIVE_PAIR = True
@@ -37,10 +37,8 @@ HEARTBEAT_INTERVAL_SECONDS = 5 * 60
 
 THAI_TZ = ZoneInfo("Asia/Bangkok")
 
-DISCORD_WEBHOOK_URL = os.getenv(
-    "DISCORD_WEBHOOK_URL",
-    "PASTE_YOUR_DISCORD_WEBHOOK_HERE"
-)
+# Railway -> Variables -> DISCORD_WEBHOOK_URL
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
 PAIRS = [
     ("BTC/USDT", "BTCUSDT"),
@@ -52,10 +50,6 @@ PAIRS = [
 ]
 
 
-# ============================================================
-# TIME
-# ============================================================
-
 def thai_text():
     return datetime.now(THAI_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -65,7 +59,7 @@ def thai_text():
 # ============================================================
 
 def discord_enabled():
-    u = (DISCORD_WEBHOOK_URL or "").strip()
+    u = DISCORD_WEBHOOK_URL
     return (
         u.startswith("https://discord.com/api/webhooks/")
         or u.startswith("https://discordapp.com/api/webhooks/")
@@ -73,77 +67,98 @@ def discord_enabled():
 
 
 def discord(msg):
+    """Send Discord webhook and never crash the main process."""
     if not discord_enabled():
-        print("[DISCORD OFF] Webhook URL is not configured.")
-        print(msg)
+        print("[DISCORD OFF] DISCORD_WEBHOOK_URL is missing/invalid.")
+        print("[DISCORD MESSAGE]", msg)
         return False
 
     try:
-        data = json.dumps({
-            "content": str(msg)[:1900]
+        payload = json.dumps({
+            "content": str(msg)[:1900],
+            "allowed_mentions": {"parse": []},
         }).encode("utf-8")
 
         req = urllib.request.Request(
             DISCORD_WEBHOOK_URL,
-            data=data,
+            data=payload,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "V15-Paper-Trainer/Fixed-V2"
+                "User-Agent": "V15-Paper-Trainer/2.0",
             },
-            method="POST"
+            method="POST",
         )
 
-        with urllib.request.urlopen(req, timeout=10) as r:
-            ok = r.status in (200, 204)
-            print(f"[DISCORD] HTTP {r.status}")
-            return ok
+        with urllib.request.urlopen(req, timeout=15) as response:
+            body = response.read().decode("utf-8", errors="ignore")
+            print(f"[DISCORD] HTTP {response.status} body={body[:200]}")
+            return response.status in (200, 204)
 
-    except Exception as e:
-        print("[DISCORD ERROR]", e)
+    except Exception as exc:
+        print("[DISCORD ERROR]", repr(exc))
         return False
 
 
+def discord_startup_test():
+    """Visible test so Railway logs immediately show Discord status."""
+    if not discord_enabled():
+        print("============================================================")
+        print("DISCORD ERROR: DISCORD_WEBHOOK_URL IS NOT CONFIGURED")
+        print("Railway -> Variables -> add DISCORD_WEBHOOK_URL")
+        print("============================================================")
+        return False
+
+    ok = discord(
+        "🚀 **V15 SYSTEM ONLINE — DISCORD TEST**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🟢 Process = `RUNNING`\n"
+        "🧪 PAPER = `ON`\n"
+        "🔒 REAL ORDER = `OFF`\n"
+        "🧪 Forced paper test = `ON`\n"
+        "⏱️ Paper cycle = `30 minutes`\n"
+        "⏱️ Result horizon = `2 minutes`\n"
+        f"🇹🇭 `{thai_text()}`"
+    )
+    print("[DISCORD STARTUP TEST]", "SUCCESS" if ok else "FAILED")
+    return ok
+
+
 # ============================================================
-# BINANCE DATA
+# BINANCE
 # ============================================================
 
 def fetch(symbol, interval="1m", limit=250):
     q = urllib.parse.urlencode({
         "symbol": symbol,
         "interval": interval,
-        "limit": limit
+        "limit": limit,
     })
-
     url = "https://api.binance.com/api/v3/klines?" + q
 
     try:
         req = urllib.request.Request(
             url,
-            headers={
-                "User-Agent": "V15-Paper-Trainer/Fixed-V2"
-            }
+            headers={"User-Agent": "V15-Paper-Trainer/2.0"},
         )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
 
-        with urllib.request.urlopen(req, timeout=8) as r:
-            data = json.loads(r.read().decode("utf-8"))
+        return [
+            [
+                int(x[0]),
+                float(x[1]),
+                float(x[2]),
+                float(x[3]),
+                float(x[4]),
+                float(x[5]),
+            ]
+            for x in data
+        ]
 
-        return [[
-            int(x[0]),
-            float(x[1]),
-            float(x[2]),
-            float(x[3]),
-            float(x[4]),
-            float(x[5])
-        ] for x in data]
-
-    except Exception as e:
-        print(f"[BINANCE ERROR] {symbol}/{interval}: {e}")
+    except Exception as exc:
+        print(f"[BINANCE ERROR] {symbol}/{interval}: {exc}")
         return []
 
-
-# ============================================================
-# CANDLE / INDICATORS
-# ============================================================
 
 def candle(k):
     o, h, l, c, v = k[1], k[2], k[3], k[4], k[5]
@@ -159,7 +174,7 @@ def candle(k):
         "up_wick": (h - max(o, c)) / rng * 100,
         "dn_wick": (min(o, c) - l) / rng * 100,
         "green": c > o,
-        "red": c < o
+        "red": c < o,
     }
 
 
@@ -173,8 +188,8 @@ def ema(values, n):
     a = 2 / (n + 1)
     x = values[0]
 
-    for v in values[1:]:
-        x = (v - x) * a + x
+    for value in values[1:]:
+        x = (value - x) * a + x
 
     return x
 
@@ -183,22 +198,25 @@ def rsi(values, n=14):
     if len(values) < n + 1:
         return 50.0
 
-    d = np.diff(values)
+    gains = []
+    losses = []
 
-    g = np.where(d > 0, d, 0.0)
-    l = np.where(d < 0, -d, 0.0)
+    for i in range(1, len(values)):
+        d = values[i] - values[i - 1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
 
-    ag = np.mean(g[:n])
-    al = np.mean(l[:n])
+    avg_gain = sum(gains[:n]) / n
+    avg_loss = sum(losses[:n]) / n
 
-    for i in range(n, len(d)):
-        ag = (ag * (n - 1) + g[i]) / n
-        al = (al * (n - 1) + l[i]) / n
+    for i in range(n, len(gains)):
+        avg_gain = (avg_gain * (n - 1) + gains[i]) / n
+        avg_loss = (avg_loss * (n - 1) + losses[i]) / n
 
-    if al == 0:
+    if avg_loss == 0:
         return 100.0
 
-    return 100 - 100 / (1 + ag / al)
+    return 100 - 100 / (1 + avg_gain / avg_loss)
 
 
 def atr_pct(p, n=14):
@@ -213,35 +231,23 @@ def atr_pct(p, n=14):
         h = closed[i]["h"]
         l = closed[i]["l"]
         pc = closed[i - 1]["c"]
+        tr.append(max(h - l, abs(h - pc), abs(l - pc)))
 
-        tr.append(
-            max(
-                h - l,
-                abs(h - pc),
-                abs(l - pc)
-            )
-        )
+    return sum(tr[-n:]) / n / closed[-1]["c"] * 100
 
-    return np.mean(tr[-n:]) / closed[-1]["c"] * 100
-
-
-# ============================================================
-# MULTI TIMEFRAME
-# ============================================================
 
 def mtf(symbol):
-    out = []
+    result = []
 
     for tf in ("1h", "15m", "5m"):
         k = fetch(symbol, tf, 250)
 
         if len(k) < 200:
-            out.append("NEUTRAL")
+            result.append("NEUTRAL")
             continue
 
         p = [candle(x) for x in k]
         closes = [x["c"] for x in p[:-1]]
-
         c = p[-2]["c"]
 
         e20 = ema(closes, 20)
@@ -249,20 +255,14 @@ def mtf(symbol):
         e200 = ema(closes, 200)
 
         if c > e20 > e50 > e200:
-            out.append("BULLISH")
-
+            result.append("BULLISH")
         elif c < e20 < e50 < e200:
-            out.append("BEARISH")
-
+            result.append("BEARISH")
         else:
-            out.append("NEUTRAL")
+            result.append("NEUTRAL")
 
-    return tuple(out)
+    return tuple(result)
 
-
-# ============================================================
-# ANALYSIS
-# ============================================================
 
 def analyze(symbol, name):
     k = fetch(symbol, "1m", 250)
@@ -273,14 +273,14 @@ def analyze(symbol, name):
             "symbol": symbol,
             "decision": "NO TRADE",
             "grade": "C",
-            "score": 0,
-            "trap": 100,
+            "score": 0.0,
+            "trap": 100.0,
             "regime": "UNKNOWN",
-            "mtf": ("NEUTRAL",) * 3,
+            "mtf": ("NEUTRAL", "NEUTRAL", "NEUTRAL"),
             "entry_time": 0,
-            "price": 0,
+            "price": 0.0,
             "rsi": 50.0,
-            "flags": ["DATA<220"]
+            "flags": ["DATA<220"],
         }
 
     p = [candle(x) for x in k]
@@ -294,10 +294,8 @@ def analyze(symbol, name):
 
     if atr > 1.2:
         regime = "HIGH_VOLATILITY"
-
     elif atr < 0.25:
         regime = "LOW_VOLATILITY"
-
     else:
         regime = "NORMAL"
 
@@ -309,14 +307,12 @@ def analyze(symbol, name):
     flags = []
 
     recent = closed[-32:-2]
-
     resistance = max(x["h"] for x in recent)
     support = min(x["l"] for x in recent)
 
     cur = closed[-1]
     action = None
 
-    # Liquidity sweep
     sweep_call = (
         cur["l"] < support
         and cur["c"] > support
@@ -331,7 +327,6 @@ def analyze(symbol, name):
         and cur["red"]
     )
 
-    # Break of structure
     highs = [x["h"] for x in closed[-8:-1]]
     lows = [x["l"] for x in closed[-8:-1]]
 
@@ -341,19 +336,15 @@ def analyze(symbol, name):
     if sweep_call or bos_call:
         action = "CALL"
         score += 25
-
     elif sweep_put or bos_put:
         action = "PUT"
         score += 25
 
-    # MTF confirmation
     if action == "CALL":
         if h == "BULLISH":
             score += 10
-
         if m15 == "BULLISH":
             score += 10
-
         if m5 == "BULLISH":
             score += 5
 
@@ -368,10 +359,8 @@ def analyze(symbol, name):
     elif action == "PUT":
         if h == "BEARISH":
             score += 10
-
         if m15 == "BEARISH":
             score += 10
-
         if m5 == "BEARISH":
             score += 5
 
@@ -383,43 +372,34 @@ def analyze(symbol, name):
             trap += 30
             flags.append("RSI Oversold")
 
-    # Candle strength
     if cur["body_pct"] >= 40:
         score += 10
 
-    # Volume
     vols = [x["v"] for x in p[-31:-2]]
 
     if vols:
-        z = (
-            cur["v"] - np.mean(vols)
-        ) / max(np.std(vols), 1e-12)
+        mean_v = sum(vols) / len(vols)
+        variance = sum((v - mean_v) ** 2 for v in vols) / len(vols)
+        std_v = variance ** 0.5
+        z = (cur["v"] - mean_v) / max(std_v, 1e-12)
 
         if z >= 2:
             score += 15
-
         elif z >= 1:
             score += 10
-
         elif z >= 0.5:
             score += 5
 
-    # Trap near levels
     if action == "CALL" and resistance > price:
-        distance = (resistance - price) / price * 100
-
-        if distance < atr * 0.45:
+        if (resistance - price) / price * 100 < atr * 0.45:
             trap += 65
             flags.append("CALL near resistance")
 
     if action == "PUT" and support < price:
-        distance = (price - support) / price * 100
-
-        if distance < atr * 0.45:
+        if (price - support) / price * 100 < atr * 0.45:
             trap += 65
             flags.append("PUT near support")
 
-    # Alignment
     aligned = (
         action == "CALL"
         and h == "BULLISH"
@@ -433,16 +413,13 @@ def analyze(symbol, name):
     if action and aligned and trap < 30 and score >= 70:
         grade = "A"
         decision = action
-
     elif action and score >= 55 and trap < 45:
         grade = "B"
         decision = "WAIT"
-
     else:
         grade = "C"
         decision = "NO TRADE"
 
-    # Normal V15 signal blocks unusual volatility.
     if regime != "NORMAL":
         decision = "NO TRADE"
         grade = "C"
@@ -461,23 +438,23 @@ def analyze(symbol, name):
         "entry_time": entry_time,
         "price": price,
         "rsi": rr,
-        "flags": flags
+        "flags": flags,
     }
 
 
 # ============================================================
-# SQLITE JOURNAL
+# SQLITE
 # ============================================================
 
 class Journal:
     def __init__(self):
         os.makedirs("./data", exist_ok=True)
-
         self.path = "./data/v15_sniper_journal.db"
         self.lock = threading.RLock()
 
         with sqlite3.connect(self.path) as c:
-            c.execute("""
+            c.execute(
+                """
                 CREATE TABLE IF NOT EXISTS paper(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ts TEXT,
@@ -493,50 +470,41 @@ class Journal:
                     exit REAL,
                     pnl REAL
                 )
-            """)
+                """
+            )
 
     def add(self, r, action, source):
         with self.lock, sqlite3.connect(self.path) as c:
-            cur = c.execute("""
+            cur = c.execute(
+                """
                 INSERT INTO paper
-                (
-                    ts,
-                    pair,
-                    action,
-                    entry,
-                    entry_time,
-                    score,
-                    grade,
-                    trap,
-                    source
-                )
+                (ts,pair,action,entry,entry_time,score,grade,trap,source)
                 VALUES(?,?,?,?,?,?,?,?,?)
-            """, (
-                thai_text(),
-                r["name"],
-                action,
-                r["price"],
-                r["entry_time"],
-                r["score"],
-                r["grade"],
-                r["trap"],
-                source
-            ))
-
+                """,
+                (
+                    thai_text(),
+                    r["name"],
+                    action,
+                    r["price"],
+                    r["entry_time"],
+                    r["score"],
+                    r["grade"],
+                    r["trap"],
+                    source,
+                ),
+            )
             return cur.lastrowid
 
     def finish(self, sid, result, exit_price, pnl):
         with self.lock, sqlite3.connect(self.path) as c:
-            c.execute("""
+            c.execute(
+                """
                 UPDATE paper
                 SET result=?, exit=?, pnl=?
                 WHERE id=?
-            """, (
-                result,
-                exit_price,
-                pnl,
-                sid
-            ))
+                """,
+                (result, exit_price, pnl, sid),
+            )
 
 
 journal = Journal()
@@ -549,34 +517,20 @@ journal = Journal()
 class Paper:
     def __init__(self):
         self.lock = threading.RLock()
-
         self.active = []
-
-        # 0 = first cycle runs immediately
-        self.last_cycle = 0
-
-        self.last_heartbeat = 0
+        self.last_cycle = 0.0
+        self.last_heartbeat = 0.0
         self.n = 0
-
-        self.session = {
-            "WIN": 0,
-            "LOSS": 0,
-            "DRAW": 0
-        }
+        self.session = {"WIN": 0, "LOSS": 0, "DRAW": 0}
 
     def active_symbol(self, symbol):
         with self.lock:
-            return any(
-                x["symbol"] == symbol
-                for x in self.active
-            )
+            return any(x["symbol"] == symbol for x in self.active)
 
     def best(self):
         rows = []
-        all_rows = []
 
         for name, symbol in PAIRS:
-
             if (
                 AVOID_DUPLICATE_ACTIVE_PAIR
                 and self.active_symbol(symbol)
@@ -588,31 +542,16 @@ class Paper:
 
                 real = r["decision"] in ("CALL", "PUT")
 
-                # ------------------------------------------------
-                # REAL V15 SIGNAL
-                # ------------------------------------------------
                 if real:
                     direction = r["decision"]
-
-                # ------------------------------------------------
-                # FORCE PAPER TEST
-                #
-                # สำคัญ:
-                # เดิม FORCE_PAPER_TEST=True แต่ logic ไม่ได้
-                # บังคับจริง เพราะมีการ skip regime ก่อนเลือก
-                #
-                # เวอร์ชันนี้เก็บ candidate ทุกตัวไว้ก่อน
-                # แล้วค่อยเลือก เพื่อให้ FORCE PAPER ทำงานจริง
-                # ------------------------------------------------
                 else:
+                    # Forced PAPER is allowed to choose a test direction.
                     h, m15, m5 = r["mtf"]
 
                     if h == "BULLISH" or m15 == "BULLISH":
                         direction = "CALL"
-
                     elif h == "BEARISH" or m15 == "BEARISH":
                         direction = "PUT"
-
                     else:
                         direction = (
                             "CALL"
@@ -620,81 +559,41 @@ class Paper:
                             else "PUT"
                         )
 
+                if r["regime"] in (
+                    "HIGH_VOLATILITY",
+                    "LOW_VOLATILITY",
+                    "UNKNOWN",
+                ):
+                    print(
+                        f"[SKIP REGIME] {name} {r['regime']}"
+                    )
+                    continue
+
                 rank = (
                     r["score"]
                     + (15 if real else 0)
                     - r["trap"] * 0.25
                 )
 
-                item = (
-                    rank,
-                    r,
-                    direction,
-                    real
-                )
-
-                all_rows.append(item)
-
-                # Candidate สำหรับ NORMAL regime
-                if r["regime"] == "NORMAL":
-                    rows.append(item)
+                rows.append((rank, r, direction, real))
 
                 print(
-                    f"[CANDIDATE] {name} "
-                    f"{direction} "
+                    f"[CANDIDATE] {name} {direction} "
                     f"grade={r['grade']} "
                     f"score={r['score']:.1f} "
                     f"trap={r['trap']:.1f} "
-                    f"regime={r['regime']} "
                     f"rank={rank:.1f}"
                 )
 
-            except Exception as e:
-                print(
-                    "[ANALYZE ERROR]",
-                    name,
-                    e
-                )
+            except Exception as exc:
+                print("[ANALYZE ERROR]", name, repr(exc))
 
-        # --------------------------------------------------------
-        # Priority 1:
-        # ใช้ candidate NORMAL ก่อน
-        # --------------------------------------------------------
-        if rows:
-            return max(
-                rows,
-                key=lambda x: x[0]
-            )
+        if not rows:
+            return None
 
-        # --------------------------------------------------------
-        # Priority 2:
-        # ถ้าไม่มี NORMAL และ FORCE_PAPER_TEST=True
-        # ให้บังคับเลือก candidate ที่ดีที่สุด
-        # เพื่อให้ระบบทดสอบทุก 30 นาทีจริง
-        # --------------------------------------------------------
-        if FORCE_PAPER_TEST and all_rows:
-            forced = max(
-                all_rows,
-                key=lambda x: x[0]
-            )
-
-            rank, r, direction, real = forced
-
-            print(
-                "[FORCE PAPER TEST] "
-                f"{r['name']} "
-                f"{direction} "
-                f"regime={r['regime']}"
-            )
-
-            return forced
-
-        return None
+        return max(rows, key=lambda x: x[0])
 
     def open_cycle(self):
-        if not PAPER_TRAINING_ENABLED:
-            return
-
         now = time.time()
 
         if now - self.last_cycle < PAPER_INTERVAL_SECONDS:
@@ -703,58 +602,44 @@ class Paper:
         self.last_cycle = now
 
         print("=" * 60)
-        print(
-            "[PAPER CYCLE]",
-            thai_text()
-        )
+        print("[PAPER CYCLE]", thai_text())
 
         selected = self.best()
 
         if not selected:
             discord(
-                "⚠️ **V15 PAPER CYCLE**\\n"
-                "ไม่พบ Candidate สำหรับ PAPER\\n"
+                "⚠️ **V15 PAPER CYCLE**\n"
+                "ไม่พบ Candidate ที่เปิด PAPER ได้ในรอบนี้\n"
                 f"🇹🇭 `{thai_text()}`"
             )
             return
 
         rank, r, direction, real = selected
 
-        # ใช้ closed 1m candle เป็น entry
-        k = fetch(
-            r["symbol"],
-            "1m",
-            5
-        )
+        k = fetch(r["symbol"], "1m", 5)
 
         if len(k) < 2:
             discord(
-                f"⚠️ **V15 ENTRY DATA ERROR** "
-                f"`{r['name']}`\\n"
-                "ดึง 1m candle ไม่พอ"
+                f"⚠️ **V15 ENTRY DATA ERROR** `{r['name']}`\n"
+                "ดึง 1m ไม่พอ"
             )
             return
 
+        # Last CLOSED 1m candle.
         entry = k[-2]
-
         price = entry[4]
         entry_time = entry[0]
 
         self.n += 1
 
         pid = f"PAPER-{self.n:06d}"
-
         source = (
             "PAPER_V15_SIGNAL"
             if real
             else "PAPER_FORCED_TEST"
         )
 
-        sid = journal.add(
-            r,
-            direction,
-            source
-        )
+        sid = journal.add(r, direction, source)
 
         order = {
             "id": pid,
@@ -768,41 +653,34 @@ class Paper:
             "trap": r["trap"],
             "real": real,
             "source": source,
-
-            # เก็บเวลาเพื่อควบคุม paper lifecycle
-            "open_wall_time": time.time(),
-            "expire": (
-                time.time()
-                + PAPER_HORIZON_SECONDS
-            )
+            "expire": time.time() + PAPER_HORIZON_SECONDS,
         }
 
         with self.lock:
             self.active.append(order)
 
-        if real:
-            mode = "🟢 V15 SIGNAL"
-        else:
-            mode = "🟡 FORCED TEST"
+        mode = (
+            "🟢 V15 SIGNAL"
+            if real
+            else "🟡 FORCED TEST"
+        )
 
         discord(
-            "🧠 **V15 PAPER TRAINING OPEN**\\n"
-            "━━━━━━━━━━━━━━━━━━━━\\n"
-            f"🆔 `{pid}`\\n"
-            f"📌 `{r['name']}`\\n"
-            f"🎯 **{direction}**\\n"
-            f"🧪 {mode}\\n"
-            f"💵 Entry `{price:.8f}`\\n"
-            f"📊 Score `{r['score']:.1f}`\\n"
-            f"🛡️ Trap `{r['trap']:.1f}`\\n"
-            f"🏷️ Grade `{r['grade']}`\\n"
-            f"🌐 `{r['regime']}`\\n"
-            f"📈 MTF "
-            f"`{r['mtf'][0]} / "
-            f"{r['mtf'][1]} / "
-            f"{r['mtf'][2]}`\\n"
-            f"🇹🇭 `{thai_text()}`\\n\\n"
-            "⏱️ **วัดผลเป้าหมาย 2 นาที**\\n"
+            "🧠 **V15 PAPER TRAINING OPEN**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 `{pid}`\n"
+            f"📌 `{r['name']}`\n"
+            f"🎯 **{direction}**\n"
+            f"🧪 {mode}\n"
+            f"💵 Entry `{price:.8f}`\n"
+            f"📊 Score `{r['score']:.1f}`\n"
+            f"🛡️ Trap `{r['trap']:.1f}`\n"
+            f"🏷️ Grade `{r['grade']}`\n"
+            f"🌐 `{r['regime']}`\n"
+            f"📈 MTF `{r['mtf'][0]} / "
+            f"{r['mtf'][1]} / {r['mtf'][2]}`\n"
+            f"🇹🇭 `{thai_text()}`\n\n"
+            "⏱️ **วัดผลหลัง 2 นาที**\n"
             "❌ PAPER ONLY — REAL ORDER OFF"
         )
 
@@ -810,7 +688,9 @@ class Paper:
             "[PAPER OPEN]",
             pid,
             r["name"],
-            direction
+            direction,
+            "rank=",
+            rank,
         )
 
     def resolve(self):
@@ -819,130 +699,97 @@ class Paper:
 
         remain = []
 
-        for o in orders:
-
-            if time.time() < o["expire"]:
-                remain.append(o)
+        for order in orders:
+            if time.time() < order["expire"]:
+                remain.append(order)
                 continue
 
-            k = fetch(
-                o["symbol"],
-                "1m",
-                10
-            )
+            k = fetch(order["symbol"], "1m", 10)
 
             if len(k) < 3:
-                remain.append(o)
+                remain.append(order)
                 continue
 
-            # ----------------------------------------------------
-            # Entry = closed candle
-            #
-            # Entry candle timestamp = T
-            # T + 1m = candle หลัง entry
-            # T + 2m = candle ที่ต้องการใช้วัดผล
-            #
-            # ต้องรอ candle T+2m ปิดก่อน
-            # ดังนั้น wall-clock ต้อง >= T+3m
-            # ----------------------------------------------------
+            # We use the candle exactly +2 minutes after entry.
             target_time = (
-                o["entry_time"]
-                + 2 * 60 * 1000
+                order["entry_time"]
+                + PAPER_HORIZON_SECONDS * 1000
             )
 
             target = None
+            now_ms = int(time.time() * 1000)
 
             for x in k:
                 if (
                     x[0] == target_time
-                    and int(time.time() * 1000)
-                    >= x[0] + 60 * 1000
+                    and now_ms >= x[0] + 60000
                 ):
                     target = x
                     break
 
             if target is None:
-                remain.append(o)
+                remain.append(order)
                 continue
 
             exit_price = target[4]
-            entry_price = o["entry"]
+            entry = order["entry"]
 
-            if o["action"] == "CALL":
-                pnl = (
-                    (exit_price - entry_price)
-                    / entry_price
-                    * 100
-                )
+            if order["action"] == "CALL":
+                pnl = (exit_price - entry) / entry * 100
             else:
-                pnl = (
-                    (entry_price - exit_price)
-                    / entry_price
-                    * 100
-                )
+                pnl = (entry - exit_price) / entry * 100
 
             if pnl > 0:
                 result = "WIN"
-
             elif pnl < 0:
                 result = "LOSS"
-
             else:
                 result = "DRAW"
 
             journal.finish(
-                o["sid"],
+                order["sid"],
                 result,
                 exit_price,
-                pnl
+                pnl,
             )
 
             self.session[result] += 1
 
-            total = sum(
-                self.session.values()
-            )
-
+            total = sum(self.session.values())
             wr = (
-                self.session["WIN"]
-                / total
-                * 100
+                self.session["WIN"] / total * 100
                 if total
                 else 0
             )
 
-            if result == "WIN":
-                emoji = "✅"
-
-            elif result == "LOSS":
-                emoji = "❌"
-
-            else:
-                emoji = "➖"
+            emoji = (
+                "✅" if result == "WIN"
+                else "❌" if result == "LOSS"
+                else "➖"
+            )
 
             discord(
-                f"{emoji} **V15 PAPER RESULT**\\n"
-                "━━━━━━━━━━━━━━━━━━━━\\n"
-                f"🆔 `{o['id']}`\\n"
-                f"📌 `{o['name']}`\\n"
-                f"🎯 `{o['action']}`\\n"
-                f"💵 Entry `{entry_price:.8f}`\\n"
-                f"💵 Exit `{exit_price:.8f}`\\n"
-                f"📈 **{result}**\\n"
-                f"💰 P/L `{pnl:+.4f}%`\\n"
-                f"📚 SESSION "
-                f"W `{self.session['WIN']}` / "
+                f"{emoji} **V15 PAPER RESULT**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"🆔 `{order['id']}`\n"
+                f"📌 `{order['name']}`\n"
+                f"🎯 `{order['action']}`\n"
+                f"💵 Entry `{entry:.8f}`\n"
+                f"💵 Exit `{exit_price:.8f}`\n"
+                f"📈 **{result}**\n"
+                f"💰 P/L `{pnl:+.4f}%`\n"
+                f"📚 SESSION W `{self.session['WIN']}` / "
                 f"L `{self.session['LOSS']}` / "
-                f"D `{self.session['DRAW']}`\\n"
-                f"🎯 Session WR `{wr:.1f}%`\\n"
+                f"D `{self.session['DRAW']}`\n"
+                f"🎯 Session WR `{wr:.1f}%`\n"
                 f"🇹🇭 `{thai_text()}`"
             )
 
             print(
                 "[PAPER RESULT]",
-                o["id"],
+                order["id"],
                 result,
-                f"{pnl:+.4f}%"
+                f"{pnl:+.4f}%",
             )
 
         with self.lock:
@@ -965,31 +812,23 @@ class Paper:
                     self.last_heartbeat = now
 
                     discord(
-                        "💓 **V15 SYSTEM HEARTBEAT**\\n"
-                        "━━━━━━━━━━━━━━━━━━━━\\n"
-                        "🟢 Process = `RUNNING`\\n"
-                        "🧪 Paper = `ON`\\n"
-                        "🔒 Real Order = `OFF`\\n"
-                        f"📦 Active Paper = "
-                        f"`{len(self.active)}`\\n"
-                        f"⏱️ Paper Interval = "
-                        f"`{PAPER_INTERVAL_SECONDS // 60} min`\\n"
-                        f"⏱️ Paper Horizon = "
-                        f"`{PAPER_HORIZON_SECONDS // 60} min`\\n"
-                        f"🧪 Force Test = "
-                        f"`{FORCE_PAPER_TEST}`\\n"
+                        "💓 **V15 SYSTEM HEARTBEAT**\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        "🟢 Process = `RUNNING`\n"
+                        "🧪 Paper = `ON`\n"
+                        "🔒 Real Order = `OFF`\n"
+                        f"📦 Active Paper = `{len(self.active)}`\n"
                         f"🇹🇭 `{thai_text()}`"
                     )
 
-            except Exception as e:
+            except Exception as exc:
                 print(
                     "[PAPER LOOP ERROR]",
-                    e
+                    repr(exc),
                 )
-
                 discord(
-                    "🚨 **V15 LOOP ERROR**\\n"
-                    f"`{str(e)[:500]}`\\n"
+                    "🚨 **V15 LOOP ERROR**\n"
+                    f"`{str(exc)[:500]}`\n"
                     f"🇹🇭 `{thai_text()}`"
                 )
 
@@ -1004,19 +843,12 @@ paper = Paper()
 # ============================================================
 
 def worker(name, symbol):
-    print(
-        f"[WORKER ONLINE] {name}"
-    )
-
+    print(f"[WORKER ONLINE] {name}")
     last = None
 
     while True:
         try:
-            k = fetch(
-                symbol,
-                "1m",
-                5
-            )
+            k = fetch(symbol, "1m", 5)
 
             if not k:
                 time.sleep(2)
@@ -1027,10 +859,7 @@ def worker(name, symbol):
             if current != last:
                 last = current
 
-                r = analyze(
-                    symbol,
-                    name
-                )
+                r = analyze(symbol, name)
 
                 print(
                     f"[MASTER] {name} "
@@ -1040,7 +869,6 @@ def worker(name, symbol):
                     f"trap={r['trap']:.1f}"
                 )
 
-                # เฉพาะ MASTER SIGNAL คุณภาพสูง
                 if (
                     r["decision"] in ("CALL", "PUT")
                     and r["grade"] in ("A", "A+")
@@ -1048,25 +876,22 @@ def worker(name, symbol):
                 ):
                     discord(
                         f"🏆 **V15 MASTER SIGNAL — "
-                        f"{r['grade']}**\\n"
-                        "━━━━━━━━━━━━━━━━━━━━\\n"
-                        f"📌 `{name}`\\n"
-                        f"🎯 **{r['decision']}**\\n"
-                        f"📊 Score `{r['score']:.1f}`\\n"
-                        f"🛡️ Trap `{r['trap']:.1f}`\\n"
-                        f"🌐 `{r['regime']}`\\n"
-                        f"📈 MTF "
-                        f"`{r['mtf'][0]} / "
-                        f"{r['mtf'][1]} / "
-                        f"{r['mtf'][2]}`\\n"
-                        f"🇹🇭 `{thai_text()}`\\n\\n"
+                        f"{r['grade']}**\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📌 `{name}`\n"
+                        f"🎯 **{r['decision']}**\n"
+                        f"📊 Score `{r['score']:.1f}`\n"
+                        f"🛡️ Trap `{r['trap']:.1f}`\n"
+                        f"🌐 `{r['regime']}`\n"
+                        f"📈 MTF `{r['mtf'][0]} / "
+                        f"{r['mtf'][1]} / {r['mtf'][2]}`\n"
+                        f"🇹🇭 `{thai_text()}`\n\n"
                         "🔒 **REAL ORDER = OFF**"
                     )
 
-        except Exception as e:
+        except Exception as exc:
             print(
-                f"[WORKER ERROR] "
-                f"{name}: {e}"
+                f"[WORKER ERROR] {name}: {repr(exc)}"
             )
 
         time.sleep(1.5)
@@ -1078,124 +903,96 @@ def worker(name, symbol):
 
 def start():
     print("=" * 60)
-    print(
-        "🚀 V15 ADAPTIVE PAPER TRAINING - FIXED V2"
-    )
+    print("🚀 V15 ADAPTIVE PAPER TRAINING - RAILWAY FIX")
     print("=" * 60)
-
-    # Safety lock
-    print(
-        "REAL ORDER =",
-        "OFF" if not REAL_ORDER_ENABLED else "ON"
-    )
-
-    print(
-        "PAPER =",
-        "ON" if PAPER_TRAINING_ENABLED else "OFF"
-    )
-
+    print("REAL ORDER =", REAL_ORDER_ENABLED)
+    print("PAPER =", PAPER_TRAINING_ENABLED)
     print(
         "PAPER INTERVAL =",
         PAPER_INTERVAL_SECONDS,
-        "seconds"
+        "seconds",
     )
-
     print(
         "PAPER HORIZON =",
         PAPER_HORIZON_SECONDS,
-        "seconds"
+        "seconds",
     )
-
+    print("FORCE PAPER TEST =", FORCE_PAPER_TEST)
+    print("THAI TIME =", thai_text())
     print(
-        "FORCE PAPER TEST =",
-        FORCE_PAPER_TEST
+        "DISCORD CONFIGURED =",
+        discord_enabled(),
     )
 
-    print(
-        "DISCORD =",
-        "CONNECTED" if discord_enabled()
-        else "NOT CONFIGURED"
-    )
+    discord_startup_test()
 
-    print(
-        "THAI TIME =",
-        thai_text()
-    )
-
-    # --------------------------------------------------------
-    # Safety check:
-    # Real order must remain OFF.
-    # --------------------------------------------------------
-    if REAL_ORDER_ENABLED:
-        print(
-            "🚨 WARNING: REAL_ORDER_ENABLED=True"
-        )
-    else:
-        print(
-            "🔒 SAFETY: REAL ORDER DISABLED"
-        )
-
-    if discord_enabled():
-        ok = discord(
-            "🚀 **V15 SYSTEM ONLINE — FIXED V2**\\n"
-            "━━━━━━━━━━━━━━━━━━━━\\n"
-            "🟢 Process = `RUNNING`\\n"
-            "🧪 PAPER = `ON`\\n"
-            "🧪 Every **30 minutes**\\n"
-            "⏱️ Result target **2 minutes**\\n"
-            f"🟡 FORCE PAPER TEST = "
-            f"`{FORCE_PAPER_TEST}`\\n"
-            "🔒 REAL ORDER = `OFF`\\n"
-            "📨 Discord = `CONNECTED`\\n"
-            f"🇹🇭 `{thai_text()}`"
-        )
-
-        print(
-            "[DISCORD START]",
-            ok
-        )
-
-    else:
-        print(
-            "⚠️ DISCORD WEBHOOK NOT CONFIGURED"
-        )
-        print(
-            "Set DISCORD_WEBHOOK_URL "
-            "in Railway Variables."
-        )
-
-    # Paper engine
     threading.Thread(
         target=paper.loop,
+        name="paper-loop",
         daemon=True,
-        name="paper-engine"
     ).start()
 
-    # Master workers
     for name, symbol in PAIRS:
         threading.Thread(
             target=worker,
             args=(name, symbol),
+            name=f"worker-{symbol}",
             daemon=True,
-            name=f"worker-{symbol}"
         ).start()
+        time.sleep(0.5)
 
-        time.sleep(0.3)
+    print("[START] All workers started.")
 
-
-# ============================================================
-# MAIN
-# ============================================================
 
 if __name__ == "__main__":
     start()
 
+    # Keep Railway process alive forever.
     while True:
         time.sleep(3600)
 '''
 
-path = Path("/mnt/data/v15_adaptive_paper_training_FIXED_V2.py")
-path.write_text(code, encoding="utf-8")
+requirements = """# V15 Railway dependencies
+# Python 3.13 compatible
+numpy>=2.1,<3
+"""
 
-print(f"สร้างไฟล์สำเร็จ: {path}")
-print("แก้หลัก: FORCE_PAPER_TEST ทำงานจริง, ถ้าไม่มี NORMAL candidate จะเลือก candidate ที่ดีที่สุดเพื่อทดสอบ PAPER, REAL ORDER ยัง OFF")
+readme = """V15 Railway Discord Fixed
+
+IMPORTANT:
+1. Replace the repository's main.py with main.py from this folder.
+2. Do NOT paste the previous generator script containing:
+       from pathlib import Path
+       code = ''' ... '''
+   into main.py.
+   main.py must start directly with imports such as "import os".
+3. In Railway, add a Variable:
+       DISCORD_WEBHOOK_URL = <your Discord webhook URL>
+4. Deploy/redeploy.
+5. Open Railway Logs.
+6. You MUST see:
+       [DISCORD STARTUP TEST] SUCCESS
+   and Discord should immediately receive:
+       V15 SYSTEM ONLINE — DISCORD TEST
+
+The bot keeps REAL_ORDER_ENABLED=False.
+Paper training runs every 30 minutes.
+Result is evaluated after 2 minutes.
+
+If Discord still does not receive the startup message, check Railway Variables
+and make sure the webhook is copied exactly from Discord.
+"""
+
+(out / "main.py").write_text(main_code, encoding="utf-8")
+(out / "requirements.txt").write_text(requirements, encoding="utf-8")
+(out / "README_FIX.txt").write_text(readme, encoding="utf-8")
+
+zip_path = Path("/mnt/data/V15_Railway_Discord_FIXED.zip")
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for p in out.iterdir():
+        z.write(p, arcname=p.name)
+
+print("สร้างไฟล์แก้ไขแล้ว")
+print(zip_path)
+print("ไฟล์เดี่ยว:", out / "main.py")
+print("requirements:", out / "requirements.txt")
