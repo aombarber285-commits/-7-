@@ -1,18 +1,11 @@
 from pathlib import Path
 
+# สร้างไฟล์ main_v15.py พร้อมนำไปทับไฟล์เดิมบน GitHub/Railway
 main_code = r'''import time
 import json
 import os
 import urllib.request
 from datetime import datetime
-
-# ============================================================
-# RAILWAY BOT V24.2
-# IMPORTANT:
-# - ไฟล์นี้คือ BOT จริงสำหรับ Railway
-# - ห้ามใช้ /mnt/data ในไฟล์นี้
-# - Paper mode เท่านั้น ไม่ส่งออเดอร์จริง
-# ============================================================
 
 SYMBOLS = [
     "BTCUSDT",
@@ -140,7 +133,6 @@ def record_trade_result(memory, symbol, action, trend_key, result):
     )
 
     row[result] = int(row.get(result, 0)) + 1
-
     save_memory(memory)
 
     decided = s["wins"] + s["losses"]
@@ -180,8 +172,6 @@ def ema(data, period):
 
 
 def calculate_indicators(candles):
-    # Binance แท่งสุดท้ายเป็นแท่งที่ยังวิ่งอยู่
-    # จึงตัดออก และวิเคราะห์เฉพาะ CLOSED candles
     if len(candles) < 55:
         return None
 
@@ -218,7 +208,6 @@ def calculate_indicators(candles):
     else:
         rsi = 100.0
 
-    # Lightweight MACD
     fast_ema = ema(closes[-12:], 12)
     slow_ema = ema(closes[-26:], 26)
     macd_val = fast_ema - slow_ema
@@ -237,25 +226,10 @@ def calculate_indicators(candles):
         else 1.0
     )
 
-    hh = (
-        highs[-1] > highs[-2]
-        and highs[-2] > highs[-3]
-    )
-
-    hl = (
-        lows[-1] > lows[-2]
-        and lows[-2] > lows[-3]
-    )
-
-    lh = (
-        highs[-1] < highs[-2]
-        and highs[-2] < highs[-3]
-    )
-
-    ll = (
-        lows[-1] < lows[-2]
-        and lows[-2] < lows[-3]
-    )
+    hh = highs[-1] > highs[-2] and highs[-2] > highs[-3]
+    hl = lows[-1] > lows[-2] and lows[-2] > lows[-3]
+    lh = highs[-1] < highs[-2] and highs[-2] < highs[-3]
+    ll = lows[-1] < lows[-2] and lows[-2] < lows[-3]
 
     return {
         "price": closes[-1],
@@ -280,32 +254,25 @@ def evaluate_brain(ind, symbol, memory):
     call = {}
     put = {}
 
-    # Trend
     if ind["ema20"] > ind["ema50"] > ind["ema200"]:
         call["TREND"] = 95
         put["TREND"] = 10
-
     elif ind["ema20"] < ind["ema50"] < ind["ema200"]:
         call["TREND"] = 10
         put["TREND"] = 95
-
     else:
         call["TREND"] = 50
         put["TREND"] = 50
 
-    # EMA
     call["EMA"] = 90 if ind["price"] > ind["ema20"] else 25
     put["EMA"] = 90 if ind["price"] < ind["ema20"] else 25
 
-    # MACD
     call["MACD"] = 88 if ind["macd_val"] > ind["macd_sig"] else 30
     put["MACD"] = 88 if ind["macd_val"] < ind["macd_sig"] else 30
 
-    # Momentum
     call["MOMENTUM"] = 88 if ind["momentum"] > 0 else 25
     put["MOMENTUM"] = 88 if ind["momentum"] < 0 else 25
 
-    # Volume
     volume_score = max(
         20.0,
         min(100.0, ind["volume_ratio"] * 50.0),
@@ -313,38 +280,27 @@ def evaluate_brain(ind, symbol, memory):
     call["VOLUME"] = volume_score
     put["VOLUME"] = volume_score
 
-    # Structure
     if ind["hh"] and ind["hl"]:
         call["STRUCTURE"] = 92
         put["STRUCTURE"] = 15
-
     elif ind["lh"] and ind["ll"]:
         call["STRUCTURE"] = 15
         put["STRUCTURE"] = 92
-
     else:
         call["STRUCTURE"] = 50
         put["STRUCTURE"] = 50
 
-    # RSI / Pattern
     if ind["rsi"] < 35:
         call["PATTERN"] = 88
         put["PATTERN"] = 30
-
     elif ind["rsi"] > 65:
         call["PATTERN"] = 30
         put["PATTERN"] = 88
-
     else:
         call["PATTERN"] = 50
         put["PATTERN"] = 50
 
-    # Memory
-    trend_key = (
-        "BULL"
-        if ind["ema20"] > ind["ema50"]
-        else "BEAR"
-    )
+    trend_key = "BULL" if ind["ema20"] > ind["ema50"] else "BEAR"
 
     c_hist = memory["direction_memory"].get(
         f"{symbol}|CALL|{trend_key}",
@@ -361,24 +317,18 @@ def evaluate_brain(ind, symbol, memory):
 
     call["MEMORY"] = (
         c_hist.get("WIN", 0) / c_total * 100
-        if c_total
-        else 50
+        if c_total else 50
     )
 
     put["MEMORY"] = (
         p_hist.get("WIN", 0) / p_total * 100
-        if p_total
-        else 50
+        if p_total else 50
     )
 
     call_final = sum(call.values()) / len(call)
     put_final = sum(put.values()) / len(put)
 
-    return (
-        round(call_final, 2),
-        round(put_final, 2),
-        trend_key,
-    )
+    return round(call_final, 2), round(put_final, 2), trend_key
 
 
 def analyze_market(symbol, memory):
@@ -393,9 +343,7 @@ def analyze_market(symbol, memory):
         return None
 
     call_score, put_score, trend_key = evaluate_brain(
-        ind,
-        symbol,
-        memory,
+        ind, symbol, memory
     )
 
     action = "WAIT"
@@ -407,7 +355,6 @@ def analyze_market(symbol, memory):
     ):
         action = "CALL"
         score = call_score
-
     elif (
         put_score >= MIN_SCORE_THRESHOLD
         and put_score - call_score >= MIN_SCORE_GAP
@@ -432,7 +379,6 @@ def scan_all_symbols(memory):
 
     for symbol in SYMBOLS:
         result = analyze_market(symbol, memory)
-
         if result:
             results.append(result)
 
@@ -461,12 +407,8 @@ def run_bot():
 
     while True:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
         print(f"\n[🔍 {now}] SCAN START", flush=True)
 
-        # ====================================================
-        # 1. ตรวจผลสัญญาณที่กำลังติดตาม
-        # ====================================================
         finished = []
 
         for symbol, trade in list(active_trades.items()):
@@ -484,7 +426,6 @@ def run_bot():
             current_price = current["close"]
             current_ts = current["timestamp"]
 
-            # ไม่ตรวจแท่งเดิมซ้ำ
             if current_ts == trade.get("last_checked_timestamp"):
                 continue
 
@@ -500,17 +441,14 @@ def run_bot():
 
             if candle_win:
                 trade["success_count"] += 1
-
                 print(
                     f"🟢 [{symbol}] "
                     f"แท่ง {trade['current_candle']}/3 WIN "
                     f"price={current_price}",
                     flush=True,
                 )
-
             else:
                 trade["fail_count"] += 1
-
                 print(
                     f"🔴 [{symbol}] "
                     f"แท่ง {trade['current_candle']}/3 LOSS "
@@ -518,7 +456,6 @@ def run_bot():
                     flush=True,
                 )
 
-            # ชนะในแท่งใดแท่งหนึ่ง = WIN
             if candle_win:
                 record_trade_result(
                     memory,
@@ -529,7 +466,6 @@ def run_bot():
                 )
                 finished.append(symbol)
 
-            # ครบ 3 แท่งแล้วยังไม่ชนะ = LOSS
             elif trade["current_candle"] >= 3:
                 record_trade_result(
                     memory,
@@ -543,9 +479,6 @@ def run_bot():
         for symbol in finished:
             active_trades.pop(symbol, None)
 
-        # ====================================================
-        # 2. สแกน SIGNAL ใหม่
-        # ====================================================
         for result in scan_all_symbols(memory):
             symbol = result["symbol"]
 
@@ -584,7 +517,6 @@ def run_bot():
                     "current_candle": 0,
                     "success_count": 0,
                     "fail_count": 0,
-                    # สำคัญ: ไม่ให้นับแท่งสัญญาณเป็นผลลัพธ์ซ้ำ
                     "last_checked_timestamp": result["closed_timestamp"],
                 }
 
@@ -600,9 +532,9 @@ if __name__ == "__main__":
     run_bot()
 '''
 
-path = Path("/mnt/data/main_v15_RAILWAY_READY.py")
+path = Path("/mnt/data/main_v15.py")
 path.write_text(main_code, encoding="utf-8")
 
-print(f"สร้างไฟล์พร้อมทับแล้ว: {path}")
-print(f"ขนาด: {path.stat().st_size:,} bytes")
-print("นี่คือ main_v15.py ของ BOT จริง ไม่ใช่สคริปต์สร้าง ZIP")
+print(f"สร้างไฟล์สำหรับทับของเดิมเรียบร้อย: {path}")
+print(f"ขนาดไฟล์: {path.stat().st_size:,} bytes")
+print("ชื่อไฟล์ตรงกับที่ Railway/GitHub ใช้อยู่: main_v15.py")
