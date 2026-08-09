@@ -132,7 +132,7 @@ def discord_enabled():
         DISCORD_WEBHOOK_URL
         and
         DISCORD_WEBHOOK_URL.startswith(
-            "https://discord.com/api/webhooks/"
+            "[https://discord.com/api/webhooks/](https://discord.com/api/webhooks/)"
         )
     )
 
@@ -206,7 +206,7 @@ def fetch_klines(
     )
 
     url = (
-        "https://api.binance.com/api/v3/klines?"
+        "[https://api.binance.com/api/v3/klines](https://api.binance.com/api/v3/klines)?"
         + params
     )
 
@@ -2861,10 +2861,8 @@ class PaperTrainerV15:
         return rows[0]
 
 
-    # ========================================================
-    # OPEN PAPER
-    # ========================================================
-
+    # =================================================       # OPEN PAPER
+    # =================================================       
     def open_cycle(self):
 
         if not PAPER_TRAINING_ENABLED:
@@ -2960,8 +2958,7 @@ class PaperTrainerV15:
 
         # ========================================================
         # JOURNAL
-        # ========================================================
-
+        # =================================================       
         signal_id = (
             journal_engine.log_signal(
 
@@ -3138,10 +3135,8 @@ class PaperTrainerV15:
         return True
 
 
-    # ========================================================
-    # RESOLVE
-    # ========================================================
-
+    # =================================================       # RESOLVE
+    # =================================================       
     def resolve(self):
 
         with self.lock:
@@ -3435,10 +3430,8 @@ class PaperTrainerV15:
             self.active = remaining
 
 
-    # ========================================================
-    # LOOP
-    # ========================================================
-
+    # =================================================       # LOOP
+    # =================================================       
     def loop(self):
 
         while True:
@@ -3710,10 +3703,8 @@ def start_script_2_system():
     )
 
 
-    # ========================================================
-    # DISCORD START MESSAGE
-    # ========================================================
-
+    # =================================================       # DISCORD START MESSAGE
+    # =================================================       
     if discord_enabled():
 
         send_discord_signal_s2(
@@ -3754,10 +3745,8 @@ def start_script_2_system():
         )
 
 
-    # ========================================================
-    # START PAPER TRAINER
-    # ========================================================
-
+    # =================================================       # START PAPER TRAINER
+    # =================================================       
     threading.Thread(
 
         target=paper_trainer.loop,
@@ -3767,10 +3756,8 @@ def start_script_2_system():
     ).start()
 
 
-    # ========================================================
-    # START MASTER SIGNAL WORKERS
-    # ========================================================
-
+    # =================================================       # START MASTER SIGNAL WORKERS
+    # =================================================       
     for pair in PAIRS_S2:
 
         threading.Thread(
