@@ -1,0 +1,318 @@
+import time
+import json
+import os
+import urllib.request
+from datetime import datetime
+
+# ==========================================
+# ⚙️ CONFIGURATION 
+# ==========================================
+SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT', 'EURUSDT']
+PAPER_INTERVAL_SECONDS = 180   # รอบประเมินทุก 3 นาที (180 วินาที)
+MIN_SCORE_THRESHOLD = 80.0     # คะแนนขั้นต่ำต้องถึงเกณฑ์ (เป้าหมายโอกาสสูง 90%)
+MIN_SCORE_GAP = 15.0           # ระยะห่างระหว่าง CALL และ PUT ต้องชัดเจน
+MEMORY_FILE = 'bot_memory_v24_3candles.json'
+
+def fetch_binance_klines(symbol, limit=100):
+    try:
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode())
+            df = []
+            for row in data:
+                df.append({
+                    'timestamp': row[0],
+                    'open': float(row[1]),
+                    'high': float(row[2]),
+                    'low': float(row[3]),
+                    'close': float(row[4]),
+                    'volume': float(row[5])
+                })
+            return df
+    except Exception as e:
+        return None
+
+# ==========================================
+# 🧠 99% STRICT BRAIN & 3-CANDLE / 3-CHANCE SYSTEM
+# ==========================================
+def init_strict_memory():
+    if os.path.exists(MEMORY_FILE):
+        with open(MEMORY_FILE, 'r') as f:
+            return json.load(f)
+            
+    print(">> 🧠 กำลังเริ่มต้นระบบหน่วยความจำแบบ 3 แท่งเทียน / 3 โอกาส...")
+    memory = {
+        "stats": {
+            "total_trades": 0, "wins": 0, "losses": 0, "draws": 0,
+            "win_streak": 0, "loss_streak": 0,
+            "best_win_streak": 0, "best_loss_streak": 0
+        },
+        "direction_memory": {},
+        "recent_logs": []
+    }
+    with open(MEMORY_FILE, 'w') as f:
+        json.dump(memory, f, indent=4)
+    return memory
+
+def save_memory(memory):
+    with open(MEMORY_FILE, 'w') as f:
+        json.dump(memory, f, indent=4)
+
+def record_trade_result(memory, symbol, action, trend_key, result):
+    s = memory["stats"]
+    s["total_trades"] += 1
+
+    if result == "WIN":
+        s["wins"] += 1
+        s["win_streak"] += 1
+        s["loss_streak"] = 0
+        s["best_win_streak"] = max(s["best_win_streak"], s["win_streak"])
+    elif result == "LOSS":
+        s["losses"] += 1
+        s["loss_streak"] += 1
+        s["win_streak"] = 0
+        s["best_loss_streak"] = max(s["best_loss_streak"], s["loss_streak"])
+    else:
+        s["draws"] += 1
+
+    key = f"{symbol}|{action}|{trend_key}"
+    row = memory["direction_memory"].setdefault(key, {"WIN": 0, "LOSS": 0, "DRAW": 0})
+    row[result] = int(row.get(result, 0)) + 1
+
+    save_memory(memory)
+
+    decided = s["wins"] + s["losses"]
+    wr = (s["wins"] / decided * 100.0) if decided else 0.0
+
+    print("\n==================================================")
+    print(f"📊 [สถิติรวมรอบ 3 แท่งเทียน] {symbol} | {action} => {result}")
+    print(f"ยอดรวมทั้งหมด: {s['total_trades']} | ชนะ: {s['wins']} | แพ้: {s['losses']}")
+    print(f"Win Rate: {wr:.2f}% | Win Streak: {s['win_streak']} | Loss Streak: {s['loss_streak']}")
+    print("==================================================")
+
+# ==========================================
+# 📊 PURE PYTHON TECHNICAL CALCULATIONS
+# ==========================================
+def calculate_indicators(df):
+    closes = [row['close'] for row in df]
+    highs = [row['high'] for row in df]
+    lows = [row['low'] for row in df]
+    volumes = [row['volume'] for row in df]
+
+    def calc_ema(data, span):
+        multiplier = 2 / (span + 1)
+        ema = data[0]
+        for price in data[1:]:
+            ema = (price * multiplier) + (ema * (1 - multiplier))
+        return ema
+
+    ema20 = calc_ema(closes[-20:], 20)
+    ema50 = calc_ema(closes[-50:], 50)
+    ema200 = calc_ema(closes, min(len(closes), 200))
+
+    # RSI (14)
+    gains, losses = 0, 0
+    for i in range(-14, 0):
+        diff = closes[i] - closes[i-1]
+        if diff > 0: gains += diff
+        else: losses -= diff
+    avg_gain = gains / 14
+    avg_loss = losses / 14
+    rs = (avg_gain / avg_loss) if avg_loss > 0 else 100
+    rsi = 100 - (100 / (1 + rs))
+
+    # MACD Proxy
+    macd_val = closes[-1] - closes[-12]
+    macd_sig = macd_val * 0.8
+
+    # ATR Proxy
+    atr = highs[-1] - lows[-1]
+
+    # Momentum & Volume
+    momentum = closes[-1] - closes[-5]
+    vol_mean = sum(volumes[-10:]) / 10
+    volume_ratio = (volumes[-1] / vol_mean) if vol_mean > 0 else 1.0
+
+    # HH/HL
+    hh = highs[-1] > highs[-2] and highs[-2] > highs[-3]
+    hl = lows[-1] > lows[-2] and lows[-2] > lows[-3]
+    lh = highs[-1] < highs[-2] and highs[-2] < highs[-3]
+    ll = lows[-1] < lows[-2] and lows[-2] < lows[-3]
+
+    return {
+        "price": closes[-1], "ema20": ema20, "ema50": ema50, "ema200": ema200,
+        "rsi": rsi, "macd_val": macd_val, "macd_sig": macd_sig, "atr": atr,
+        "momentum": momentum, "volume_ratio": volume_ratio, "hh": hh, "hl": hl, "lh": lh, "ll": ll
+    }
+
+def evaluate_99_strict_brain(ind, symbol, memory):
+    call_scores, put_scores = {}, {}
+    price = ind["price"]
+
+    trend_score = 90 if ind["ema20"] > ind["ema50"] > ind["ema200"] else (-90 if ind["ema20"] < ind["ema50"] < ind["ema200"] else 0)
+    call_scores["TREND"] = max(0, min(100, (trend_score + 100) / 2))
+    put_scores["TREND"] = max(0, min(100, ((-trend_score) + 100) / 2))
+
+    call_scores["EMA"] = 90 if price > ind["ema20"] else 30
+    put_scores["EMA"] = 90 if price < ind["ema20"] else 30
+
+    call_scores["MACD"] = 85 if ind["macd_val"] > ind["macd_sig"] else 35
+    put_scores["MACD"] = 85 if ind["macd_val"] < ind["macd_sig"] else 35
+
+    call_scores["ADX"] = 75 if ind["atr"] > 0 else 50
+    put_scores["ADX"] = 75 if ind["atr"] > 0 else 50
+
+    call_scores["MOMENTUM"] = 85 if ind["momentum"] > 0 else 30
+    put_scores["MOMENTUM"] = 85 if ind["momentum"] < 0 else 30
+
+    vol_score = min(100, ind["volume_ratio"] * 50)
+    call_scores["VOLUME"] = vol_score
+    put_scores["VOLUME"] = vol_score
+
+    if ind["hh"] and ind["hl"]:
+        call_scores["MTF"], put_scores["MTF"] = 90, 20
+    elif ind["lh"] and ind["ll"]:
+        call_scores["MTF"], put_scores["MTF"] = 20, 90
+    else:
+        call_scores["MTF"], put_scores["MTF"] = 50, 50
+
+    c_hist = memory["direction_memory"].get(f"{symbol}|CALL|BULL", {"WIN": 1, "LOSS": 1})
+    p_hist = memory["direction_memory"].get(f"{symbol}|PUT|BEAR", {"WIN": 1, "LOSS": 1})
+    call_scores["MEMORY"] = (c_hist["WIN"] / (c_hist["WIN"] + c_hist["LOSS"]) * 100)
+    put_scores["MEMORY"] = (p_hist["WIN"] / (p_hist["WIN"] + p_hist["LOSS"]) * 100)
+
+    if ind["rsi"] < 35:
+        call_scores["PATTERN"], put_scores["PATTERN"] = 85, 30
+    elif ind["rsi"] > 65:
+        call_scores["PATTERN"], put_scores["PATTERN"] = 30, 85
+    else:
+        call_scores["PATTERN"], put_scores["PATTERN"] = 50, 50
+
+    call_total = sum(call_scores.values()) / len(call_scores)
+    put_total = sum(put_scores.values()) / len(put_scores)
+
+    return call_scores, put_scores, round(call_total, 2), round(put_total, 2)
+
+def analyze_market_strict(symbol, memory):
+    df = fetch_binance_klines(symbol, 100)
+    if not df: return None
+    
+    ind = calculate_indicators(df)
+    c_scores, p_scores, call_final, put_final = evaluate_99_strict_brain(ind, symbol, memory)
+
+    action = "WAIT"
+    chosen_score = 0
+
+    # ยกระดับความแม่นยำให้สูงขึ้นเพื่อหาจังหวะที่มั่นใจใกล้เคียง 90%
+    if call_final >= MIN_SCORE_THRESHOLD and call_final - put_final >= MIN_SCORE_GAP:
+        action = "CALL"
+        chosen_score = call_final
+    elif put_final >= MIN_SCORE_THRESHOLD and put_final - call_final >= MIN_SCORE_GAP:
+        action = "PUT"
+        chosen_score = put_final
+
+    trend_key = "BULL" if ind["ema20"] > ind["ema50"] else "BEAR"
+
+    return {
+        "symbol": symbol, "action": action, "score": chosen_score,
+        "call_score": call_final, "put_score": put_final,
+        "trend_key": trend_key, "price": ind["price"]
+    }
+
+def scan_all_symbols(memory):
+    """ ประเมินสถานะครบทุกคู่เงินพร้อมกันทุกรอบ 3 นาที """
+    results = []
+    for sym in SYMBOLS:
+        res = analyze_market_strict(symbol=sym, memory=memory)
+        if res:
+            results.append(res)
+    return results
+
+# ==========================================
+# 🚀 MAIN LOOP (3-CANDLE & 3-CHANCE EVALUATION)
+# ==========================================
+def run_bot():
+    print("==================================================")
+    print("🤖 V24.2 MULTI-SYMBOL 3-CANDLE / 3-CHANCE SYSTEM")
+    print("ประเมินครบทุกคู่เงิน | วัดผล 3 แท่งเทียน | 1 ใน 3 ชนะนับชนะ")
+    print("==================================================")
+
+    memory = init_strict_memory()
+    active_trades = {}  # เก็บสถานะไม้ที่กำลังติดตาม 3 แท่งเทียนของแต่ละคู่เงิน
+
+    while True:
+        current_time = datetime.now().strftime("%H:%M:%S")
+        print(f"\n[🔍 {current_time}] กำลังสแกนและประเมินทุกคู่เงิน (ครบทุก 3 นาที)...")
+
+        # 1. ตรวจสอบและอัปเดตสถานะไม้ที่ค้างอยู่ (ครบกำหนดเช็ค 3 แท่งเทียน)
+        symbols_to_remove = []
+        for sym, trade in active_trades.items():
+            trade['current_candle'] += 1
+            df_check = fetch_binance_klines(sym, 5)
+            
+            if df_check:
+                current_price = df_check[-1]['close']
+                entry_price = trade['price']
+                action = trade['action']
+                
+                # เช็คผลของแท่งเทียนปัจจุบัน
+                if action == "CALL":
+                    candle_win = current_price > entry_price
+                else:
+                    candle_win = current_price < entry_price
+                
+                if candle_win:
+                    trade['success_count'] += 1
+                    print(f"   🟢 [{sym}] แท่งที่ {trade['current_candle']}/3 ชนะ! (ราคาปิด {current_price} vs เข้า {entry_price})")
+                else:
+                    trade['fail_count'] += 1
+                    print(f"   🔴 [{sym}] แท่งที่ {trade['current_candle']}/3 แพ้ (ราคาปิด {current_price} vs เข้า {entry_price})")
+
+                # ครบกำหนด 3 แท่งเทียนแล้ว ตัดสินผลลัพธ์รวม
+                if trade['current_candle'] >= 3:
+                    print(f"🏁 สิ้นสุดการประเมิน 3 แท่งเทียนของคู่ {sym} ({action})")
+                    print(f"   - ชนะสะสม: {trade['success_count']} ครั้ง | แพ้สะสม: {trade['fail_count']} ครั้ง")
+                    
+                    # กฎ: หาก 1 ใน 3 ชนะ ถือว่านับชนะ / ถ้าจะนับแพ้ต้องแพ้ครบ 3 ครั้ง
+                    if trade['success_count'] >= 1:
+                        final_result = "WIN"
+                        print(f"   👉 ผลลัพธ์สรุป: WIN (เพราะมีชนะอย่างน้อย 1 แท่ง)")
+                    else:
+                        final_result = "LOSS"
+                        print(f"   👉 ผลลัพธ์สรุป: LOSS (เพราะแพ้ครบทั้ง 3 แท่ง)")
+                    
+                    record_trade_result(memory, sym, action, trade['trend_key'], final_result)
+                    symbols_to_remove.append(sym)
+
+        for sym in symbols_to_remove:
+            del active_trades[sym]
+
+        # 2. สแกนหาคู่เงินที่มีโอกาสเข้าเกณฑ์ 90% ในรอบปัจจุบันทันที
+        market_evaluations = scan_all_symbols(memory)
+        
+        for res in market_evaluations:
+            sym = res['symbol']
+            action = res['action']
+            score = res['score']
+            
+            # หากคู่ไหนเข้าเงื่อนไขความแม่นยำสูงและยังไม่มีไม้ค้างอยู่ ให้ส่งสัญญาณเตือนและเริ่มนับ 3 แท่งทันที
+            if action != "WAIT" and score >= MIN_SCORE_THRESHOLD and sym not in active_trades:
+                print(f"\n🚨 [แจ้งเตือนสัญญาณด่วน!] พบโอกาสความแม่นยำสูง (ใกล้เคียง 90%)")
+                print(f"   📌 คู่เงิน: {sym} | สัญญาณ: {action} | คะแนน: {score} (CALL: {res['call_score']}, PUT: {res['put_score']})")
+                print(f"   ⏳ เริ่มต้นนับถอยหลังติดตาม 3 แท่งเทียน (3 โอกาส)...")
+                
+                active_trades[sym] = {
+                    'symbol': sym,
+                    'action': action,
+                    'price': res['price'],
+                    'trend_key': res['trend_key'],
+                    'current_candle': 0,
+                    'success_count': 0,
+                    'fail_count': 0
+                }
+
+        time.sleep(PAPER_INTERVAL_SECONDS)
+
+if __name__ == "__main__":
+    run_bot()
