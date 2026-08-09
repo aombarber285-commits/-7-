@@ -1,5 +1,3 @@
-from pathlib import Path
-
 # สร้างไฟล์ main_v15.py พร้อมนำไปทับไฟล์เดิมบน GitHub/Railway
 main_code = r'''import time
 import json
