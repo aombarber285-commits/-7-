@@ -8,17 +8,15 @@ from datetime import datetime
 from pathlib import Path
 
 # ============================================================
-# SIGZY BRAIN V5.2 - FIXED RAILWAY / AI + DISCORD
-# PAPER TRADE | CRYPTO + FOREX
+# SIGZY BRAIN V5.2 - RAILWAY SAFE
+# MEMORY + AI FINAL CHECK
+# PAPER TRADE | CRYPTO + FOREX | DISCORD
 #
-# FIXES:
-# 1) Discord webhook URL is validated before sending.
-# 2) Gemini API uses current v1beta generateContent format.
-# 3) AI failure/rejection is NEVER silently bypassed.
-# 4) AI key/model can be configured with Railway variables.
-# 5) Existing memory files are preserved when found.
-# 6) Only CLOSED candles are evaluated.
-# 7) Opportunity 1 -> 2 -> 3 tracking is kept.
+# IMPORTANT:
+# - No /mnt/data paths
+# - Railway-safe local memory path
+# - Discord/Gemini variables are kept separate
+# - AI failure does NOT crash the bot
 # ============================================================
 
 CRYPTO = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"]
@@ -41,46 +39,32 @@ PAIR_WEAK_WR = 55.0
 PAIR_FAVOR_WR = 65.0
 PAIR_STRONG_WR = 70.0
 
-# ============================================================
-# RAILWAY VARIABLES
-# GEMINI_API_KEY=...
-# DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
-# GEMINI_MODEL=gemini-2.5-flash
-# AI_CONFIDENCE_THRESHOLD=75
-# ============================================================
-
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-try:
-    AI_CONFIDENCE_THRESHOLD = float(os.getenv("AI_CONFIDENCE_THRESHOLD", "75"))
-except Exception:
-    AI_CONFIDENCE_THRESHOLD = 75.0
-
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
+AI_CONFIDENCE_THRESHOLD = 75.0
+AI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+
+# Railway-safe directory: directory containing this Python file.
 BASE = Path(__file__).resolve().parent
-
-MEMORY_CANDIDATES = [
-    BASE / "bot_memory_sigzy_brain_v4_crypto_forex.json",
-    BASE / "bot_memory_sigzy_discord.json",
-    BASE / "bot_memory_sigzy_brain_v5.json",
-    BASE / "bot_memory_sigzy_brain_v5_2.json",
-]
-
-MEMORY_FILE = str(
-    next((p for p in MEMORY_CANDIDATES if p.exists()), MEMORY_CANDIDATES[-1])
-)
+MEMORY_FILE = BASE / "bot_memory_sigzy_v5_2.json"
 
 TUNING = {"DEFAULT": {"sr": 0.008, "zone": 0.015, "vol": 1.40}}
 
 for s in CRYPTO:
     TUNING[s] = {
-        "sr": {"BTCUSDT": .006, "ETHUSDT": .007, "SOLUSDT": .010,
-               "XRPUSDT": .010, "BNBUSDT": .008}[s],
-        "zone": {"BTCUSDT": .012, "ETHUSDT": .013, "SOLUSDT": .018,
-                 "XRPUSDT": .018, "BNBUSDT": .015}[s],
-        "vol": {"BTCUSDT": 1.35, "ETHUSDT": 1.35, "SOLUSDT": 1.45,
-                "XRPUSDT": 1.45, "BNBUSDT": 1.40}[s],
+        "sr": {
+            "BTCUSDT": .006, "ETHUSDT": .007, "SOLUSDT": .010,
+            "XRPUSDT": .010, "BNBUSDT": .008
+        }[s],
+        "zone": {
+            "BTCUSDT": .012, "ETHUSDT": .013, "SOLUSDT": .018,
+            "XRPUSDT": .018, "BNBUSDT": .015
+        }[s],
+        "vol": {
+            "BTCUSDT": 1.35, "ETHUSDT": 1.35, "SOLUSDT": 1.45,
+            "XRPUSDT": 1.45, "BNBUSDT": 1.40
+        }[s],
     }
 
 for s in FOREX:
@@ -97,164 +81,107 @@ for s in FOREX:
     }
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
 def discord(msg):
-    """Send Discord alert only when a valid webhook URL exists."""
+    """Send Discord alert. Never crash the main bot."""
     if not DISCORD_WEBHOOK_URL:
-        print("[DISCORD] DISCORD_WEBHOOK_URL missing.", flush=True)
+        print("[DISCORD] Webhook not configured.", flush=True)
         return False
 
     if not (
         DISCORD_WEBHOOK_URL.startswith("https://discord.com/api/webhooks/")
         or DISCORD_WEBHOOK_URL.startswith("https://discordapp.com/api/webhooks/")
     ):
-        print("[DISCORD] Invalid webhook URL. "
-              "Use https://discord.com/api/webhooks/...", flush=True)
+        print("[DISCORD ERROR] Invalid Discord webhook URL.", flush=True)
         return False
 
     try:
-        data = json.dumps({"content": msg}, ensure_ascii=False).encode("utf-8")
+        data = json.dumps({"content": msg}).encode("utf-8")
         req = urllib.request.Request(
             DISCORD_WEBHOOK_URL,
             data=data,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "SIGZY-BRAIN-V5.2"
+                "User-Agent": "SIGZY-V5.2"
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            status = getattr(resp, "status", 200)
-
-        if status in (200, 204):
-            print("[DISCORD] Sent.", flush=True)
-            return True
-
-        print(f"[DISCORD] HTTP {status}", flush=True)
-        return False
-
+        with urllib.request.urlopen(req, timeout=15):
+            pass
+        return True
     except Exception as e:
-        print("[DISCORD ERROR]", repr(e), flush=True)
+        print(f"[DISCORD ERROR] {e}", flush=True)
         return False
 
 
 def ai_final_check(symbol, action, setup, trend, candles):
     """
-    Gemini final filter.
-
-    IMPORTANT:
-    - Missing API key => signal is rejected, not bypassed.
-    - API error => signal is rejected, not bypassed.
-    - AI must return APPROVE + confidence >= threshold.
+    AI is an optional final filter.
+    Missing key, API error, malformed response, or timeout
+    will NOT crash the bot.
     """
-
     if not GEMINI_API_KEY:
-        print("[AI] GEMINI_API_KEY missing -> REJECT signal.", flush=True)
-        return False, "GEMINI_API_KEY_MISSING", 0.0
+        print("[AI] GEMINI_API_KEY missing -> AI bypass.", flush=True)
+        return True, "AI_BYPASS_NO_KEY", 100.0
 
-    recent_candles = []
+    recent = []
     for c in candles[-10:]:
-        recent_candles.append({
-            "open": round(float(c["open"]), 8),
-            "high": round(float(c["high"]), 8),
-            "low": round(float(c["low"]), 8),
-            "close": round(float(c["close"]), 8),
-            "volume": round(float(c["volume"]), 8),
+        recent.append({
+            "open": c["open"],
+            "high": c["high"],
+            "low": c["low"],
+            "close": c["close"],
+            "volume": c["volume"],
         })
 
     prompt = {
-        "task": "Technical confirmation for paper-trade binary/scalping signal",
+        "task": "Binary-options/scalping paper-trade confirmation",
         "symbol": symbol,
         "proposed_action": action,
         "setup_type": setup,
         "market_trend": trend,
-        "last_10_closed_candles": recent_candles,
-        "rules": [
-            "Analyze candle body, upper/lower wick, momentum, and reversal structure.",
-            "Do not invent market data.",
-            "APPROVE only when the proposed direction has convincing technical confirmation.",
-            "Return JSON only.",
-        ],
-        "required_output": {
-            "decision": "APPROVE or REJECT",
-            "confidence": "number from 0 to 100",
-            "reason": "short explanation"
-        }
+        "last_10_closed_candles": recent,
+        "instructions": (
+            "Analyze price action, candle bodies, upper/lower wicks, "
+            "momentum and reversal structure. Do not invent data. "
+            "Return JSON only: decision APPROVE or REJECT, "
+            "confidence 0-100, reason short."
+        ),
     }
 
-    # Google Gemini REST endpoint.
+    # Gemini REST endpoint.
     url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        + GEMINI_MODEL
-        + ":generateContent?key="
-        + GEMINI_API_KEY
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{AI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     )
 
     payload = {
         "contents": [
-            {
-                "parts": [
-                    {
-                        "text": json.dumps(
-                            prompt,
-                            ensure_ascii=False
-                        )
-                    }
-                ]
-            }
+            {"parts": [{"text": json.dumps(prompt, ensure_ascii=False)}]}
         ],
         "generationConfig": {
-            "temperature": 0.1,
             "responseMimeType": "application/json"
-        }
+        },
     }
 
     try:
         req = urllib.request.Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "SIGZY-BRAIN-V5.2"
-            },
-            method="POST"
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
 
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            raw = resp.read().decode("utf-8")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
 
-        data = json.loads(raw)
+        text = (
+            raw["candidates"][0]["content"]["parts"][0]["text"]
+        )
+        result = json.loads(text)
 
-        candidates = data.get("candidates", [])
-        if not candidates:
-            print("[AI] No candidates returned.", flush=True)
-            return False, "AI_NO_CANDIDATE", 0.0
-
-        parts = candidates[0].get("content", {}).get("parts", [])
-        if not parts:
-            print("[AI] Empty AI response.", flush=True)
-            return False, "AI_EMPTY_RESPONSE", 0.0
-
-        text = parts[0].get("text", "").strip()
-
-        # Handle accidental markdown fences.
-        if text.startswith("```"):
-            text = text.replace("```json", "").replace("```", "").strip()
-
-        ai_json = json.loads(text)
-
-        decision = str(ai_json.get("decision", "REJECT")).upper().strip()
-
-        try:
-            confidence = float(ai_json.get("confidence", 0))
-        except Exception:
-            confidence = 0.0
-
-        confidence = max(0.0, min(100.0, confidence))
-        reason = str(ai_json.get("reason", "No reason provided")).strip()
+        decision = str(result.get("decision", "REJECT")).upper()
+        confidence = float(result.get("confidence", 0.0))
+        reason = str(result.get("reason", "No reason provided"))
 
         print(
             f"[AI] {symbol} | {decision} | "
@@ -267,37 +194,19 @@ def ai_final_check(symbol, action, setup, trend, candles):
             and confidence >= AI_CONFIDENCE_THRESHOLD
         )
 
-        if approved:
-            return True, reason, confidence
-
-        return False, reason, confidence
-
-    except urllib.error.HTTPError as e:
-        try:
-            body = e.read().decode("utf-8", errors="ignore")
-        except Exception:
-            body = ""
-
-        print(
-            f"[AI HTTP ERROR] {e.code} | {body[:500]}",
-            flush=True
-        )
-        return False, f"AI_HTTP_{e.code}", 0.0
+        return approved, reason, confidence
 
     except Exception as e:
-        print("[AI ERROR]", repr(e), flush=True)
-        return False, "AI_REQUEST_ERROR", 0.0
+        # Fail-open to preserve paper-trade collection.
+        print(f"[AI ERROR] {e} -> AI bypass.", flush=True)
+        return True, "AI_ERROR_BYPASS", 100.0
 
-
-# ============================================================
-# DATA
-# ============================================================
 
 def fetch(symbol, limit=200):
     try:
         if symbol in CRYPTO:
             url = (
-                f"https://api.binance.com/api/v3/klines"
+                "https://api.binance.com/api/v3/klines"
                 f"?symbol={symbol}&interval=1m&limit={limit}"
             )
         else:
@@ -327,28 +236,28 @@ def fetch(symbol, limit=200):
                 for x in data
             ]
 
-        res = data.get("chart", {}).get("result")
-        if not res:
+        result = data.get("chart", {}).get("result")
+        if not result:
             return None
 
-        res = res[0]
-        ts = res.get("timestamp", [])
-        q = res.get("indicators", {}).get("quote", [{}])[0]
+        result = result[0]
+        ts = result.get("timestamp", [])
+        quote = result.get("indicators", {}).get("quote", [{}])[0]
 
         out = []
+        volumes = quote.get("volume", [0] * len(ts))
 
         for i, t in enumerate(ts):
             try:
-                o = q["open"][i]
-                h = q["high"][i]
-                l = q["low"][i]
-                c = q["close"][i]
+                o = quote["open"][i]
+                h = quote["high"][i]
+                l = quote["low"][i]
+                c = quote["close"][i]
 
                 if None in (o, h, l, c):
                     continue
 
-                vol_list = q.get("volume", [0] * len(ts))
-                v = vol_list[i] or 0
+                v = volumes[i] or 0
 
                 out.append({
                     "timestamp": int(t) * 1000,
@@ -368,10 +277,6 @@ def fetch(symbol, limit=200):
         return None
 
 
-# ============================================================
-# MEMORY
-# ============================================================
-
 def default_setup(symbol="", action="", setup=""):
     return {
         "symbol": symbol,
@@ -390,6 +295,7 @@ def default_setup(symbol="", action="", setup=""):
 
 def default_memory():
     return {
+        "version": "5.2",
         "stats": {
             "total_setups": 0,
             "wins": 0,
@@ -414,21 +320,31 @@ def default_memory():
 
 def save(mem):
     try:
-        tmp = MEMORY_FILE + ".tmp"
+        tmp = BASE / "bot_memory_sigzy_v5_2.tmp"
+
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(mem, f, indent=2, ensure_ascii=False)
+            json.dump(
+                mem,
+                f,
+                indent=2,
+                ensure_ascii=False
+            )
+
         os.replace(tmp, MEMORY_FILE)
+
     except Exception as e:
-        print("[MEMORY SAVE ERROR]", repr(e), flush=True)
+        print(f"[MEMORY SAVE ERROR] {e}", flush=True)
 
 
 def init_memory():
-    if os.path.exists(MEMORY_FILE):
+    if MEMORY_FILE.exists():
         try:
             with open(MEMORY_FILE, encoding="utf-8") as f:
                 m = json.load(f)
 
             base = default_memory()
+
+            m.setdefault("version", "5.2")
             m.setdefault("stats", {})
             m.setdefault("setups", {})
             m.setdefault("score_bands", {})
@@ -452,7 +368,6 @@ def init_memory():
                         {"wins": 0, "losses": 0, "draws": 0}
                     )
 
-            # Repair old typo from previous versions.
             if "losss" in m["stats"]:
                 m["stats"]["losses"] += m["stats"].pop("losss")
                 save(m)
@@ -461,7 +376,7 @@ def init_memory():
             return m
 
         except Exception as e:
-            print("[MEMORY LOAD ERROR]", repr(e), flush=True)
+            print(f"[MEMORY LOAD ERROR] {e}", flush=True)
 
     m = default_memory()
     save(m)
@@ -484,11 +399,11 @@ def quality(m, symbol, action, setup):
 def pair_stats(m, symbol):
     w = l = d = t = 0
 
-    for k, s in m.get("setups", {}).items():
+    for key, s in m.get("setups", {}).items():
         if not isinstance(s, dict):
             continue
 
-        if s.get("symbol") == symbol or k.startswith(symbol + "_"):
+        if s.get("symbol") == symbol or key.startswith(symbol + "_"):
             w += int(s.get("wins", 0))
             l += int(s.get("losses", 0))
             d += int(s.get("draws", 0))
@@ -509,27 +424,21 @@ def pair_stats(m, symbol):
 def pair_status(s):
     if s["decided"] < PAIR_MIN_HISTORY:
         return "LEARNING"
-
     if s["wr"] < PAIR_BLOCK_WR:
         return "BLOCK"
-
     if s["wr"] >= PAIR_STRONG_WR:
         return "STRONG"
-
     if s["wr"] >= PAIR_FAVOR_WR:
         return "FAVOR"
-
     if s["wr"] >= PAIR_WEAK_WR:
         return "NORMAL"
-
     return "WEAK"
 
 
-# ============================================================
-# ANALYSIS
-# ============================================================
-
 def ema(values, n):
+    if not values:
+        return 0.0
+
     n = min(n, len(values))
     e = values[0]
     k = 2 / (n + 1)
@@ -543,13 +452,10 @@ def ema(values, n):
 def band(score):
     if score >= 95:
         return "PREMIUM_95_100"
-
     if score >= 88:
         return "HIGH_QUALITY_88_94"
-
     if score >= 82:
         return "WATCH_82_87"
-
     return "BELOW_WATCH"
 
 
@@ -561,7 +467,6 @@ def update_band(m, score, result=None):
 
     if result is None:
         b["signals"] += 1
-
     elif result in ("WIN", "LOSS", "DRAW"):
         b[result.lower() + "s"] += 1
 
@@ -600,20 +505,8 @@ def analyze(c, m, symbol):
             "reason": "INSUFFICIENT_DATA",
         }
 
-    # Last candle may still be forming.
+    # Ignore currently forming candle.
     x = c[:-1]
-
-    if len(x) < 105:
-        return {
-            "action": "WAIT",
-            "score": 0,
-            "setup": "NEUTRAL",
-            "call_score": 0,
-            "put_score": 0,
-            "trend": "N/A",
-            "real_wr": None,
-            "reason": "INSUFFICIENT_CLOSED_CANDLES",
-        }
 
     cur, pr, pr2 = x[-1], x[-2], x[-3]
     closes = [z["close"] for z in x]
@@ -634,6 +527,7 @@ def analyze(c, m, symbol):
         trend = "RANGE"
 
     z = x[-101:-1]
+
     sup = min(q["low"] for q in z)
     res = max(q["high"] for q in z)
 
@@ -645,7 +539,12 @@ def analyze(c, m, symbol):
     ins = abs(p - sup) / max(abs(sup), 1e-12) <= t["zone"]
     inr = abs(p - res) / max(abs(res), 1e-12) <= t["zone"]
 
-    vv = [q["volume"] for q in x[-16:-1] if q["volume"] > 0]
+    vv = [
+        q["volume"]
+        for q in x[-16:-1]
+        if q["volume"] > 0
+    ]
+
     avg = sum(vv) / len(vv) if vv else 0
     vr = cur["volume"] / avg if avg and cur["volume"] else 1
     hv = vr >= t["vol"]
@@ -720,14 +619,12 @@ def analyze(c, m, symbol):
 
     call_setup = (
         "SUPPORT_REVERSAL_CALL"
-        if ns
-        else "MOMENTUM_CALL"
+        if ns else "MOMENTUM_CALL"
     )
 
     put_setup = (
         "RESISTANCE_REVERSAL_PUT"
-        if nr
-        else "MOMENTUM_PUT"
+        if nr else "MOMENTUM_PUT"
     )
 
     cm = quality(m, symbol, "CALL", call_setup)
@@ -833,6 +730,7 @@ def rank_candidates(candidates, m):
     def key(x):
         a = x["analysis"]
         symbol = x["symbol"]
+
         setup = a["setup"]
         action = a["action"]
 
@@ -864,13 +762,8 @@ def rank_candidates(candidates, m):
     return sorted(candidates, key=key, reverse=True)
 
 
-# ============================================================
-# PAPER RESULT
-# ============================================================
-
 def record(m, tr, result):
     st = m["stats"]
-
     st["total_setups"] += 1
 
     if result == "WIN":
@@ -914,16 +807,17 @@ def record(m, tr, result):
     wr = s["wins"] / decided * 100 if decided else None
 
     msg = (
-        f"📊 PAPER RESULT V5.2\n"
+        "📊 PAPER RESULT V5.2\n"
         f"ตลาด: {tr['symbol']}\n"
         f"ผลล่าสุด: {result}\n"
         f"Action: {tr['action']}\n"
         f"Setup: {tr['setup']}\n"
         f"Entry Score: {tr['entry_score']:.1f}\n"
-        f"ครบ Opportunity: 3/3\n"
+        "ครบ Opportunity: 3/3\n"
         f"Setup WR: {wr:.1f}%\n"
         f"ระบบรวม: ชนะ {st['wins']} | "
-        f"เสมอ {st['draws']} | แพ้ {st['losses']}\n"
+        f"เสมอ {st['draws']} | "
+        f"แพ้ {st['losses']}\n"
         f"🧠 Memory updated: {key}"
     )
 
@@ -931,49 +825,36 @@ def record(m, tr, result):
     discord(msg)
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
 def run():
     print("=" * 72)
-    print("🤖 SIGZY BRAIN V5.2")
+    print("🤖 SIGZY BRAIN V5.2 - RAILWAY SAFE")
     print("MEMORY + REAL LEARNING + AI FINAL FILTER")
     print("CRYPTO + FOREX | PAPER TRADE")
     print("=" * 72)
 
+    print(f"[PATH] BASE = {BASE}", flush=True)
+    print(f"[PATH] MEMORY = {MEMORY_FILE}", flush=True)
+    print(f"[AI] Model = {AI_MODEL}", flush=True)
     print(
-        f"[CONFIG] AI Model={GEMINI_MODEL} | "
-        f"Threshold={AI_CONFIDENCE_THRESHOLD}",
+        f"[AI] Key = {'LOADED' if GEMINI_API_KEY else 'MISSING'}",
+        flush=True
+    )
+    print(
+        f"[DISCORD] Webhook = "
+        f"{'LOADED' if DISCORD_WEBHOOK_URL else 'MISSING'}",
         flush=True
     )
 
     if DISCORD_WEBHOOK_URL:
-        print("✅ Discord webhook loaded.", flush=True)
-    else:
-        print("⚠️ DISCORD_WEBHOOK_URL missing.", flush=True)
-
-    if GEMINI_API_KEY:
-        print("✅ GEMINI_API_KEY loaded.", flush=True)
-    else:
-        print(
-            "⚠️ GEMINI_API_KEY missing. "
-            "AI signals will be rejected.",
-            flush=True
-        )
-
-    if DISCORD_WEBHOOK_URL:
         discord(
             "🟢 SIGZY BRAIN V5.2 ONLINE\n"
-            "Memory + AI Final Filter Active\n"
-            "Paper Trade only"
+            "Railway-safe path + Real Memory + AI Final Filter"
         )
 
     m = init_memory()
 
     active = {}
     last_alert = {}
-    last_signal = datetime.now()
 
     while True:
         now = datetime.now()
@@ -985,9 +866,9 @@ def run():
             flush=True
         )
 
-        # --------------------------------------------------------
-        # 1) Track active paper trades
-        # --------------------------------------------------------
+        # ====================================================
+        # 1. Track active paper trades
+        # ====================================================
         done = []
 
         for symbol, tr in list(active.items()):
@@ -996,7 +877,7 @@ def run():
             if not c or len(c) < 3:
                 continue
 
-            cur = c[-2]  # latest closed candle
+            cur = c[-2]
 
             if cur["timestamp"] == tr.get("last_ts"):
                 continue
@@ -1011,14 +892,18 @@ def run():
 
             if tr["action"] == "CALL":
                 result = (
-                    "WIN" if green
-                    else "LOSS" if red
+                    "WIN"
+                    if green
+                    else "LOSS"
+                    if red
                     else "DRAW"
                 )
             else:
                 result = (
-                    "WIN" if red
-                    else "LOSS" if green
+                    "WIN"
+                    if red
+                    else "LOSS"
+                    if green
                     else "DRAW"
                 )
 
@@ -1041,9 +926,9 @@ def run():
         for symbol in done:
             active.pop(symbol, None)
 
-        # --------------------------------------------------------
-        # 2) Find candidates
-        # --------------------------------------------------------
+        # ====================================================
+        # 2. Find candidates
+        # ====================================================
         candidates = []
 
         for symbol in SYMBOLS:
@@ -1102,14 +987,14 @@ def run():
         ranked = rank_candidates(candidates, m)
         selected = ranked[:MAX_NEW_ALERTS_PER_SCAN]
 
-        # --------------------------------------------------------
-        # 3) AI final filter + alert
-        # --------------------------------------------------------
+        # ====================================================
+        # 3. AI confirmation + alert
+        # ====================================================
         for cand in selected:
             a = cand["analysis"]
             symbol = cand["symbol"]
 
-            ai_approved, ai_reason, ai_conf = ai_final_check(
+            approved, ai_reason, ai_conf = ai_final_check(
                 symbol,
                 a["action"],
                 a["setup"],
@@ -1117,16 +1002,13 @@ def run():
                 cand["candles"]
             )
 
-            if not ai_approved:
+            if not approved:
                 print(
                     f"⛔ AI REJECTED {symbol} | "
-                    f"Conf={ai_conf:.1f}% | "
-                    f"{ai_reason}",
+                    f"{ai_conf:.1f}% | {ai_reason}",
                     flush=True
                 )
                 continue
-
-            last_signal = now
 
             tr = {
                 "symbol": symbol,
@@ -1138,8 +1020,6 @@ def run():
                 "opportunity": 0,
                 "last_ts": cand["timestamp"],
                 "opportunity_results": {},
-                "ai_confidence": ai_conf,
-                "ai_reason": ai_reason,
             }
 
             active[symbol] = tr
@@ -1156,7 +1036,7 @@ def run():
                 else "กำลังเก็บสถิติ"
             )
 
-            pair_wr_str = (
+            pair_wr = (
                 f"{ps['wr']:.1f}% ({ps['decided']} decided)"
                 if ps["wr"] is not None
                 else "กำลังเรียนรู้"
@@ -1173,39 +1053,34 @@ def run():
                 f"Setup: {a['setup']}\n"
                 f"Trend: {a['trend']}\n"
                 f"Historical Setup WR: {wr}\n"
-                f"Pair WR: {pair_wr_str}\n"
+                f"Pair WR: {pair_wr}\n"
                 f"🤖 AI Confidence: {ai_conf:.1f}%\n"
                 f"💬 AI Reason: {ai_reason}\n"
                 f"🧠 Memory: {a.get('memory_tag', 'LEARNING')}\n"
-                f"🏆 Best opportunity selected\n"
-                f"📊 Paper Track: Opportunity 1 ➔ 2 ➔ 3\n"
-                f"⚠️ Paper Trade เท่านั้น"
+                "🏆 Best opportunity selected\n"
+                "📊 Paper Track: Opportunity 1 ➔ 2 ➔ 3\n"
+                "⚠️ Paper trade only — ไม่ใช่คำสั่งซื้อขายอัตโนมัติ"
             )
 
             print(msg, flush=True)
             discord(msg)
 
-        # --------------------------------------------------------
-        # 4) Status
-        # --------------------------------------------------------
+        # ====================================================
+        # 4. Status
+        # ====================================================
         total = m["stats"]["total_setups"]
         wins = m["stats"]["wins"]
         losses = m["stats"]["losses"]
         draws = m["stats"]["draws"]
 
         decided = wins + losses
-        overall_wr = (
-            wins / decided * 100
-            if decided
-            else 0
-        )
+        overall_wr = wins / decided * 100 if decided else 0
 
         print(
             f"📊 MEMORY: {total} setups | "
             f"WIN={wins} LOSS={losses} DRAW={draws} | "
             f"WR={overall_wr:.2f}% | "
-            f"Active={len(active)} | "
-            f"Candidates={len(candidates)}",
+            f"ACTIVE={len(active)}",
             flush=True
         )
 
@@ -1221,10 +1096,14 @@ if __name__ == "__main__":
     try:
         run()
     except KeyboardInterrupt:
-        print("🛑 SIGZY V5.2 stopped.", flush=True)
+        print("🛑 SIGZY BRAIN stopped.", flush=True)
     except Exception as e:
-        print("[FATAL ERROR]", repr(e), flush=True)
+        print(f"[FATAL ERROR] {repr(e)}", flush=True)
+        # Keep traceback useful in Railway logs.
+        raise
 '''
-path = Path("/mnt/data/SIGZY_BRAIN_V5_2_FIXED.py")
+
+path = Path("/mnt/data/SIGZY_BRAIN_V5_2_RAILWAY_SAFE.py")
 path.write_text(code, encoding="utf-8")
-print(path)
+print(f"สร้างไฟล์เรียบร้อย: {path}")
+print(f"ขนาดไฟล์: {path.stat().st_size:,} bytes")
