@@ -1,12 +1,10 @@
-import time, json, os, urllib.request, math
+import time, json, os, urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # ============================================================
-# SIGZY BRAIN V6.0 - 3 BRAIN PAPER TRADER (STRICT 80%+ WINRATE TUNED)
-# BOT + AI #1 PATTERN + AI #2 RISK/CONTRARIAN
-# REAL MEMORY + BEST PAIR SELECTOR + DISCORD
-# THAI TIMEZONE FIXED (UTC+7)
+# SIGZY BRAIN V6.0 - 3 BRAIN PAPER TRADER
+# BOT + AI PATTERN + AI RISK/CONTRARIAN
 # ============================================================
 
 CRYPTO = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"]
@@ -16,7 +14,6 @@ SYMBOLS = CRYPTO + FOREX
 
 PAPER_INTERVAL_SECONDS = 60
 MIN_SCORE_THRESHOLD = 85.0
-SYMBOL_COOLDOWN_SECONDS = 300
 
 THAI_TZ = timezone(timedelta(hours=7))
 
@@ -29,7 +26,6 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
 BASE = Path(__file__).resolve().parent
-MEMORY_FILE = BASE / "bot_memory_sigzy_brain_v6.json"
 
 # ---------------- DISCORD NOTIFICATION ----------------
 def discord(msg):
@@ -48,7 +44,7 @@ def discord(msg):
             pass
         return True
     except Exception as e:
-        print("[DISCORD ERROR]", e, flush=True)
+        print(f"[DISCORD ERROR] {e}", flush=True)
         return False
 
 # ---------------- AI FUNCTIONS ----------------
