@@ -6,7 +6,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 
 # ============================================================
-# SIGZY AI 15M - DYNAMIC THRESHOLD & SESSION TRACKER
+# SIGZY AI 15M - DYNAMIC THRESHOLD, TRACKER & THAI TIME FIXED
 # ============================================================
 
 SYMBOLS = [
@@ -50,6 +50,16 @@ def now_text():
     return thai.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def format_candle_time(utc_time_str):
+    """แปลงเวลา Candle จาก UTC ให้เป็นเวลาไทย (GMT+7)"""
+    try:
+        dt = datetime.strptime(utc_time_str, "%Y-%m-%d %H:%M:%S")
+        thai_dt = dt + timedelta(hours=7)
+        return thai_dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return utc_time_str
+
+
 def send_discord(message):
     if not DISCORD_WEBHOOK_URL:
         return
@@ -64,7 +74,6 @@ def send_discord(message):
 
 
 def is_trading_time():
-    # ให้ระบบวิเคราะห์ตามคะแนนจริงและ Dynamic Threshold
     return True
 
 
@@ -174,7 +183,6 @@ def market_regime(candles):
 
 
 def get_threshold(regime, thai_hour):
-    # เกณฑ์พื้นฐานตามสภาวะตลาด
     if regime == "QUIET":
         base_threshold = 60
     elif regime == "FAST":
@@ -182,7 +190,6 @@ def get_threshold(regime, thai_hour):
     else:
         base_threshold = 65
 
-    # Dynamic Threshold ปรับเพิ่มตามช่วงเวลา
     if 4 <= thai_hour < 5:
         base_threshold += 5   # ช่วง 04:00-05:00 เพิ่มความเข้มงวด +5
     elif 5 <= thai_hour < 6:
@@ -337,7 +344,6 @@ def analyze_15m_opportunity(symbol, candles):
 
 
 def calculate_session_stats():
-    """คำนวณ Win Rate แยกตามช่วงเวลา"""
     sessions = ["00-04", "04-05", "05-06", "06-12", "12-18", "18-24"]
     stats_text = ""
 
@@ -467,6 +473,9 @@ def send_update(signals, watchlist):
                 SENT_SIGNALS.add(signal_key)
                 PENDING_TRADES.append(sig)
 
+                # แปลงเวลา Candle เป็นเวลาไทยเพื่อความถูกต้อง
+                thai_candle_time = format_candle_time(sig['candle_time'])
+
                 msg = (
                     f"🎯 **SIGZY AI 15M (OPTIMIZED)**\n\n"
                     f"💱 คู่เงิน: **{sig['symbol']}**\n"
@@ -477,7 +486,7 @@ def send_update(signals, watchlist):
                     f"🎯 TP: **{sig['tp']:.5f}**\n"
                     f"🛑 SL: **{sig['sl']:.5f}**\n\n"
                     f"🔎 ปัจจัยสนับสนุน: {sig['reasons']}\n\n"
-                    f"⏱️ Candle: {sig['candle_time']}\n"
+                    f"⏱️ Candle: {thai_candle_time}\n"
                     f"🕐 {now_text()}"
                 )
                 send_discord(msg)
@@ -511,10 +520,10 @@ def wait_next_15m():
 def main():
     print()
     print("=" * 65)
-    print("SIGZY AI 15M - DYNAMIC THRESHOLD & SESSION TRACKER STARTED")
+    print("SIGZY AI 15M - DYNAMIC THRESHOLD & THAI TIME FIXED STARTED")
     print("=" * 65)
 
-    send_discord("🤖 **SIGZY ONLINE (DYNAMIC THRESHOLD & SESSION TRACKER)**\nปรับระดับความเข้มงวดตามช่วงเวลาและสแกนพร้อมติดตามสถิติแยก Session เรียบร้อย!")
+    send_discord("🤖 **SIGZY ONLINE (DYNAMIC THRESHOLD & THAI TIME FIXED)**\nปรับระดับความเข้มงวดตามช่วงเวลา แก้ไขเวลา Candle เป็นเวลาไทยเรียบร้อย!")
 
     while True:
         try:
