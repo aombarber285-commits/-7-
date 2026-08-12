@@ -6,7 +6,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 
 # ============================================================
-# SIGZY AI 15M - FIXED API KEY & FULL OPTIMIZED
+# SIGZY AI 15M - DYNAMIC THRESHOLD & SESSION TRACKER
 # ============================================================
 
 SYMBOLS = [
@@ -28,13 +28,20 @@ TP_ATR = 0.50
 SL_ATR = 0.50
 
 API_KEY_CORRECT = "77aef7a76c9b45e68d72394940bc0e77"
-# ใส่ Discord Webhook URL โดยตรง
-DISCORD_WEBHOOK_URL = os.getenv(
+
+RAW_WEBHOOK = os.getenv(
     "DISCORD_WEBHOOK_URL",
     "https://discord.com/api/webhooks/1537208534058405918/555sHE5Z09zHOD8xtv7Q-fBj5NP4bUE4nkeIFz6ugqsWxEIVmEi2PX0Wxx36ZCLXlKpR"
 )
+DISCORD_WEBHOOK_URL = RAW_WEBHOOK.strip()
+if DISCORD_WEBHOOK_URL.startswith("Https://"):
+    DISCORD_WEBHOOK_URL = "https://" + DISCORD_WEBHOOK_URL[8:]
+
+STATS_WEBHOOK_URL = os.getenv("STATS_WEBHOOK_URL", "")
 
 SENT_SIGNALS = set()
+PENDING_TRADES = []
+TRADE_HISTORY = []
 
 
 def now_text():
@@ -57,9 +64,24 @@ def send_discord(message):
 
 
 def is_trading_time():
-    """กรองช่วงเช้ามืดที่ตลาดไร้ประสิทธิภาพ (04:00 - 06:00 น. ไทย)"""
-    thai_hour = (datetime.now(timezone.utc) + timedelta(hours=7)).hour
-    return not (4 <= thai_hour < 6)
+    # ให้ระบบวิเคราะห์ตามคะแนนจริงและ Dynamic Threshold
+    return True
+
+
+def get_time_session(thai_hour):
+    """แบ่งช่วงเวลาสำหรับเก็บสถิติ Win Rate"""
+    if 0 <= thai_hour < 4:
+        return "00-04"
+    elif 4 <= thai_hour < 5:
+        return "04-05"
+    elif 5 <= thai_hour < 6:
+        return "05-06"
+    elif 6 <= thai_hour < 12:
+        return "06-12"
+    elif 12 <= thai_hour < 18:
+        return "12-18"
+    else:
+        return "18-24"
 
 
 def get_market_data(symbol):
@@ -151,12 +173,22 @@ def market_regime(candles):
     return "NORMAL"
 
 
-def get_threshold(regime):
+def get_threshold(regime, thai_hour):
+    # เกณฑ์พื้นฐานตามสภาวะตลาด
     if regime == "QUIET":
-        return 60
+        base_threshold = 60
     elif regime == "FAST":
-        return 70
-    return 65
+        base_threshold = 70
+    else:
+        base_threshold = 65
+
+    # Dynamic Threshold ปรับเพิ่มตามช่วงเวลา
+    if 4 <= thai_hour < 5:
+        base_threshold += 5   # ช่วง 04:00-05:00 เพิ่มความเข้มงวด +5
+    elif 5 <= thai_hour < 6:
+        base_threshold += 10  # ช่วง 05:00-06:00 เพิ่มความเข้มงวด +10
+
+    return base_threshold
 
 
 def analyze_15m_opportunity(symbol, candles):
@@ -169,6 +201,9 @@ def analyze_15m_opportunity(symbol, candles):
     current_atr = atr(candles, 14)
     if not current_atr:
         return {"decision": "WAIT", "score": 0}
+
+    thai_now = datetime.now(timezone.utc) + timedelta(hours=7)
+    thai_hour = thai_now.hour
 
     call_score = 0
     put_score = 0
@@ -257,6 +292,9 @@ def analyze_15m_opportunity(symbol, candles):
         confirmations_put += 1
         reasons.append("Breakout DOWN")
 
+    regime = market_regime(candles)
+    threshold = get_threshold(regime, thai_hour)
+
     if confirmations_call >= confirmations_put and confirmations_call >= 2:
         direction = "CALL"
         call_score += 50 + (confirmations_call * 12)
@@ -266,18 +304,14 @@ def analyze_15m_opportunity(symbol, candles):
         put_score += 50 + (confirmations_put * 12)
         score = put_score
     else:
-        regime = market_regime(candles)
-        threshold = get_threshold(regime)
         if 55 <= max(call_score, put_score) < threshold:
             return {"decision": "WATCH", "score": max(call_score, put_score), "symbol": symbol, "reasons": "ใกล้เข้าเงื่อนไข"}
         return {"decision": "WAIT", "score": 0}
 
     score = min(score, 99)
-    regime = market_regime(candles)
-    threshold = get_threshold(regime)
 
     if score < threshold:
-        return {"decision": "WATCH", "score": score, "symbol": symbol, "reasons": "ใกล้เข้าเงื่อนไข"}
+        return {"decision": "WATCH", "score": score, "symbol": symbol, "reasons": f"Score {score} ไม่ถึง Threshold {threshold}"}
 
     if direction == "CALL":
         tp = price + current_atr * TP_ATR
@@ -297,15 +331,101 @@ def analyze_15m_opportunity(symbol, candles):
         "regime": regime,
         "threshold": threshold,
         "reasons": " | ".join(reasons),
-        "candle_time": c0["datetime"]
+        "candle_time": c0["datetime"],
+        "session": get_time_session(thai_hour)
     }
 
 
-def scan_all_symbols():
-    if not is_trading_time():
-        print(f"[{now_text()}] ตลาดช่วงเช้ามืด ข้ามการสแกน")
-        return [], []
+def calculate_session_stats():
+    """คำนวณ Win Rate แยกตามช่วงเวลา"""
+    sessions = ["00-04", "04-05", "05-06", "06-12", "12-18", "18-24"]
+    stats_text = ""
 
+    for s in sessions:
+        trades = [t for t in TRADE_HISTORY if t.get("session") == s]
+        total = len(trades)
+        if total > 0:
+            wins = sum(1 for t in trades if "WIN" in t["result"])
+            wr = (wins / total) * 100
+            stats_text += f"• **{s} น.**: {wins}/{total} ไม้ ({wr:.1f}%)\n"
+        else:
+            stats_text += f"• **{s} น.**: - (ยังไม่มีข้อมูล)\n"
+
+    return stats_text
+
+
+def verify_pending_trades():
+    global PENDING_TRADES, TRADE_HISTORY
+
+    if not PENDING_TRADES:
+        return
+
+    remaining_trades = []
+
+    for trade in PENDING_TRADES:
+        candles = get_market_data(trade["symbol"])
+        if not candles:
+            remaining_trades.append(trade)
+            continue
+
+        latest_candle = candles[-1]
+        
+        if latest_candle["datetime"] != trade["candle_time"]:
+            close_price = latest_candle["close"]
+            direction = trade["decision"]
+            entry_price = trade["price"]
+
+            if direction == "CALL":
+                result = "WIN 🟢" if close_price > entry_price else "LOSS 🔴"
+            else:
+                result = "WIN 🟢" if close_price < entry_price else "LOSS 🔴"
+
+            record = {
+                "symbol": trade["symbol"],
+                "decision": direction,
+                "score": trade["score"],
+                "entry_price": entry_price,
+                "close_price": close_price,
+                "result": result,
+                "reasons": trade["reasons"],
+                "candle_time": trade["candle_time"],
+                "session": trade.get("session", "N/A"),
+                "timestamp": now_text()
+            }
+
+            TRADE_HISTORY.append(record)
+
+            total_trades = len(TRADE_HISTORY)
+            wins = sum(1 for t in TRADE_HISTORY if "WIN" in t["result"])
+            win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
+
+            session_stats = calculate_session_stats()
+
+            msg = (
+                f"📊 **RESULT UPDATE (AUTO-TRACKER)**\n\n"
+                f"💱 คู่เงิน: **{record['symbol']}** ({record['decision']})\n"
+                f"🏆 Score: **{record['score']}/100** | Session: **{record['session']} น.**\n"
+                f"📍 Entry: **{record['entry_price']:.5f}** $\rightarrow$ Close: **{record['close_price']:.5f}**\n"
+                f"🏁 ผลลัพธ์: **{record['result']}**\n\n"
+                f"📈 **WIN RATE BY SESSION**\n"
+                f"{session_stats}\n"
+                f"📊 **OVERALL:** {wins}/{total_trades} ไม้ (**{win_rate:.2f}%**)\n"
+                f"🕐 {now_text()}"
+            )
+            send_discord(msg)
+
+            if STATS_WEBHOOK_URL:
+                try:
+                    requests.post(STATS_WEBHOOK_URL, json=record, timeout=5)
+                except Exception as e:
+                    print("Stats Export Error:", e)
+        else:
+            remaining_trades.append(trade)
+
+    PENDING_TRADES = remaining_trades
+
+
+def scan_all_symbols():
     signals = []
     watchlist = []
 
@@ -336,23 +456,23 @@ def scan_all_symbols():
 
 
 def send_update(signals, watchlist):
-    global SENT_SIGNALS
+    global SENT_SIGNALS, PENDING_TRADES
 
     if signals:
-        # เรียงตามคะแนนความแม่นยำ
         signals.sort(key=lambda x: x["score"], reverse=True)
 
         for sig in signals:
             signal_key = (sig["symbol"], sig["candle_time"], sig["decision"])
             if signal_key not in SENT_SIGNALS:
                 SENT_SIGNALS.add(signal_key)
+                PENDING_TRADES.append(sig)
 
                 msg = (
                     f"🎯 **SIGZY AI 15M (OPTIMIZED)**\n\n"
                     f"💱 คู่เงิน: **{sig['symbol']}**\n"
                     f"📌 ทิศทาง: **{sig['decision']}**\n"
                     f"🏆 Score: **{sig['score']}/100** (Threshold: {sig['threshold']})\n"
-                    f"🌡️ Market: **{sig['regime']}**\n"
+                    f"🌡️ Market: **{sig['regime']}** | Session: **{sig['session']} น.**\n"
                     f"💰 Entry: **{sig['price']:.5f}**\n"
                     f"🎯 TP: **{sig['tp']:.5f}**\n"
                     f"🛑 SL: **{sig['sl']:.5f}**\n\n"
@@ -391,13 +511,14 @@ def wait_next_15m():
 def main():
     print()
     print("=" * 65)
-    print("SIGZY AI 15M - SMART SYSTEM STARTED")
+    print("SIGZY AI 15M - DYNAMIC THRESHOLD & SESSION TRACKER STARTED")
     print("=" * 65)
 
-    send_discord("🤖 **SIGZY ONLINE (SMART MULTI-PAIR)**\nระบบสแกนพร้อมทำงานแล้ว!")
+    send_discord("🤖 **SIGZY ONLINE (DYNAMIC THRESHOLD & SESSION TRACKER)**\nปรับระดับความเข้มงวดตามช่วงเวลาและสแกนพร้อมติดตามสถิติแยก Session เรียบร้อย!")
 
     while True:
         try:
+            verify_pending_trades()
             signals, watchlist = scan_all_symbols()
             send_update(signals, watchlist)
         except Exception as e:
