@@ -6,7 +6,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 
 # ============================================================
-# SIGZY AI 15M - DYNAMIC THRESHOLD, TRACKER & THAI TIME FIXED
+# SIGZY AI 15M - FIXED AUTO-TRACKER & DYNAMIC THRESHOLD
 # ============================================================
 
 SYMBOLS = [
@@ -78,7 +78,6 @@ def is_trading_time():
 
 
 def get_time_session(thai_hour):
-    """แบ่งช่วงเวลาสำหรับเก็บสถิติ Win Rate"""
     if 0 <= thai_hour < 4:
         return "00-04"
     elif 4 <= thai_hour < 5:
@@ -191,9 +190,9 @@ def get_threshold(regime, thai_hour):
         base_threshold = 65
 
     if 4 <= thai_hour < 5:
-        base_threshold += 5   # ช่วง 04:00-05:00 เพิ่มความเข้มงวด +5
+        base_threshold += 5
     elif 5 <= thai_hour < 6:
-        base_threshold += 10  # ช่วง 05:00-06:00 เพิ่มความเข้มงวด +10
+        base_threshold += 10
 
     return base_threshold
 
@@ -338,7 +337,7 @@ def analyze_15m_opportunity(symbol, candles):
         "regime": regime,
         "threshold": threshold,
         "reasons": " | ".join(reasons),
-        "candle_time": c0["datetime"],
+        "candle_time": c0["datetime"], # เก็บเป็น UTC เพื่อเปรียบเทียบในระบบ
         "session": get_time_session(thai_hour)
     }
 
@@ -376,6 +375,7 @@ def verify_pending_trades():
 
         latest_candle = candles[-1]
         
+        # แก้ไขการเปรียบเทียบ: ใช้เวลา UTC เทียบกับ UTC ตรงๆ
         if latest_candle["datetime"] != trade["candle_time"]:
             close_price = latest_candle["close"]
             direction = trade["decision"]
@@ -473,7 +473,6 @@ def send_update(signals, watchlist):
                 SENT_SIGNALS.add(signal_key)
                 PENDING_TRADES.append(sig)
 
-                # แปลงเวลา Candle เป็นเวลาไทยเพื่อความถูกต้อง
                 thai_candle_time = format_candle_time(sig['candle_time'])
 
                 msg = (
@@ -520,10 +519,10 @@ def wait_next_15m():
 def main():
     print()
     print("=" * 65)
-    print("SIGZY AI 15M - DYNAMIC THRESHOLD & THAI TIME FIXED STARTED")
+    print("SIGZY AI 15M - FIXED AUTO-TRACKER STARTED")
     print("=" * 65)
 
-    send_discord("🤖 **SIGZY ONLINE (DYNAMIC THRESHOLD & THAI TIME FIXED)**\nปรับระดับความเข้มงวดตามช่วงเวลา แก้ไขเวลา Candle เป็นเวลาไทยเรียบร้อย!")
+    send_discord("🤖 **SIGZY ONLINE (FIXED AUTO-TRACKER)**\nแก้ไขระบบตรวจผลแพ้/ชนะเรียบร้อย บอตพร้อมตรวจผลอัตโนมัติเมื่อจบแท่ง!")
 
     while True:
         try:
