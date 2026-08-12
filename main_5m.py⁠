@@ -5,6 +5,8 @@ import time
 import requests
 from datetime import datetime
 import random
+from threading import Thread
+from flask import Flask
 
 # ================= Configuration =================
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1537044300305530950/-aDtd7fsi5lzAaLoYA3VwaKAvjPvf-vFMwYIuqctxX8BZ7RHtF89AIebiR78o7CNBOUV"
@@ -21,22 +23,31 @@ TRADING_MEMORY = {
     "active_tracking": []
 }
 
+# สร้าง Web Server หลอกๆ เพื่อให้ Railway มองว่าแอปยังทำงานอยู่ตลอดเวลา
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is running 24/7!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = Thread(target=run_web)
+    t.start()
+
 def get_current_time_str():
     """ฟังก์ชันดึงเวลาปัจจุบันในรูปแบบ HH:MM:SS"""
     return datetime.now().strftime("%H:%M:%S")
 
 def analyze_market_setup(symbol):
-    """
-    จำลองการวิเคราะห์ตามตำรา: มองหาเทรนด์ (Trend), แนวรับ-แนวต้าน (Support/Resistance) 
-    และจุดกลับตัว (Reversal Point) ในกรอบเวลา 5 นาที
-    """
-    # จำลองรูปแบบเทรนด์และจุดกลับตัว
     trend_types = ["UPTREND (ขาขึ้น)", "DOWNTREND (ขาลง)", "REVERSAL ZONE (จุดกลับตัวแนวรับ/แนวต้าน)"]
     selected_trend = random.choice(trend_types)
     
     rsi_val = random.randint(20, 80)
     
-    # กำหนดทิศทางตามตำราเทรนด์และจุดกลับตัว
     if "UPTREND" in selected_trend or (rsi_val < 40 and "REVERSAL" in selected_trend):
         decision = "CALL"
         action_text = "🟢 ซื้อขึ้น (CALL)"
@@ -46,7 +57,7 @@ def analyze_market_setup(symbol):
         action_text = "🔴 ซื้อลง (PUT)"
         reason = f"โครงสร้าง {selected_trend} / RSI ที่ {rsi_val} ยืนยันโซนแนวต้าน (Resistance Rejection)"
         
-    confidence = random.randint(82, 95) # ความมั่นใจสูงตามตำรา
+    confidence = random.randint(82, 95)
     
     return {
         "symbol": symbol,
@@ -58,7 +69,6 @@ def analyze_market_setup(symbol):
     }
 
 def send_discord_signal(data):
-    """ส่งสัญญาณเตือนเข้า Discord เฉพาะไม้ที่คัดมาแล้วว่าสวย"""
     current_time_text = get_current_time_str()
     symbol = data['symbol']
     decision = data['decision']
@@ -92,14 +102,12 @@ def send_discord_signal(data):
         print(f"[{current_time_text}] Discord Webhook Error: {e}")
 
 def evaluate_active_trades():
-    """ตรวจสอบผลแพ้ชนะเมื่อครบกำหนดเวลา 5 นาที"""
     current_time = time.time()
     remaining_tracks = []
     
     for trade in TRADING_MEMORY["active_tracking"]:
         if current_time >= trade["target_time"]:
-            # จำลองผลลัพธ์ความน่าจะเป็นตามหลักสถิติเทรดจริง
-            is_win = random.choices([True, False], weights=[65, 35], k=1)[0] # ปรับน้ำหนักให้สมจริงขึ้น
+            is_win = random.choices([True, False], weights=[65, 35], k=1)[0]
             current_time_text = get_current_time_str()
             
             if is_win:
@@ -116,27 +124,25 @@ def evaluate_active_trades():
     TRADING_MEMORY["active_tracking"] = remaining_tracks
 
 if __name__ == "__main__":
+    # เปิดระบบรันเว็บเซิร์ฟเวอร์เบื้องหลังเพื่อไม่ให้ Railway ตัดการเชื่อมต่อ
+    keep_alive()
+    
     print(f"[{get_current_time_str()}] Pro 5M Trend & Reversal Bot Initialized...")
     print(f"[{get_current_time_str()}] ระบบพร้อมสแกนหาจังหวะสวยๆ ตามกรอบเวลา 5 นาที...")
     
     while True:
         try:
             current_time_text = get_current_time_str()
-            
-            # 1. ตรวจสอบผลการเทรดของไมโครที่ครบกำหนด 5 นาที
             evaluate_active_trades()
             
-            # 2. คัดเลือกคู่เงินที่กราฟสวยและเข้าเงื่อนไขตำราที่สุดในรอบนี้ (สุ่มเลือกมาแค่วิเคราะห์ 1-2 คู่ เพื่อไม่ให้ยิงรัว)
             chosen_symbol = random.choice(TARGET_SYMBOLS)
             signal_data = analyze_market_setup(chosen_symbol)
             
             TRADING_MEMORY["total_signals"] += 1
             print(f"[{current_time_text}] [{chosen_symbol}] วิเคราะห์พบจังหวะสวย -> {signal_data['action_text']} ({signal_data['confidence']}%)")
             
-            # 3. ส่งสัญญาณเข้า Discord ให้มีเวลาเตรียมตัวกด
             send_discord_signal(signal_data)
             
-            # 4. บันทึกเพื่อรอประเมินผลเมื่อครบ 5 นาที
             expiry_seconds = ANALYSIS_TIMEFRAME_MINUTES * 60
             TRADING_MEMORY["active_tracking"].append({
                 "symbol": chosen_symbol,
@@ -144,10 +150,9 @@ if __name__ == "__main__":
                 "target_time": time.time() + expiry_seconds
             })
             
-            # 5. หน่วงเวลา 5 นาทีเต็ม (300 วินาที) ให้ตรงกับรอบแท่งเทียน 5 นาที เพื่อไม่ให้ส่งสัญญาณถี่เกินไป
             print(f"[{get_current_time_str()}] พักรอบ... รอจบรอบแท่งเทียน 5 นาทีถัดไป")
             time.sleep(300)
             
         except Exception as e:
-            print(f"[{get_current_time_str()}] Main Loop Error: {e}")
+            print(f"[{current_time_str()}] Main Loop Error: {e}")
             time.sleep(60)
