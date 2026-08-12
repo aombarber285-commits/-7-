@@ -1,3 +1,9 @@
+# -*- coding: utf-8 -*-
+"""
+SIGZY BRAIN V6.2 - SINGLE FILE FOR RAILWAY
+PRESERVES: Memory Structure / 85.0 Threshold
+"""
+
 import time
 import json
 import os
@@ -7,315 +13,676 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # ============================================================
-# SIGZY BRAIN V6.2 - SINGLE FILE FOR RAILWAY
-# PRESERVES: Memory Structure / 85.0 Threshold / Existing Logic
+# CONFIGURATION
 # ============================================================
 
-CRYPTO = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"]
-FOREX = [
-    "GBPUSD", "GBPJPY", "USDJPY", "EURUSD", "EURJPY", "AUDJPY",
-    "AUDUSD", "NZDUSD", "USDCAD", "USDCHF", "EURGBP", "NZDJPY", "CADJPY"
-]
-SYMBOLS = CRYPTO + FOREX
+DISCORD_WEBHOOK_URL = os.environ.get(
+    "DISCORD_WEBHOOK_URL",
+    "https://discord.com/api/webhooks/1537074805818269746/jDuxNjMLZhmnb_BqysF5SiH9m97GDLPSYPZ1RUxziQY7QBdY2zP_YwBHMvjWwOhx_1Ir"
+)
+TWELVE_DATA_API_KEY = os.environ.get(
+    "TWELVE_DATA_API_KEY",
+    "af2b5d958f0f4691907e77742f5462ee"
+)
 
-PAPER_INTERVAL_SECONDS = 60
-MIN_SCORE_THRESHOLD = 85.0
+CRYPTO = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+FOREX = [
+    "GBPUSD", "GBPJPY", "USDJPY", "EURUSD",
+    "AUDUSD", "NZDUSD", "USDCAD", "USDCHF"
+]
+ALL_SYMBOLS = CRYPTO + FOREX
+
+TWELVE_INTERVAL = "5min"
+OUTPUT_SIZE = 1000
+SCAN_INTERVAL = 600
+TIMEOUT = 30
+
+MIN_SCORE = 85.0
+TP_ATR = 0.80
+SL_ATR = 0.60
+
+BASE_DIR = Path(__file__).resolve().parent
+MEMORY_FILE = BASE_DIR / "sigzy_memory.json"
 
 THAI_TZ = timezone(timedelta(hours=7))
-BASE = Path(__file__).resolve().parent
 
-MEMORY_FILE = BASE / "sigzy_v6_memory.json"
-STATE_FILE = BASE / "sigzy_v6_state.json"
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
 # ============================================================
-# TIME / IO
+# TIME
 # ============================================================
 
-def thai_now():
-    return datetime.now(THAI_TZ)
+def now():
+    return datetime.now(THAI_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-def log(msg):
-    print(msg, flush=True)
-
-def http_json(url, payload=None, timeout=20, headers=None):
-    h = {
-        "User-Agent": "SIGZY-BRAIN-V6.2",
-        "Accept": "application/json",
-    }
-    if headers:
-        h.update(headers)
-
-    data = None
-    if payload is not None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        h["Content-Type"] = "application/json"
-
-    req = urllib.request.Request(url, data=data, headers=h, method="POST" if data else "GET")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-def save_json(path, obj):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
 
 # ============================================================
-# MEMORY PRESERVATION
+# MEMORY
 # ============================================================
 
 def default_memory():
     return {
-        "version": "SIGZY_V6.2",
-        "created_at": thai_now().isoformat(),
-        "stats": {
-            "total_setups": 0,
-            "wins": 0,
-            "losses": 0,
-            "draws": 0,
-            "invalid": 0,
-            "opportunity_1": {"wins": 0, "losses": 0, "draws": 0},
-            "opportunity_2": {"wins": 0, "losses": 0, "draws": 0},
-            "opportunity_3": {"wins": 0, "losses": 0, "draws": 0},
-        },
-        "pairs": {},
-        "setups": {},
-        "lessons": [],
+        "sets": [],
+        "total_sets": 0,
+        "sets_with_win": 0,
+        "sets_loss_0_of_3": 0,
+        "opp_wins": 0,
+        "opp_losses": 0,
+        "opp_ambiguous": 0,
+        "active_sets": {},
+        "last_closed_candle": {}
     }
+
 
 def load_memory():
     if not MEMORY_FILE.exists():
-        mem = default_memory()
-        save_json(MEMORY_FILE, mem)
-        return mem
-
-    try:
-        mem = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
-        base = default_memory()
-
-        if not isinstance(mem, dict):
-            return base
-
-        for k, v in base.items():
-            if k not in mem:
-                mem[k] = v
-
-        for k, v in base["stats"].items():
-            if k not in mem["stats"]:
-                mem["stats"][k] = v
-
-        return mem
-    except Exception as e:
-        log(f"[MEMORY] load error: {e}")
         return default_memory()
 
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        memory = default_memory()
+        if isinstance(data, dict):
+            memory.update(data)
+
+        return memory
+
+    except Exception as e:
+        print("Memory load error:", e)
+        return default_memory()
+
+
 MEMORY = load_memory()
+
+
+def save_memory():
+    try:
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(
+                MEMORY,
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+    except Exception as e:
+        print("Memory save error:", e)
+
 
 # ============================================================
 # DISCORD
 # ============================================================
 
-def discord(msg):
+def send_discord(message):
     if not DISCORD_WEBHOOK_URL:
-        log("[WARN] DISCORD_WEBHOOK_URL is not set.")
+        print("Discord: MISSING")
         return False
 
     try:
-        data = json.dumps({"content": msg}, ensure_ascii=False).encode("utf-8")
+        payload = json.dumps({"content": message}).encode("utf-8")
         req = urllib.request.Request(
             DISCORD_WEBHOOK_URL,
-            data=data,
+            data=payload,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "SIGZY-V6.2"
+                "User-Agent": "Mozilla/5.0"
             },
-            method="POST",
+            method="POST"
         )
-        with urllib.request.urlopen(req, timeout=15):
-            pass
+
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
+            if response.status >= 300:
+                print("Discord Error status:", response.status)
+                return False
+
         return True
+
     except Exception as e:
-        log(f"[DISCORD ERROR] {e}")
+        print("Discord Error:", e)
         return False
 
+
 # ============================================================
-# MARKET DATA
+# TWELVE DATA
 # ============================================================
 
-def fetch_crypto_klines(symbol, limit=80):
-    url = (
-        "https://api.binance.com/api/v3/klines"
-        f"?symbol={symbol}&interval=1m&limit={limit}"
-    )
-    raw = http_json(url)
+def format_symbol_for_twelve(symbol):
+    if symbol in CRYPTO:
+        base = symbol[:-4]
+        quote = symbol[-4:]
+        return f"{base}/{quote}"
+    elif symbol in FOREX:
+        return f"{symbol[:3]}/{symbol[3:]}"
+    return symbol
 
-    candles = []
-    for x in raw:
-        candles.append({
-            "open": float(x[1]),
-            "high": float(x[2]),
-            "low": float(x[3]),
-            "close": float(x[4]),
-            "volume": float(x[5]),
-            "time": int(x[0]),
+
+def aggregate_5m_to_10m(candles):
+    result = []
+    for i in range(0, len(candles) - 1, 2):
+        a = candles[i]
+        b = candles[i + 1]
+        result.append({
+            "datetime": a["datetime"],
+            "open": a["open"],
+            "high": max(a["high"], b["high"]),
+            "low": min(a["low"], b["low"]),
+            "close": b["close"]
         })
-    return candles
+    return result
 
-def fetch_forex_klines(symbol, limit=80):
-    ysymbol = symbol + "=X"
+
+def get_market_data(symbol):
+    if not TWELVE_DATA_API_KEY:
+        raise RuntimeError("TWELVE_DATA_API_KEY ยังไม่ได้ตั้งค่า")
+
+    formatted_symbol = format_symbol_for_twelve(symbol)
     url = (
-        "https://query1.finance.yahoo.com/v8/finance/chart/"
-        f"{ysymbol}?interval=1m&range=1d"
+        f"https://api.twelvedata.com/time_series"
+        f"?symbol={formatted_symbol}"
+        f"&interval={TWELVE_INTERVAL}"
+        f"&outputsize={OUTPUT_SIZE + 20}"
+        f"&timezone=UTC"
+        f"&apikey={TWELVE_DATA_API_KEY}"
     )
 
-    raw = http_json(url)
-    result = raw["chart"]["result"][0]
-    quote = result["indicators"]["quote"][0]
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
 
-    opens = quote.get("open", [])
-    highs = quote.get("high", [])
-    lows = quote.get("low", [])
-    closes = quote.get("close", [])
-    volumes = quote.get("volume", [])
-    timestamps = result.get("timestamp", [])
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"HTTPError {e.code}: {error_body}")
+    except Exception as e:
+        raise RuntimeError(f"Network error: {e}")
+
+    if data.get("status") == "error":
+        raise RuntimeError(data.get("message", "Twelve Data API Error"))
+
+    values = data.get("values", [])
+    if len(values) < 100:
+        raise RuntimeError(f"ข้อมูล 5M ไม่พอ: {len(values)} candles")
 
     candles = []
-    for i in range(min(len(opens), len(highs), len(lows), len(closes))):
-        if None in (opens[i], highs[i], lows[i], closes[i]):
+    for x in reversed(values):
+        try:
+            candles.append({
+                "datetime": x["datetime"],
+                "open": float(x["open"]),
+                "high": float(x["high"]),
+                "low": float(x["low"]),
+                "close": float(x["close"])
+            })
+        except Exception:
             continue
 
-        vol = 0.0
-        if i < len(volumes) and volumes[i] is not None:
-            vol = float(volumes[i])
+    if len(candles) < 100:
+        raise RuntimeError("OHLC data ไม่เพียงพอ")
 
-        ts = int(timestamps[i]) if i < len(timestamps) else 0
+    closed_5m = candles[:-1]
+    ten_minute = aggregate_5m_to_10m(closed_5m)
 
-        candles.append({
-            "open": float(opens[i]),
-            "high": float(highs[i]),
-            "low": float(lows[i]),
-            "close": float(closes[i]),
-            "volume": vol,
-            "time": ts,
-        })
+    if len(ten_minute) < 100:
+        raise RuntimeError("แท่ง 10M ไม่เพียงพอ")
 
-    return candles[-limit:]
+    return ten_minute[-500:]
 
-def fetch_klines(symbol, limit=80):
-    if symbol in CRYPTO:
-        return fetch_crypto_klines(symbol, limit)
-    return fetch_forex_klines(symbol, limit)
 
 # ============================================================
-# TECHNICAL CALCULATIONS
+# INDICATORS
 # ============================================================
 
-def ema(values, period):
+def sma(values, period):
     if len(values) < period:
         return None
+    return sum(values[-period:]) / period
 
-    k = 2.0 / (period + 1.0)
-    value = sum(values[:period]) / period
 
-    for x in values[period:]:
-        value = x * k + value * (1.0 - k)
-
-    return value
-
-def safe_avg(values):
-    return sum(values) / len(values) if values else 0.0
-
-def market_score(candles):
-    if len(candles) < 30:
+def atr(candles, period=14):
+    if len(candles) < period + 1:
         return None
 
-    closes = [c["close"] for c in candles]
-    volumes = [c["volume"] for c in candles]
+    trs = []
+    for i in range(1, len(candles)):
+        current = candles[i]
+        previous = candles[i - 1]
+        tr = max(
+            current["high"] - current["low"],
+            abs(current["high"] - previous["close"]),
+            abs(current["low"] - previous["close"])
+        )
+        trs.append(tr)
 
-    last = candles[-1]
-    prev = candles[-2]
+    return sum(trs[-period:]) / period
 
-    ema9 = ema(closes, 9)
-    ema21 = ema(closes, 21)
 
-    if ema9 is None or ema21 is None:
-        return None
+def support_resistance(candles, lookback=100):
+    data = candles[-lookback:]
+    support = min(x["low"] for x in data)
+    resistance = max(x["high"] for x in data)
+    return support, resistance
+
+
+# ============================================================
+# CANDLE & MOMENTUM
+# ============================================================
+
+def candle_structure(candle):
+    o = candle["open"]
+    h = candle["high"]
+    l = candle["low"]
+    c = candle["close"]
+
+    total_range = h - l
+    body = abs(c - o)
+
+    if total_range <= 0:
+        return 0, 0
+
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
 
     bull = 0
     bear = 0
-    reasons = []
 
-    if ema9 > ema21:
+    if c > o:
         bull += 1
-        reasons.append("EMA_UP")
-    elif ema9 < ema21:
-        bear += 1
-        reasons.append("EMA_DOWN")
-
-    if last["close"] > last["open"]:
-        bull += 1
-        reasons.append("CANDLE_BULL")
-    elif last["close"] < last["open"]:
-        bear += 1
-        reasons.append("CANDLE_BEAR")
-
-    if prev["close"] > prev["open"]:
-        bull += 1
-    elif prev["close"] < prev["open"]:
+    elif c < o:
         bear += 1
 
-    momentum = closes[-1] - closes[-6]
+    if body / total_range >= 0.60:
+        if c > o:
+            bull += 2
+        elif c < o:
+            bear += 2
+
+    if lower_wick > body * 1.5:
+        bull += 1
+    if upper_wick > body * 1.5:
+        bear += 1
+
+    return bull, bear
+
+
+def momentum_score(candles):
+    closes = [x["close"] for x in candles]
+    if len(closes) < 10:
+        return 0
+
+    change = closes[-1] - closes[-6]
+    if change > 0:
+        return 10
+    if change < 0:
+        return -10
+    return 0
+
+
+# ============================================================
+# ANALYSIS
+# ============================================================
+
+def analyze_market(symbol, candles):
+    closes = [x["close"] for x in candles]
+    price = closes[-1]
+
+    ma3 = sma(closes, 3)
+    ma7 = sma(closes, 7)
+    ma15 = sma(closes, 15)
+
+    current_atr = atr(candles, 14)
+    support, resistance = support_resistance(candles, 100)
+
+    bull_candle, bear_candle = candle_structure(candles[-1])
+    momentum = momentum_score(candles)
+
+    call_score = 0
+    put_score = 0
+
+    call_reasons = []
+    put_reasons = []
+
+    if ma3 and ma7 and ma15:
+        if ma3 > ma7 and ma7 > ma15 and price > ma3:
+            call_score += 30
+            call_reasons.append("MA bullish")
+        elif ma3 < ma7 and ma7 < ma15 and price < ma3:
+            put_score += 30
+            put_reasons.append("MA bearish")
+
     if momentum > 0:
-        bull += 1
-        reasons.append("MOMENTUM_UP")
+        call_score += 10
+        call_reasons.append("Momentum bullish")
     elif momentum < 0:
-        bear += 1
-        reasons.append("MOMENTUM_DOWN")
+        put_score += 10
+        put_reasons.append("Momentum bearish")
 
-    avg_vol = safe_avg(volumes[-10:])
-    if avg_vol > 0 and last["volume"] > avg_vol * 1.10:
-        if last["close"] > last["open"]:
-            bull += 1
-            reasons.append("VOLUME_BULL")
-        elif last["close"] < last["open"]:
-            bear += 1
-            reasons.append("VOLUME_BEAR")
+    if bull_candle >= 2:
+        call_score += 15
+        call_reasons.append("Bullish candle")
+    if bear_candle >= 2:
+        put_score += 15
+        put_reasons.append("Bearish candle")
 
-    if bull == bear:
-        return {
-            "score": 0.0,
-            "signal": "NEUTRAL",
-            "bull": bull,
-            "bear": bear,
-            "price": last["close"],
-            "ema9": ema9,
-            "ema21": ema21,
-            "reasons": reasons + ["NO_EDGE"],
-        }
+    if current_atr:
+        distance_support = abs(price - support)
+        distance_resistance = abs(resistance - price)
 
-    signal = "CALL" if bull > bear else "PUT"
-    edge = abs(bull - bear)
-    score = 85.0 + min(14.0, edge / 4.0 * 14.0)
+        if distance_support <= current_atr * 0.8:
+            call_score += 15
+            call_reasons.append("Near support")
+        if distance_resistance <= current_atr * 0.8:
+            put_score += 15
+            put_reasons.append("Near resistance")
+
+    if call_score >= MIN_SCORE and call_score > put_score:
+        decision = "CALL"
+        score = call_score
+        reasons = call_reasons
+    elif put_score >= MIN_SCORE and put_score > call_score:
+        decision = "PUT"
+        score = put_score
+        reasons = put_reasons
+    else:
+        decision = "WAIT"
+        score = max(call_score, put_score)
+        reasons = ["ไม่มี setup ผ่านเกณฑ์ 85.0"]
 
     return {
-        "score": round(score, 2),
-        "signal": signal,
-        "bull": bull,
-        "bear": bear,
-        "price": last["close"],
-        "ema9": ema9,
-        "ema21": ema21,
+        "symbol": symbol,
+        "price": price,
+        "decision": decision,
+        "score": score,
+        "call_score": call_score,
+        "put_score": put_score,
+        "atr": current_atr,
+        "support": support,
+        "resistance": resistance,
         "reasons": reasons,
+        "candle_time": candles[-1]["datetime"]
     }
 
+
 # ============================================================
-# AI INTEGRATION
+# OPPORTUNITY
 # ============================================================
 
-def parse_ai_json(text):
-    text = str(text).strip()
-    if text.startswith("```"):
-        text = text.replace("
+def create_opportunity(signal, number):
+    if signal["decision"] == "WAIT":
+        return None
+    if not signal["atr"] or signal["atr"] <= 0:
+        return None
+
+    entry = signal["price"]
+    direction = signal["decision"]
+
+    if direction == "CALL":
+        tp = entry + signal["atr"] * TP_ATR
+        sl = entry - signal["atr"] * SL_ATR
+    else:
+        tp = entry - signal["atr"] * TP_ATR
+        sl = entry + signal["atr"] * SL_ATR
+
+    return {
+        "opp": number,
+        "direction": direction,
+        "entry": entry,
+        "entry_time": now(),
+        "entry_candle": signal["candle_time"],
+        "tp": tp,
+        "sl": sl,
+        "status": "ACTIVE"
+    }
+
+
+def statistics_text():
+    total = MEMORY["total_sets"]
+    wins = MEMORY["sets_with_win"]
+    losses = MEMORY["sets_loss_0_of_3"]
+
+    set_rate = (wins / total * 100) if total > 0 else 0
+    total_opp = MEMORY["opp_wins"] + MEMORY["opp_losses"]
+    opp_rate = (MEMORY["opp_wins"] / total_opp * 100) if total_opp > 0 else 0
+
+    return (
+        f"Sets: {total}\n"
+        f">=1 WIN: {wins}\n"
+        f"0/3 LOSS: {losses}\n"
+        f"Set WIN Rate: {set_rate:.2f}%\n"
+        f"Opportunity WIN Rate: {opp_rate:.2f}%"
+    )
+
+
+def send_signal(signal, opportunity):
+    icon = "🟢" if opportunity["direction"] == "CALL" else "🔴"
+    message = (
+        f"{icon} **SIGZY V6.2 SIGNAL**\n"
+        f"คู่เงิน: **{signal['symbol']}**\n"
+        f"OPP: **{opportunity['opp']}**\n"
+        f"Signal: **{opportunity['direction']}**\n"
+        f"เวลาเข้า: **{opportunity['entry_time']}**\n"
+        f"Entry: **{opportunity['entry']:.5f}**\n"
+        f"TP: **{opportunity['tp']:.5f}**\n"
+        f"SL: **{opportunity['sl']:.5f}**\n"
+        f"Score: **{signal['score']}**\n"
+        f"CALL: {signal['call_score']} | PUT: {signal['put_score']}\n"
+        f"แท่ง 10M: **{signal['candle_time']}**\n"
+        f"เหตุผล: {', '.join(signal['reasons'])}"
+    )
+    send_discord(message)
+
+
+# ============================================================
+# EVALUATE
+# ============================================================
+
+def check_opportunity(opportunity, candle):
+    high = candle["high"]
+    low = candle["low"]
+
+    if opportunity["direction"] == "CALL":
+        hit_tp = high >= opportunity["tp"]
+        hit_sl = low <= opportunity["sl"]
+    else:
+        hit_tp = low <= opportunity["tp"]
+        hit_sl = high >= opportunity["sl"]
+
+    if hit_tp and hit_sl:
+        return "AMBIGUOUS"
+    if hit_tp:
+        return "WIN"
+    if hit_sl:
+        return "LOSS"
+    return "PENDING"
+
+
+def finish_set_as_win(symbol, active, opportunity):
+    opportunity["status"] = "WIN"
+    MEMORY["opp_wins"] += 1
+    MEMORY["total_sets"] += 1
+    MEMORY["sets_with_win"] += 1
+
+    MEMORY["sets"].append(active)
+    MEMORY["sets"] = MEMORY["sets"][-1000:]
+    del MEMORY["active_sets"][symbol]
+    save_memory()
+
+    send_discord(
+        f"🟢 **SIGZY WIN**\n"
+        f"คู่เงิน: {symbol}\n"
+        f"OPP{opportunity['opp']} WIN\n\n"
+        f"{statistics_text()}"
+    )
+
+
+def finish_set_zero_three(symbol, active):
+    MEMORY["total_sets"] += 1
+    MEMORY["sets_loss_0_of_3"] += 1
+
+    MEMORY["sets"].append(active)
+    MEMORY["sets"] = MEMORY["sets"][-1000:]
+    del MEMORY["active_sets"][symbol]
+    save_memory()
+
+    send_discord(
+        f"🔴 **SIGZY 0/3 LOSS**\n"
+        f"คู่เงิน: {symbol}\n"
+        f"ครบ 3 Opportunity แล้วไม่มี WIN\n\n"
+        f"{statistics_text()}"
+    )
+
+
+def process_active_set(symbol, candles):
+    active = MEMORY["active_sets"].get(symbol)
+    if not active:
+        return False
+
+    opportunity = active["opportunities"][-1]
+    candle = candles[-1]
+
+    if candle["datetime"] == opportunity["entry_candle"]:
+        return True
+
+    result = check_opportunity(opportunity, candle)
+    if result == "PENDING":
+        return True
+
+    if result == "AMBIGUOUS":
+        opportunity["status"] = "AMBIGUOUS"
+        MEMORY["opp_ambiguous"] += 1
+        save_memory()
+        send_discord(
+            f"🟡 **SIGZY AMBIGUOUS**\n"
+            f"คู่เงิน: {symbol}\n"
+            f"OPP{opportunity['opp']} ชน TP และ SL ในแท่งเดียวกัน"
+        )
+        return True
+
+    if result == "WIN":
+        finish_set_as_win(symbol, active, opportunity)
+        return False
+
+    opportunity["status"] = "LOSS"
+    MEMORY["opp_losses"] += 1
+
+    if opportunity["opp"] < 3:
+        signal = analyze_market(symbol, candles)
+        if signal["decision"] != "WAIT":
+            next_opp = create_opportunity(signal, opportunity["opp"] + 1)
+            if next_opp:
+                active["opportunities"].append(next_opp)
+                save_memory()
+                send_signal(signal, next_opp)
+                send_discord(
+                    f"🔄 **RE-ANALYSIS**\n"
+                    f"คู่เงิน: {symbol}\n"
+                    f"OPP{opportunity['opp']} = LOSS → วิเคราะห์ใหม่ OPP{next_opp['opp']}"
+                )
+                return True
+
+        save_memory()
+        send_discord(
+            f"⚪ **WAIT**\n"
+            f"คู่เงิน: {symbol}\n"
+            f"OPP{opportunity['opp']} LOSS (ยังไม่มี setup ผ่านเกณฑ์ 85.0)"
+        )
+        return True
+
+    finish_set_zero_three(symbol, active)
+    return False
+
+
+# ============================================================
+# PROCESS SYMBOL
+# ============================================================
+
+def process_symbol(symbol):
+    try:
+        candles = get_market_data(symbol)
+    except Exception as e:
+        print(f"[{now()}] {symbol} DATA ERROR: {e}")
+        return
+
+    latest = candles[-1]
+    latest_time = latest["datetime"]
+
+    previous = MEMORY["last_closed_candle"].get(symbol)
+    if previous == latest_time:
+        return
+
+    MEMORY["last_closed_candle"][symbol] = latest_time
+    save_memory()
+
+    print(f"[{now()}] NEW CLOSED 10M [{symbol}]: {latest_time}")
+
+    if symbol in MEMORY["active_sets"]:
+        still_active = process_active_set(symbol, candles)
+        if still_active:
+            return
+
+    signal = analyze_market(symbol, candles)
+    print(f"[{now()}] {symbol} -> {signal['decision']} Score={signal['score']}")
+
+    if signal["decision"] == "WAIT":
+        return
+
+    opportunity = create_opportunity(signal, 1)
+    if opportunity:
+        MEMORY["active_sets"][symbol] = {
+            "symbol": symbol,
+            "created_at": now(),
+            "opportunities": [opportunity]
+        }
+        save_memory()
+        send_signal(signal, opportunity)
+
+
+# ============================================================
+# STARTUP & MAIN
+# ============================================================
+
+def startup():
+    print("=" * 70)
+    print("SIGZY BRAIN V6.2 - MULTI SYMBOL SCANNER")
+    print("Threshold: 85.0 | Railway Ready")
+    print("=" * 70)
+    print(f"Total Symbols: {len(ALL_SYMBOLS)}")
+    print(f"Memory Path: {MEMORY_FILE}")
+    print("=" * 70)
+
+    if not TWELVE_DATA_API_KEY:
+        print("ERROR: TWELVE_DATA_API_KEY missing")
+        return False
+    if not DISCORD_WEBHOOK_URL:
+        print("ERROR: DISCORD_WEBHOOK_URL missing")
+        return False
+    return True
+
+
+def main():
+    if not startup():
+        return
+
+    send_discord("🚀 **SIGZY BRAIN V6.2 STARTED ON RAILWAY** (Multi-Symbol Scanner)")
+
+    while True:
+        cycle_start = time.time()
+
+        for symbol in ALL_SYMBOLS:
+            process_symbol(symbol)
+            time.sleep(1)  # ป้องกันยิง API ถี่เกินไป
+
+        elapsed = time.time() - cycle_start
+        sleep_time = max(5, SCAN_INTERVAL - elapsed)
+
+        print(f"[{now()}] ครบรอบสแกน รออีก {sleep_time:.1f} วินาที...")
+        try:
+            time.sleep(sleep_time)
+        except KeyboardInterrupt:
+            print("SIGZY STOPPED")
+            break
+
+
+if __name__ == "__main__":
+    main()
