@@ -6,6 +6,8 @@ import time
 import requests
 from datetime import datetime, timezone, timedelta
 import yfinance as yf
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ============================================================
 # CONFIGURATIONS & GLOBAL VARIABLES
@@ -233,7 +235,6 @@ def run_script_1_scanner():
                     SENT_SIGNALS.add(signal_key)
                     PENDING_TRADES.append(res)
                     
-                    # ส่งเข้า Tracker (ระบบที่ 2) อัตโนมัติทันทีที่พบสัญญาณ
                     ACTIVE_TRACKERS.append({
                         "symbol": res["symbol"],
                         "decision": res["decision"],
@@ -410,7 +411,6 @@ def run_script_2_tracker():
 
 def main():
     log("🚀 รวมสคริปต์ทำงานพร้อมกัน: [ระบบ 1: สัญญาณ 15M] + [ระบบ 2: Sigzy Tracker]")
-    send_discord("🤖 **SIGZY BOT COMBINED ONLINE**\nบอทสแกนสัญญาณและระบบติดตามผล (Tracker) เริ่มทำงานพร้อมกันแล้วครับ!")
     
     load_memory_from_file()
 
@@ -427,8 +427,7 @@ def main():
 
         log("⏳ พักรอบการทำงาน 3 นาที...\n" + "="*50)
         time.sleep(180)
-from threading import Thread
-from http.server import HTTPServer, BaseHTTPRequestHandler
+
 
 # สร้างเว็บเซิร์ฟเวอร์จำลองเพื่อให้ Railway มองว่าแอปทำงานอยู่ตลอดเวลา
 class DummyHandler(BaseHTTPRequestHandler):
