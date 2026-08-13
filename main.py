@@ -1,6 +1,4 @@
-from pathlib import Path
-
-code = r'''# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 SIGZY 15M + 5M ZONE FLIP / 3-OPPORTUNITY TRACKER
 Python 3.10 / Railway ready
@@ -1537,19 +1535,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-'''
-
-path = Path("/mnt/data/main.py")
-path.write_text(code, encoding="utf-8")
-
-# Also create a minimal requirements file suitable for Railway/Python 3.10.
-requirements = """requests>=2.31.0
-yfinance>=0.2.40
-google-genai>=1.0.0
-"""
-req_path = Path("/mnt/data/requirements.txt")
-req_path.write_text(requirements, encoding="utf-8")
-
-print(f"สร้างไฟล์สำเร็จ: {path}")
-print(f"สร้างไฟล์สำเร็จ: {req_path}")
-print(f"main.py ขนาด {path.stat().st_size:,} bytes")
