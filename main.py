@@ -10,7 +10,6 @@ import yfinance as yf
 # SIGZY AI 15M - YFINANCE VERSION (NO API LIMIT / FREE FOREX)
 # ============================================================
 
-# แมปคู่เงินสัญลักษณ์มาตรฐานเป็นฟอร์แมตของ Yahoo Finance
 SYMBOL_MAP = {
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
@@ -111,12 +110,28 @@ def calculate_ema(candles, period=50):
     return ema
 
 
-def body(c): return abs(c["close"] - c["open"])
-def candle_range(c): return max(c["high"] - c["low"], 0.00000001)
-def upper_wick(c): return c["high"] - max(c["open"], c["close"])
-def lower_wick(c): return min(c["open"], c["close"]) - c["low"]
-def bullish(c): return c["close"] > c["open"]
-def bearish(c): return c["close"] < c["open"]
+def body(c):
+    return abs(c["close"] - c["open"])
+
+
+def candle_range(c):
+    return max(c["high"] - c["low"], 0.00000001)
+
+
+def upper_wick(c):
+    return c["high"] - max(c["open"], c["close"])
+
+
+def lower_wick(c):
+    return min(c["open"], c["close"]) - c["low"]
+
+
+def bullish(c):
+    return c["close"] > c["open"]
+
+
+def bearish(c):
+    return c["close"] < c["open"]
 
 
 def analyze_15m_opportunity(symbol, candles):
@@ -154,7 +169,3 @@ def analyze_15m_opportunity(symbol, candles):
 
     is_strong_bull = bullish(c0) and ratio0 >= 0.70
     is_strong_bear = bearish(c0) and ratio0 >= 0.70
-    is_hammer = lower0 >= b0 * 2.5 and upper0 <= r0 * 0.20 and ratio0 <= 0.40
-    is_shooting_star = upper0 >= b0 * 2.5 and lower0 <= r0 * 0.20 and ratio0 <= 0.40
-    is_bull_engulfing = (bullish(c0) and bearish(c1) and c0["open"] <= c1["close"] and c0["close"] >= c1["open"] and body(c0) > body(c1))
-    is_bear_engulfing = (bearish(c0) and bullish(c
