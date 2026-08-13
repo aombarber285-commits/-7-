@@ -6,7 +6,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 
 # ============================================================
-# SIGZY AI 15M - FIXED AUTO-TRACKER & DYNAMIC THRESHOLD
+# SIGZY AI 15M - AUTO-TRACKER & BRAIN ENGINE
 # ============================================================
 
 SYMBOLS = [
@@ -40,6 +40,7 @@ if DISCORD_WEBHOOK_URL.startswith("Https://"):
 STATS_WEBHOOK_URL = os.getenv("STATS_WEBHOOK_URL", "")
 
 SENT_SIGNALS = set()
+PROCESSED_KEYS = set()
 PENDING_TRADES = []
 TRADE_HISTORY = []
 
@@ -51,7 +52,6 @@ def now_text():
 
 
 def format_candle_time(utc_time_str):
-    """แปลงเวลา Candle จาก UTC ให้เป็นเวลาไทย (GMT+7)"""
     try:
         dt = datetime.strptime(utc_time_str, "%Y-%m-%d %H:%M:%S")
         thai_dt = dt + timedelta(hours=7)
@@ -71,10 +71,6 @@ def send_discord(message):
         )
     except Exception as e:
         print("Discord Error:", e)
-
-
-def is_trading_time():
-    return True
 
 
 def get_time_session(thai_hour):
@@ -197,6 +193,9 @@ def get_threshold(regime, thai_hour):
     return base_threshold
 
 
+# ============================================================
+# คลังสมองวิเคราะห์หลัก (BRAIN ENGINE)
+# ============================================================
 def analyze_15m_opportunity(symbol, candles):
     if len(candles) < 50:
         return {"decision": "WAIT", "score": 0}
@@ -337,7 +336,7 @@ def analyze_15m_opportunity(symbol, candles):
         "regime": regime,
         "threshold": threshold,
         "reasons": " | ".join(reasons),
-        "candle_time": c0["datetime"], # เก็บเป็น UTC เพื่อเปรียบเทียบในระบบ
+        "candle_time": c0["datetime"],
         "session": get_time_session(thai_hour)
     }
 
@@ -360,7 +359,7 @@ def calculate_session_stats():
 
 
 def verify_pending_trades():
-    global PENDING_TRADES, TRADE_HISTORY
+    global PENDING_TRADES, TRADE_HISTORY, PROCESSED_KEYS
 
     if not PENDING_TRADES:
         return
@@ -368,16 +367,25 @@ def verify_pending_trades():
     remaining_trades = []
 
     for trade in PENDING_TRADES:
+        trade_key = (trade["symbol"], trade["candle_time"], trade["decision"])
+        
+        if trade_key in PROCESSED_KEYS:
+            continue
+
         candles = get_market_data(trade["symbol"])
         if not candles:
             remaining_trades.append(trade)
             continue
 
-        latest_candle = candles[-1]
-        
-        # แก้ไขการเปรียบเทียบ: ใช้เวลา UTC เทียบกับ UTC ตรงๆ
-        if latest_candle["datetime"] != trade["candle_time"]:
-            close_price = latest_candle["close"]
+        target_candle = None
+        for c in candles:
+            if c["datetime"] > trade["candle_time"]:
+                target_candle = c
+                break
+
+        if target_candle:
+            PROCESSED_KEYS.add(trade_key)
+            close_price = target_candle["close"]
             direction = trade["decision"]
             entry_price = trade["price"]
 
@@ -411,7 +419,7 @@ def verify_pending_trades():
                 f"📊 **RESULT UPDATE (AUTO-TRACKER)**\n\n"
                 f"💱 คู่เงิน: **{record['symbol']}** ({record['decision']})\n"
                 f"🏆 Score: **{record['score']}/100** | Session: **{record['session']} น.**\n"
-                f"📍 Entry: **{record['entry_price']:.5f}** $\rightarrow$ Close: **{record['close_price']:.5f}**\n"
+                f"📍 Entry: **{record['entry_price']:.5f}** -> Close: **{record['close_price']:.5f}**\n"
                 f"🏁 ผลลัพธ์: **{record['result']}**\n\n"
                 f"📈 **WIN RATE BY SESSION**\n"
                 f"{session_stats}\n"
@@ -419,6 +427,7 @@ def verify_pending_trades():
                 f"🕐 {now_text()}"
             )
             send_discord(msg)
+            print(f"✅ ตรวจผลสำเร็จ: {record['symbol']} -> {record['result']}")
 
             if STATS_WEBHOOK_URL:
                 try:
@@ -498,41 +507,30 @@ def send_update(signals, watchlist):
         send_discord(watch_msg)
 
 
-def wait_next_15m():
-    now = datetime.now(timezone.utc)
-    minute = now.minute
-    next_block = ((minute // 15) + 1) * 15
-
-    if next_block >= 60:
-        target = (now + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0)
-    else:
-        target = now.replace(minute=next_block, second=5, microsecond=0)
-
-    total_seconds = int((target - now).total_seconds())
-    if total_seconds <= 0:
-        return
-
-    print(f"\n⏳ รอแท่ง 15M ถัดไป (ประมาณ {total_seconds} วินาที)...")
-    time.sleep(total_seconds)
-
-
 def main():
     print()
     print("=" * 65)
-    print("SIGZY AI 15M - FIXED AUTO-TRACKER STARTED")
+    print("SIGZY AI 15M - ALWAYS ACTIVE TRACKER STARTED")
     print("=" * 65)
 
-    send_discord("🤖 **SIGZY ONLINE (FIXED AUTO-TRACKER)**\nแก้ไขระบบตรวจผลแพ้/ชนะเรียบร้อย บอตพร้อมตรวจผลอัตโนมัติเมื่อจบแท่ง!")
+    send_discord("🤖 **SIGZY ONLINE**\nพร้อมสแกนกราฟและตรวจผลอัตโนมัติ!")
+
+    last_scan_time = 0
 
     while True:
         try:
             verify_pending_trades()
-            signals, watchlist = scan_all_symbols()
-            send_update(signals, watchlist)
+
+            now_ts = time.time()
+            if now_ts - last_scan_time >= 300:
+                signals, watchlist = scan_all_symbols()
+                send_update(signals, watchlist)
+                last_scan_time = now_ts
+
         except Exception as e:
             print(f"MAIN ERROR: {e}")
 
-        wait_next_15m()
+        time.sleep(30)
 
 
 if __name__ == "__main__":
