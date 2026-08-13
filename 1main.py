@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 import yfinance as yf
 from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from google import genai
 
 # ============================================================
 # CONFIGURATIONS & GLOBAL VARIABLES
@@ -20,6 +21,9 @@ RAW_WEBHOOK = os.getenv(
 DISCORD_WEBHOOK_URL = RAW_WEBHOOK.strip()
 if DISCORD_WEBHOOK_URL.startswith("Https://"):
     DISCORD_WEBHOOK_URL = "https://" + DISCORD_WEBHOOK_URL[8:]
+
+# ตั้งค่า Client สำหรับ Google GenAI
+ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 SYMBOL_MAP = {
     "EUR/USD": "EURUSD=X",
@@ -69,6 +73,45 @@ def send_discord(message):
             print(f"  [Discord Error] Status Code: {response.status_code}")
     except Exception as e:
         print(f"  [Discord Exception] {e}")
+
+
+# ============================================================
+# [AI Integration] ฟังก์ชันวิเคราะห์ตลาดด้วย Gemini
+# ============================================================
+
+def ai_market_trend_report(symbol="EUR/USD"):
+    """ให้ AI วิเคราะห์แนวโน้มตลาดปัจจุบัน"""
+    try:
+        prompt = (
+            f"ช่วยวิเคราะห์แนวโน้มสภาวะตลาด forex คู่เงิน {symbol} ในกรอบเวลาสั้นๆ ตอนนี้ให้หน่อยครับ "
+            f"ขอแบบกระชับสั้นๆ 2-3 บรรทัด ว่าตลาดกำลังอยู่ในเทรนด์ขาขึ้น ขาลง หรือไซด์เวย์ และควรระวังอะไร"
+        )
+        response = ai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+        )
+        return response.text
+    except Exception as e:
+        return f"AI Analysis Error: {e}"
+
+
+def market_reporter_loop():
+    """ลูปการทำงานที่จะส่งรายงานวิเคราะห์จาก AI ทุก 5 นาที"""
+    while True:
+        try:
+            print("🤖 กำลังให้ AI วิเคราะห์แนวโน้มตลาดรอบ 5 นาที...")
+            analysis = ai_market_trend_report("EUR/USD")
+            message = (
+                f"📊 **[รายงานตลาดรอบ 5 นาที]** 🤖\n"
+                f"----------------------------------\n"
+                f"{analysis}\n"
+                f"----------------------------------"
+            )
+            send_to_discord(message)
+        except Exception as e:
+            print(f"Market Reporter Error: {e}")
+        
+        time.sleep(300)
 
 
 # ============================================================
@@ -406,13 +449,17 @@ def run_script_2_tracker():
 
 
 # ============================================================
-# MAIN LOOP (รันพร้อมกันในเซิร์ฟเวอร์เดียว)
+# MAIN LOOP & BACKGROUND THREADS
 # ============================================================
 
 def main():
-    log("🚀 รวมสคริปต์ทำงานพร้อมกัน: [ระบบ 1: สัญญาณ 15M] + [ระบบ 2: Sigzy Tracker]")
+    log("🚀 รวมสคริปต์ทำงานพร้อมกัน: [ระบบ 1: สัญญาณ 15M] + [ระบบ 2: Sigzy Tracker] + [AI 5M Report]")
     
     load_memory_from_file()
+
+    # รัน AI Market Reporter แยก Thread ออกไป เพื่อให้ส่งรายงานทุก 5 นาทีโดยไม่บล็อกระบบเทรดหลัก
+    reporter_thread = Thread(target=market_reporter_loop, daemon=True)
+    reporter_thread.start()
 
     while True:
         try:
