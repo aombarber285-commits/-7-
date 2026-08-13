@@ -1,4 +1,3 @@
+google-genai
 requests
 yfinance
-pandas
-numpy
