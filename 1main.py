@@ -107,7 +107,7 @@ def market_reporter_loop():
                 f"{analysis}\n"
                 f"----------------------------------"
             )
-            send_to_discord(message)
+            send_discord(message)
         except Exception as e:
             print(f"Market Reporter Error: {e}")
         
