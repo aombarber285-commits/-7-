@@ -7,7 +7,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 
 # ============================================================
-# SIGZY AI 15M - FIXED EVALUATION & PERSISTENT ENGINE
+# SIGZY AI 15M - API SAFE & ACCURATE ENGINE
 # ============================================================
 
 SYMBOLS = [
@@ -28,7 +28,14 @@ TIMEOUT = 10
 TP_ATR = 0.50
 SL_ATR = 0.50
 
-API_KEY_CORRECT = "77aef7a76c9b45e68d72394940bc0e77"
+# ระบบสำรอง API Key
+API_KEYS = [
+    "77aef7a76c9b45e68d72394940bc0e77",
+    # หากสมัคร Key ฟรีเพิ่ม นำมาวางเพิ่มตรงนี้ได้ครับ เช่น:
+    # "YOUR_SECOND_API_KEY",
+]
+current_key_index = 0
+
 HISTORY_FILE = "trade_history.json"
 
 RAW_WEBHOOK = os.getenv(
@@ -45,13 +52,11 @@ SENT_SIGNALS = set()
 PROCESSED_KEYS = set()
 PENDING_TRADES = []
 
-TRADE_HISTORY = []          # เก็บประวัติไม้รายออเดอร์
-CURRENT_SERIES_TRADES = []  # เก็บไม้ในชุดปัจจุบัน (1 ใน 3)
-SERIES_HISTORY = []         # เก็บประวัติ Series
+TRADE_HISTORY = []
+CURRENT_SERIES_TRADES = []
+SERIES_HISTORY = []
 
-# ============================================================
-# PERSISTENT HISTORY MANAGEMENT (เก็บข้อมูลถาวร)
-# ============================================================
+
 def load_history():
     global TRADE_HISTORY, SERIES_HISTORY
     if os.path.exists(HISTORY_FILE):
@@ -60,9 +65,9 @@ def load_history():
                 data = json.load(f)
                 TRADE_HISTORY = data.get("trade_history", [])
                 SERIES_HISTORY = data.get("series_history", [])
-                print(f"📦 โหลดประวัติสำเร็จ: Trade History ({len(TRADE_HISTORY)}) | Series History ({len(SERIES_HISTORY)})")
-        except Exception as e:
-            print("Error loading history:", e)
+        except Exception:
+            pass
+
 
 def save_history():
     try:
@@ -72,8 +77,8 @@ def save_history():
         }
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print("Error saving history:", e)
+    except Exception:
+        pass
 
 
 def now_text():
@@ -120,13 +125,20 @@ def get_time_session(thai_hour):
 
 
 def get_market_data(symbol):
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={INTERVAL}&outputsize={OUTPUT_SIZE}&timezone=UTC&apikey={API_KEY_CORRECT}"
+    global current_key_index
+
+    api_key = API_KEYS[current_key_index]
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={INTERVAL}&outputsize={OUTPUT_SIZE}&timezone=UTC&apikey={api_key}"
 
     try:
         response = requests.get(url, timeout=TIMEOUT)
         data = response.json()
 
         if data.get("status") == "error":
+            print(f"{symbol} API Limit/Error: {data.get('message')}")
+            # สลับไปใช้ Key ถัดไปหากมี
+            if len(API_KEYS) > 1:
+                current_key_index = (current_key_index + 1) % len(API_KEYS)
             return []
 
         values = data.get("values", [])
@@ -256,8 +268,6 @@ def analyze_15m_opportunity(symbol, candles):
     if ratio0 < 0.45:
         return {"decision": "WAIT", "score": 0}
 
-    call_score = 0
-    put_score = 0
     reasons = []
     confirmations_call = 0
     confirmations_put = 0
@@ -387,7 +397,6 @@ def verify_pending_trades():
             remaining_trades.append(trade)
             continue
 
-        # ดึงแท่งเทียนถัดไปที่จบแล้ว
         target_candle = None
         for c in candles:
             if c["datetime"] > trade["candle_time"]:
@@ -405,10 +414,6 @@ def verify_pending_trades():
             candle_low = target_candle["low"]
             close_price = target_candle["close"]
 
-            # ----------------------------------------------------
-            # 2. ตรวจ TP/SL จริงแบบ Intra-candle High/Low Check
-            # ----------------------------------------------------
-            result = "LOSS 🔴"
             exit_reason = "Close Price"
 
             if direction == "CALL":
@@ -420,7 +425,7 @@ def verify_pending_trades():
                     exit_reason = "SL Hit (Low)"
                 else:
                     result = "WIN 🟢" if close_price > entry_price else "LOSS 🔴"
-            else: # PUT
+            else:
                 if candle_low <= tp_price:
                     result = "WIN 🟢"
                     exit_reason = "TP Hit (Low)"
@@ -448,17 +453,12 @@ def verify_pending_trades():
             CURRENT_SERIES_TRADES.append(trade_record)
             trade_index = len(CURRENT_SERIES_TRADES)
 
-            # ----------------------------------------------------
-            # 3. แยกสถิติ Trade WR และ Series WR ชัดเจน
-            # ----------------------------------------------------
             total_trades = len(TRADE_HISTORY)
             wins_trades = sum(1 for t in TRADE_HISTORY if "WIN" in t["result"])
             trade_wr = (wins_trades / total_trades) * 100 if total_trades > 0 else 0
 
-            # เช็กสถิติ Series
             has_win = any("WIN" in t["result"] for t in CURRENT_SERIES_TRADES)
             is_series_complete = False
-            series_status = ""
 
             if has_win:
                 is_series_complete = True
@@ -479,23 +479,19 @@ def verify_pending_trades():
                 SERIES_HISTORY.append(series_record)
                 CURRENT_SERIES_TRADES = []
 
-            # คำนวณ Series Win Rate
             total_series = len(SERIES_HISTORY)
             wins_series = sum(1 for sr in SERIES_HISTORY if sr["result"] == "SERIES WIN 🟢")
             series_wr = (wins_series / total_series) * 100 if total_series > 0 else 0
 
-            # ----------------------------------------------------
-            # 4. บันทึก History ถาวรลงไฟล์
-            # ----------------------------------------------------
             save_history()
 
             msg = (
-                f"📊 **ACCURATE EVALUATION REPORT**\n\n"
+                f"📊 **SIGZY EVALUATION REPORT**\n\n"
                 f"💱 คู่เงิน: **{trade_record['symbol']}** ({trade_record['decision']})\n"
-                f"📍 ไม้ที่: **{trade_index}/3** ในรอบนี้ | Session: **{trade_record['session']} น.**\n"
+                f"📍 ไม้ที่: **{trade_index}/3** | Session: **{trade_record['session']} น.**\n"
                 f"🎯 Entry: **{trade_record['entry_price']:.5f}** -> Close: **{trade_record['close_price']:.5f}**\n"
                 f"🏁 ผลออเดอร์: **{trade_record['result']}** ({trade_record['exit_reason']})\n\n"
-                f"🏆 **สถานะรอบ Series:** **{series_status}**\n"
+                f"🏆 **สถานะ Series:** **{series_status}**\n"
                 f"----------------------------------------\n"
                 f"🎯 **SINGLE TRADE WR:** {wins_trades}/{total_trades} ไม้ (**{trade_wr:.2f}%**)\n"
                 f"🏆 **SERIES (1 ใน 3) WR:** {wins_series}/{total_series} รอบ (**{series_wr:.2f}%**)\n"
@@ -518,10 +514,7 @@ def scan_all_symbols():
     signals = []
     watchlist = []
 
-    print()
-    print("=" * 65)
-    print(f"[{now_text()}] 🔍 สแกน 8 คู่เงิน (Accuracy Mode)...")
-    print("=" * 65)
+    print(f"[{now_text()}] 🔍 สแกน 8 คู่เงิน...")
 
     for symbol in SYMBOLS:
         try:
@@ -532,12 +525,8 @@ def scan_all_symbols():
             res = analyze_15m_opportunity(symbol, candles)
             if res["decision"] == "WATCH":
                 watchlist.append(res)
-                print(f"{symbol}: WATCH (Score: {res['score']})")
             elif res["decision"] != "WAIT":
                 signals.append(res)
-                print(f"{symbol}: 🎯 {res['decision']} | Score: {res['score']}")
-            else:
-                print(f"{symbol}: WAIT")
         except Exception as e:
             print(f"{symbol}: ERROR {e}")
 
@@ -559,7 +548,7 @@ def send_update(signals, watchlist):
                 thai_candle_time = format_candle_time(sig['candle_time'])
 
                 msg = (
-                    f"🎯 **SIGZY AI 15M (ACCURATE MODE)**\n\n"
+                    f"🎯 **SIGZY AI 15M**\n\n"
                     f"💱 คู่เงิน: **{sig['symbol']}**\n"
                     f"📌 ทิศทาง: **{sig['decision']}**\n"
                     f"🏆 Score: **{sig['score']}/100** (Threshold: {sig['threshold']})\n"
@@ -573,30 +562,21 @@ def send_update(signals, watchlist):
                 )
                 send_discord(msg)
 
-    if watchlist:
-        watch_msg = "👀 **Early Alert (จับตาดู):**\n"
-        for w in watchlist[:3]:
-            watch_msg += f"- {w['symbol']} (Score: {w['score']})\n"
-        send_discord(watch_msg)
-
 
 def main():
-    print()
-    print("=" * 65)
-    print("SIGZY AI 15M - ACCURATE EVALUATION ENGINE STARTED")
-    print("=" * 65)
-
+    print("SIGZY AI 15M - API SAFE ENGINE STARTED")
     load_history()
-    send_discord("🤖 **SIGZY ONLINE**\nปรับปรุงระบบวัดผลแม่นยำ: ตรวจ TP/SL จริง + บันทึก History ถาวร + แยก Trade WR และ Series WR!")
+    send_discord("🤖 **SIGZY ONLINE**\nปรับรอบการสแกนเพื่อประหยัด API + พร้อมระบบตรวจผล TP/SL เรียบร้อย!")
 
     last_scan_time = 0
 
     while True:
         try:
-            verify_pending_trades()
-
             now_ts = time.time()
-            if now_ts - last_scan_time >= 300:
+
+            # วนสแกนและตรวจผลทุก 3 นาที (180 วินาที) เพื่อประหยัด API
+            if now_ts - last_scan_time >= 180:
+                verify_pending_trades()
                 signals, watchlist = scan_all_symbols()
                 send_update(signals, watchlist)
                 last_scan_time = now_ts
@@ -604,7 +584,7 @@ def main():
         except Exception as e:
             print(f"MAIN ERROR: {e}")
 
-        time.sleep(10)
+        time.sleep(30)
 
 
 if __name__ == "__main__":
