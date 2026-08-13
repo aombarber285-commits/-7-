@@ -427,6 +427,23 @@ def main():
 
         log("⏳ พักรอบการทำงาน 3 นาที...\n" + "="*50)
         time.sleep(180)
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# สร้างเว็บเซิร์ฟเวอร์จำลองเพื่อให้ Railway มองว่าแอปทำงานอยู่ตลอดเวลา
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+def run_server():
+    server = HTTPServer(('0.0.0.0', 8080), DummyHandler)
+    server.serve_forever()
+
+# รันเซิร์ฟเวอร์จำลองไว้ในเบื้องหลัง (Background Thread)
+server_thread = Thread(target=run_server, daemon=True)
+server_thread.start()
 
 
 if __name__ == "__main__":
