@@ -7,9 +7,10 @@ from datetime import datetime, timezone, timedelta
 import yfinance as yf
 
 # ============================================================
-# SIGZY AI 15M - YFINANCE VERSION (NO API LIMIT)
+# SIGZY AI 15M - YFINANCE VERSION (NO API LIMIT / FREE FOREX)
 # ============================================================
 
+# แปลงสัญลักษณ์คู่เงินให้เป็นฟอร์แมตของ Yahoo Finance
 SYMBOL_MAP = {
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
@@ -292,7 +293,7 @@ def verify_pending_trades():
             win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
 
             msg = (
-                f"📊 **RESULT UPDATE**\n\n"
+                f"📊 **RESULT UPDATE (yfinance)**\n\n"
                 f"💱 คู่เงิน: **{record['symbol']}** ({record['decision']})\n"
                 f"🎯 Entry: **{record['entry_price']:.5f}** -> Close: **{record['close_price']:.5f}**\n"
                 f"🏁 ผลลัพธ์: **{record['result']}** ({exit_reason})\n\n"
