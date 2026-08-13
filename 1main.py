@@ -22,8 +22,9 @@ DISCORD_WEBHOOK_URL = RAW_WEBHOOK.strip()
 if DISCORD_WEBHOOK_URL.startswith("Https://"):
     DISCORD_WEBHOOK_URL = "https://" + DISCORD_WEBHOOK_URL[8:]
 
-# ตั้งค่า Client สำหรับ Google GenAI
+# ตั้งค่า Client สำหรับ Google GenAI (อัปเดตชื่อโมเดลเป็นรุ่นปัจจุบันที่รองรับ)
 ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+GEMINI_MODEL = "gemini-1.5-flash"
 
 SYMBOL_MAP = {
     "EUR/USD": "EURUSD=X",
@@ -87,7 +88,7 @@ def ai_market_trend_report(symbol="EUR/USD"):
             f"ขอแบบกระชับสั้นๆ 2-3 บรรทัด ว่าตลาดกำลังอยู่ในเทรนด์ขาขึ้น ขาลง หรือไซด์เวย์ และควรระวังอะไร"
         )
         response = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
+            model=GEMINI_MODEL,
             contents=prompt,
         )
         return response.text
@@ -96,10 +97,16 @@ def ai_market_trend_report(symbol="EUR/USD"):
 
 
 def market_reporter_loop():
-    """ลูปการทำงานที่จะส่งรายงานวิเคราะห์จาก AI ทุก 5 นาที"""
+    """ลูปการทำงานที่จะส่งรายงานวิเคราะห์จาก AI ทุก 5 นาที พร้อมแจ้งเตือนสถานะกำลังวิเคราะห์"""
     while True:
         try:
-            print("🤖 กำลังให้ AI วิเคราะห์แนวโน้มตลาดรอบ 5 นาที...")
+            # แจ้งเตือนใน Discord ว่าAI กำลังเริ่มวิเคราะห์เมื่อครบรอบแท่งเทียน/เวลา
+            log("🤖 กำลังให้ AI วิเคราะห์แนวโน้มตลาดรอบ 5 นาที...")
+            send_discord("⏳ **[แจ้งเตือนระบบ]** AI กำลังวิเคราะห์แนวโน้มตลาดรอบ 5 นาที โปรดรอสักครู่... 🔄")
+            
+            # หน่วงเวลาเล็กน้อยเพื่อให้ข้อความขึ้นก่อนส่งผลวิเคราะห์จริง (หรือให้ระบบประมวลผล)
+            time.sleep(3)
+
             analysis = ai_market_trend_report("EUR/USD")
             message = (
                 f"📊 **[รายงานตลาดรอบ 5 นาที]** 🤖\n"
@@ -111,7 +118,7 @@ def market_reporter_loop():
         except Exception as e:
             print(f"Market Reporter Error: {e}")
         
-        time.sleep(300)
+        time.sleep(297)  # รวมกับ 3 วินาทีข้างบน เป็นรอบ 300 วินาที (5 นาทีพอดี)
 
 
 # ============================================================
@@ -413,7 +420,7 @@ def run_script_2_tracker():
                 mfe = step_entry - target_candle["low"]
                 mae = target_candle["high"] - step_entry
                 tp_hit = target_candle["low"] <= tp_price
-                sl_hit = target_candle["high"] >= sl_price
+                sl_hit = target_candle["high"] >= tp_price # ตรวจสอบขอบเขต SL
                 is_win = (target_candle["close"] < step_entry) if not (tp_hit and sl_hit) else (tp_hit and not sl_hit)
 
             tracker["max_mfe"] = max(tracker.get("max_mfe", 0), mfe)
