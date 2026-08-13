@@ -1,10 +1,12 @@
+# -*- coding: utf-8 -*-
+
 import os
 import time
 import requests
 from datetime import datetime, timezone, timedelta
 
 # ============================================================
-# SIGZY AI 15M - FAST & ACCURATE SERIES TRACKER
+# SIGZY AI 15M - DYNAMIC THRESHOLD, TRACKER & THAI TIME FIXED
 # ============================================================
 
 SYMBOLS = [
@@ -20,7 +22,7 @@ SYMBOLS = [
 
 INTERVAL = "15min"
 OUTPUT_SIZE = 100
-TIMEOUT = 10
+TIMEOUT = 15
 
 TP_ATR = 0.50
 SL_ATR = 0.50
@@ -38,24 +40,25 @@ if DISCORD_WEBHOOK_URL.startswith("Https://"):
 STATS_WEBHOOK_URL = os.getenv("STATS_WEBHOOK_URL", "")
 
 SENT_SIGNALS = set()
-PROCESSED_KEYS = set()
 PENDING_TRADES = []
+TRADE_HISTORY = []
 
-CURRENT_SERIES_TRADES = []
-SERIES_HISTORY = []
 
 def now_text():
     utc_now = datetime.now(timezone.utc)
     thai = utc_now + timedelta(hours=7)
     return thai.strftime("%Y-%m-%d %H:%M:%S")
 
+
 def format_candle_time(utc_time_str):
+    """แปลงเวลา Candle จาก UTC ให้เป็นเวลาไทย (GMT+7)"""
     try:
         dt = datetime.strptime(utc_time_str, "%Y-%m-%d %H:%M:%S")
         thai_dt = dt + timedelta(hours=7)
         return thai_dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return utc_time_str
+
 
 def send_discord(message):
     if not DISCORD_WEBHOOK_URL:
@@ -69,7 +72,13 @@ def send_discord(message):
     except Exception as e:
         print("Discord Error:", e)
 
+
+def is_trading_time():
+    return True
+
+
 def get_time_session(thai_hour):
+    """แบ่งช่วงเวลาสำหรับเก็บสถิติ Win Rate"""
     if 0 <= thai_hour < 4:
         return "00-04"
     elif 4 <= thai_hour < 5:
@@ -83,6 +92,7 @@ def get_time_session(thai_hour):
     else:
         return "18-24"
 
+
 def get_market_data(symbol):
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={INTERVAL}&outputsize={OUTPUT_SIZE}&timezone=UTC&apikey={API_KEY_CORRECT}"
 
@@ -91,6 +101,7 @@ def get_market_data(symbol):
         data = response.json()
 
         if data.get("status") == "error":
+            print(f"{symbol} API Error: {data.get('message')}")
             return []
 
         values = data.get("values", [])
@@ -111,8 +122,10 @@ def get_market_data(symbol):
                 continue
         return candles
 
-    except Exception:
+    except Exception as e:
+        print(f"{symbol} Market Error: {e}")
         return []
+
 
 def atr(candles, period=14):
     if len(candles) < period + 1:
@@ -129,33 +142,30 @@ def atr(candles, period=14):
         trs.append(tr)
     return sum(trs[-period:]) / period
 
-def calculate_ema(candles, period=50):
-    if len(candles) < period:
-        return None
-    closes = [c["close"] for c in candles]
-    multiplier = 2 / (period + 1)
-    ema = sum(closes[:period]) / period
-    for price in closes[period:]:
-        ema = (price - ema) * multiplier + ema
-    return ema
 
 def body(c):
     return abs(c["close"] - c["open"])
 
+
 def candle_range(c):
     return max(c["high"] - c["low"], 0.00000001)
+
 
 def upper_wick(c):
     return c["high"] - max(c["open"], c["close"])
 
+
 def lower_wick(c):
     return min(c["open"], c["close"]) - c["low"]
+
 
 def bullish(c):
     return c["close"] > c["open"]
 
+
 def bearish(c):
     return c["close"] < c["open"]
+
 
 def market_regime(candles):
     current_atr = atr(candles, 14)
@@ -171,20 +181,22 @@ def market_regime(candles):
         return "FAST"
     return "NORMAL"
 
+
 def get_threshold(regime, thai_hour):
-    base_threshold = 70
-
     if regime == "QUIET":
-        base_threshold += 5
+        base_threshold = 60
     elif regime == "FAST":
-        base_threshold += 8
+        base_threshold = 70
+    else:
+        base_threshold = 65
 
-    if 6 <= thai_hour < 12:
-        base_threshold += 8
-    elif 4 <= thai_hour < 6:
-        base_threshold += 5
+    if 4 <= thai_hour < 5:
+        base_threshold += 5   # ช่วง 04:00-05:00 เพิ่มความเข้มงวด +5
+    elif 5 <= thai_hour < 6:
+        base_threshold += 10  # ช่วง 05:00-06:00 เพิ่มความเข้มงวด +10
 
     return base_threshold
+
 
 def analyze_15m_opportunity(symbol, candles):
     if len(candles) < 50:
@@ -194,20 +206,11 @@ def analyze_15m_opportunity(symbol, candles):
     c1 = candles[-2]
     price = c0["close"]
     current_atr = atr(candles, 14)
-    ema50 = calculate_ema(candles, 50)
-
-    if not current_atr or not ema50:
+    if not current_atr:
         return {"decision": "WAIT", "score": 0}
 
     thai_now = datetime.now(timezone.utc) + timedelta(hours=7)
     thai_hour = thai_now.hour
-
-    b0 = body(c0)
-    r0 = candle_range(c0)
-    ratio0 = b0 / r0 if r0 > 0 else 0
-
-    if ratio0 < 0.45:
-        return {"decision": "WAIT", "score": 0}
 
     call_score = 0
     put_score = 0
@@ -215,18 +218,11 @@ def analyze_15m_opportunity(symbol, candles):
     confirmations_call = 0
     confirmations_put = 0
 
-    above_ema = price > ema50
-    below_ema = price < ema50
-
-    if above_ema:
-        confirmations_call += 1
-        reasons.append("Above EMA 50")
-    elif below_ema:
-        confirmations_put += 1
-        reasons.append("Below EMA 50")
-
+    b0 = body(c0)
+    r0 = candle_range(c0)
     upper0 = upper_wick(c0)
     lower0 = lower_wick(c0)
+    ratio0 = b0 / r0 if r0 > 0 else 0
 
     is_strong_bull = bullish(c0) and ratio0 >= 0.70
     is_strong_bear = bearish(c0) and ratio0 >= 0.70
@@ -241,7 +237,7 @@ def analyze_15m_opportunity(symbol, candles):
         if is_bull_engulfing:
             reasons.append("Bullish Engulfing")
         elif is_hammer:
-            reasons.append("Bullish Hammer")
+            reasons.append("Bullish Pin Bar / Hammer")
         else:
             reasons.append("Strong Bullish Candle")
 
@@ -250,7 +246,7 @@ def analyze_15m_opportunity(symbol, candles):
         if is_bear_engulfing:
             reasons.append("Bearish Engulfing")
         elif is_shooting_star:
-            reasons.append("Shooting Star")
+            reasons.append("Bearish Shooting Star")
         else:
             reasons.append("Strong Bearish Candle")
 
@@ -261,13 +257,19 @@ def analyze_15m_opportunity(symbol, candles):
     at_support = abs(price - support_level) <= (support_level * 0.0008)
     at_resistance = abs(price - resistance_level) <= (resistance_level * 0.0008)
 
-    if at_support and above_ema:
+    if at_support:
         confirmations_call += 1
-        reasons.append("Support Confluence")
+        reasons.append("At Support Zone")
+        if is_hammer:
+            call_score += 10
+            reasons.append("S/R Rejection Bonus")
 
-    if at_resistance and below_ema:
+    if at_resistance:
         confirmations_put += 1
-        reasons.append("Resistance Confluence")
+        reasons.append("At Resistance Zone")
+        if is_shooting_star:
+            put_score += 10
+            reasons.append("S/R Rejection Bonus")
 
     recent_3 = candles[-3:]
     bull_momentum = sum(1 for c in recent_3 if bullish(c)) >= 2
@@ -276,27 +278,47 @@ def analyze_15m_opportunity(symbol, candles):
     if bull_momentum:
         confirmations_call += 1
         reasons.append("Bullish Momentum")
+        if is_strong_bull:
+            call_score += 10
+            reasons.append("Candle+Momentum Alignment")
 
     if bear_momentum:
         confirmations_put += 1
         reasons.append("Bearish Momentum")
+        if is_strong_bear:
+            put_score += 10
+            reasons.append("Candle+Momentum Alignment")
+
+    prev_5_high = max(c["high"] for c in candles[-6:-1])
+    prev_5_low = min(c["low"] for c in candles[-6:-1])
+
+    if price > prev_5_high and bullish(c0):
+        confirmations_call += 1
+        reasons.append("Breakout UP")
+    elif price < prev_5_low and bearish(c0):
+        confirmations_put += 1
+        reasons.append("Breakout DOWN")
 
     regime = market_regime(candles)
     threshold = get_threshold(regime, thai_hour)
 
-    if confirmations_call > confirmations_put and confirmations_call >= 3 and above_ema:
+    if confirmations_call >= confirmations_put and confirmations_call >= 2:
         direction = "CALL"
-        score = 50 + (confirmations_call * 12)
-    elif confirmations_put > confirmations_call and confirmations_put >= 3 and below_ema:
+        call_score += 50 + (confirmations_call * 12)
+        score = call_score
+    elif confirmations_put > confirmations_call and confirmations_put >= 2:
         direction = "PUT"
-        score = 50 + (confirmations_put * 12)
+        put_score += 50 + (confirmations_put * 12)
+        score = put_score
     else:
+        if 55 <= max(call_score, put_score) < threshold:
+            return {"decision": "WATCH", "score": max(call_score, put_score), "symbol": symbol, "reasons": "ใกล้เข้าเงื่อนไข"}
         return {"decision": "WAIT", "score": 0}
 
     score = min(score, 99)
 
     if score < threshold:
-        return {"decision": "WATCH", "score": score, "symbol": symbol, "reasons": f"Score {score} < Threshold {threshold}"}
+        return {"decision": "WATCH", "score": score, "symbol": symbol, "reasons": f"Score {score} ไม่ถึง Threshold {threshold}"}
 
     if direction == "CALL":
         tp = price + current_atr * TP_ATR
@@ -320,24 +342,26 @@ def analyze_15m_opportunity(symbol, candles):
         "session": get_time_session(thai_hour)
     }
 
-def calculate_series_stats():
+
+def calculate_session_stats():
     sessions = ["00-04", "04-05", "05-06", "06-12", "12-18", "18-24"]
     stats_text = ""
 
     for s in sessions:
-        series_in_session = [sr for sr in SERIES_HISTORY if sr.get("session") == s]
-        total = len(series_in_session)
+        trades = [t for t in TRADE_HISTORY if t.get("session") == s]
+        total = len(trades)
         if total > 0:
-            wins = sum(1 for sr in series_in_session if sr["result"] == "SERIES WIN 🟢")
+            wins = sum(1 for t in trades if "WIN" in t["result"])
             wr = (wins / total) * 100
-            stats_text += f"• **{s} น.**: {wins}/{total} รอบ ({wr:.1f}%)\n"
+            stats_text += f"• **{s} น.**: {wins}/{total} ไม้ ({wr:.1f}%)\n"
         else:
             stats_text += f"• **{s} น.**: - (ยังไม่มีข้อมูล)\n"
 
     return stats_text
 
+
 def verify_pending_trades():
-    global PENDING_TRADES, PROCESSED_KEYS, CURRENT_SERIES_TRADES, SERIES_HISTORY
+    global PENDING_TRADES, TRADE_HISTORY
 
     if not PENDING_TRADES:
         return
@@ -345,25 +369,15 @@ def verify_pending_trades():
     remaining_trades = []
 
     for trade in PENDING_TRADES:
-        trade_key = (trade["symbol"], trade["candle_time"], trade["decision"])
-        
-        if trade_key in PROCESSED_KEYS:
-            continue
-
         candles = get_market_data(trade["symbol"])
         if not candles:
             remaining_trades.append(trade)
             continue
 
-        target_candle = None
-        for c in candles:
-            if c["datetime"] > trade["candle_time"]:
-                target_candle = c
-                break
-
-        if target_candle:
-            PROCESSED_KEYS.add(trade_key)
-            close_price = target_candle["close"]
+        latest_candle = candles[-1]
+        
+        if latest_candle["datetime"] != trade["candle_time"]:
+            close_price = latest_candle["close"]
             direction = trade["decision"]
             entry_price = trade["price"]
 
@@ -372,73 +386,50 @@ def verify_pending_trades():
             else:
                 result = "WIN 🟢" if close_price < entry_price else "LOSS 🔴"
 
-            trade_record = {
+            record = {
                 "symbol": trade["symbol"],
                 "decision": direction,
                 "score": trade["score"],
                 "entry_price": entry_price,
                 "close_price": close_price,
                 "result": result,
+                "reasons": trade["reasons"],
+                "candle_time": trade["candle_time"],
                 "session": trade.get("session", "N/A"),
                 "timestamp": now_text()
             }
 
-            CURRENT_SERIES_TRADES.append(trade_record)
-            trade_index = len(CURRENT_SERIES_TRADES)
+            TRADE_HISTORY.append(record)
 
-            has_win = any("WIN" in t["result"] for t in CURRENT_SERIES_TRADES)
-            is_series_complete = False
-            series_status = ""
+            total_trades = len(TRADE_HISTORY)
+            wins = sum(1 for t in TRADE_HISTORY if "WIN" in t["result"])
+            win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
 
-            if has_win:
-                is_series_complete = True
-                series_status = "SERIES WIN 🟢 (ชนะ 1 ใน 3)"
-            elif trade_index >= 3:
-                is_series_complete = True
-                series_status = "SERIES LOSS 🔴 (แพ้ติดกัน 3 ไม้)"
-            else:
-                series_status = f"IN PROGRESS ⏳ (ไม้ที่ {trade_index}/3)"
-
-            if is_series_complete:
-                series_record = {
-                    "result": "SERIES WIN 🟢" if has_win else "SERIES LOSS 🔴",
-                    "trades": list(CURRENT_SERIES_TRADES),
-                    "session": trade_record["session"],
-                    "timestamp": now_text()
-                }
-                SERIES_HISTORY.append(series_record)
-                CURRENT_SERIES_TRADES = []
-
-            total_series = len(SERIES_HISTORY)
-            wins_series = sum(1 for sr in SERIES_HISTORY if sr["result"] == "SERIES WIN 🟢")
-            overall_wr = (wins_series / total_series) * 100 if total_series > 0 else 0
-
-            session_stats = calculate_series_stats()
+            session_stats = calculate_session_stats()
 
             msg = (
-                f"⚡ **FAST RESULT UPDATE (3-SERIES TRACKER)**\n\n"
-                f"💱 คู่เงิน: **{trade_record['symbol']}** ({trade_record['decision']})\n"
-                f"📍 ไม้ที่: **{trade_index}/3** ในรอบนี้ | Session: **{trade_record['session']} น.**\n"
-                f"🎯 Entry: **{trade_record['entry_price']:.5f}** -> Close: **{trade_record['close_price']:.5f}**\n"
-                f"🏁 ผลไม้ปัจจุบัน: **{trade_record['result']}**\n\n"
-                f"🏆 **สถานะรอบปัจจุบัน:** **{series_status}**\n"
-                f"----------------------------------------\n"
-                f"📈 **SERIES WIN RATE BY SESSION**\n"
+                f"📊 **RESULT UPDATE (AUTO-TRACKER)**\n\n"
+                f"💱 คู่เงิน: **{record['symbol']}** ({record['decision']})\n"
+                f"🏆 Score: **{record['score']}/100** | Session: **{record['session']} น.**\n"
+                f"📍 Entry: **{record['entry_price']:.5f}** $\rightarrow$ Close: **{record['close_price']:.5f}**\n"
+                f"🏁 ผลลัพธ์: **{record['result']}**\n\n"
+                f"📈 **WIN RATE BY SESSION**\n"
                 f"{session_stats}\n"
-                f"📊 **OVERALL SERIES:** {wins_series}/{total_series} รอบ (**{overall_wr:.2f}%**)\n"
+                f"📊 **OVERALL:** {wins}/{total_trades} ไม้ (**{win_rate:.2f}%**)\n"
                 f"🕐 {now_text()}"
             )
             send_discord(msg)
 
-            if STATS_WEBHOOK_URL and is_series_complete:
+            if STATS_WEBHOOK_URL:
                 try:
-                    requests.post(STATS_WEBHOOK_URL, json=series_record, timeout=5)
-                except Exception:
-                    pass
+                    requests.post(STATS_WEBHOOK_URL, json=record, timeout=5)
+                except Exception as e:
+                    print("Stats Export Error:", e)
         else:
             remaining_trades.append(trade)
 
     PENDING_TRADES = remaining_trades
+
 
 def scan_all_symbols():
     signals = []
@@ -446,7 +437,7 @@ def scan_all_symbols():
 
     print()
     print("=" * 65)
-    print(f"[{now_text()}] 🔍 สแกน 8 คู่เงิน (Fast 10s Check)...")
+    print(f"[{now_text()}] 🔍 สแกน 8 คู่เงิน...")
     print("=" * 65)
 
     for symbol in SYMBOLS:
@@ -469,6 +460,7 @@ def scan_all_symbols():
 
     return signals, watchlist
 
+
 def send_update(signals, watchlist):
     global SENT_SIGNALS, PENDING_TRADES
 
@@ -481,10 +473,11 @@ def send_update(signals, watchlist):
                 SENT_SIGNALS.add(signal_key)
                 PENDING_TRADES.append(sig)
 
+                # แปลงเวลา Candle เป็นเวลาไทยเพื่อความถูกต้อง
                 thai_candle_time = format_candle_time(sig['candle_time'])
 
                 msg = (
-                    f"🎯 **SIGZY AI 15M (3-TRADE SERIES)**\n\n"
+                    f"🎯 **SIGZY AI 15M (OPTIMIZED)**\n\n"
                     f"💱 คู่เงิน: **{sig['symbol']}**\n"
                     f"📌 ทิศทาง: **{sig['decision']}**\n"
                     f"🏆 Score: **{sig['score']}/100** (Threshold: {sig['threshold']})\n"
@@ -497,6 +490,7 @@ def send_update(signals, watchlist):
                     f"🕐 {now_text()}"
                 )
                 send_discord(msg)
+                print(f"🚨 ส่งสัญญาณ {sig['symbol']} เข้า Discord เรียบร้อย!")
 
     if watchlist:
         watch_msg = "👀 **Early Alert (จับตาดู):**\n"
@@ -504,32 +498,43 @@ def send_update(signals, watchlist):
             watch_msg += f"- {w['symbol']} (Score: {w['score']})\n"
         send_discord(watch_msg)
 
+
+def wait_next_15m():
+    now = datetime.now(timezone.utc)
+    minute = now.minute
+    next_block = ((minute // 15) + 1) * 15
+
+    if next_block >= 60:
+        target = (now + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0)
+    else:
+        target = now.replace(minute=next_block, second=5, microsecond=0)
+
+    total_seconds = int((target - now).total_seconds())
+    if total_seconds <= 0:
+        return
+
+    print(f"\n⏳ รอแท่ง 15M ถัดไป (ประมาณ {total_seconds} วินาที)...")
+    time.sleep(total_seconds)
+
+
 def main():
     print()
     print("=" * 65)
-    print("SIGZY AI 15M - FAST & ACCURATE SERIES ENGINE STARTED")
+    print("SIGZY AI 15M - DYNAMIC THRESHOLD & THAI TIME FIXED STARTED")
     print("=" * 65)
 
-    send_discord("🤖 **SIGZY ONLINE**\nเปิดโหมดสรุปผลไว (Fast Check 10s) + สถิติ Series 1 ใน 3 เรียบร้อย!")
-
-    last_scan_time = 0
+    send_discord("🤖 **SIGZY ONLINE (DYNAMIC THRESHOLD & THAI TIME FIXED)**\nปรับระดับความเข้มงวดตามช่วงเวลา แก้ไขเวลา Candle เป็นเวลาไทยเรียบร้อย!")
 
     while True:
         try:
-            # วนตรวจผลทุกๆ 10 วินาที เพื่อให้แจ้งเตือนสรุปผลไวขึ้น
             verify_pending_trades()
-
-            now_ts = time.time()
-            if now_ts - last_scan_time >= 300:
-                signals, watchlist = scan_all_symbols()
-                send_update(signals, watchlist)
-                last_scan_time = now_ts
-
+            signals, watchlist = scan_all_symbols()
+            send_update(signals, watchlist)
         except Exception as e:
             print(f"MAIN ERROR: {e}")
 
-        time.sleep(10)
+        wait_next_15m()
+
 
 if __name__ == "__main__":
-    main() 
-ยังดียุ่ไหม
+    main()
