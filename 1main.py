@@ -22,9 +22,9 @@ DISCORD_WEBHOOK_URL = RAW_WEBHOOK.strip()
 if DISCORD_WEBHOOK_URL.startswith("Https://"):
     DISCORD_WEBHOOK_URL = "https://" + DISCORD_WEBHOOK_URL[8:]
 
-# ตั้งค่า Client สำหรับ Google GenAI (อัปเดตชื่อโมเดลเป็นรุ่นปัจจุบันที่รองรับ)
+# ตั้งค่า Client สำหรับ Google GenAI (ใช้รุ่น gemini-2.5-flash ตามมาตรฐาน SDK ล่าสุด)
 ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 SYMBOL_MAP = {
     "EUR/USD": "EURUSD=X",
@@ -100,11 +100,9 @@ def market_reporter_loop():
     """ลูปการทำงานที่จะส่งรายงานวิเคราะห์จาก AI ทุก 5 นาที พร้อมแจ้งเตือนสถานะกำลังวิเคราะห์"""
     while True:
         try:
-            # แจ้งเตือนใน Discord ว่าAI กำลังเริ่มวิเคราะห์เมื่อครบรอบแท่งเทียน/เวลา
             log("🤖 กำลังให้ AI วิเคราะห์แนวโน้มตลาดรอบ 5 นาที...")
             send_discord("⏳ **[แจ้งเตือนระบบ]** AI กำลังวิเคราะห์แนวโน้มตลาดรอบ 5 นาที โปรดรอสักครู่... 🔄")
             
-            # หน่วงเวลาเล็กน้อยเพื่อให้ข้อความขึ้นก่อนส่งผลวิเคราะห์จริง (หรือให้ระบบประมวลผล)
             time.sleep(3)
 
             analysis = ai_market_trend_report("EUR/USD")
@@ -118,7 +116,7 @@ def market_reporter_loop():
         except Exception as e:
             print(f"Market Reporter Error: {e}")
         
-        time.sleep(297)  # รวมกับ 3 วินาทีข้างบน เป็นรอบ 300 วินาที (5 นาทีพอดี)
+        time.sleep(297)
 
 
 # ============================================================
@@ -420,7 +418,7 @@ def run_script_2_tracker():
                 mfe = step_entry - target_candle["low"]
                 mae = target_candle["high"] - step_entry
                 tp_hit = target_candle["low"] <= tp_price
-                sl_hit = target_candle["high"] >= tp_price # ตรวจสอบขอบเขต SL
+                sl_hit = target_candle["high"] >= sl_price
                 is_win = (target_candle["close"] < step_entry) if not (tp_hit and sl_hit) else (tp_hit and not sl_hit)
 
             tracker["max_mfe"] = max(tracker.get("max_mfe", 0), mfe)
@@ -464,18 +462,13 @@ def main():
     
     load_memory_from_file()
 
-    # รัน AI Market Reporter แยก Thread ออกไป เพื่อให้ส่งรายงานทุก 5 นาทีโดยไม่บล็อกระบบเทรดหลัก
     reporter_thread = Thread(target=market_reporter_loop, daemon=True)
     reporter_thread.start()
 
     while True:
         try:
-            # รันระบบที่ 2 เช็คผลลัพธ์เก่าก่อน
             run_script_2_tracker()
-            
-            # รันระบบที่ 1 หาจุดเข้าใหม่
             run_script_1_scanner()
-
         except Exception as e:
             log(f"⚠️ MAIN ERROR: {e}")
 
@@ -483,7 +476,6 @@ def main():
         time.sleep(180)
 
 
-# สร้างเว็บเซิร์ฟเวอร์จำลองเพื่อให้ Railway มองว่าแอปทำงานอยู่ตลอดเวลา
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -494,7 +486,6 @@ def run_server():
     server = HTTPServer(('0.0.0.0', 8080), DummyHandler)
     server.serve_forever()
 
-# รันเซิร์ฟเวอร์จำลองไว้ในเบื้องหลัง (Background Thread)
 server_thread = Thread(target=run_server, daemon=True)
 server_thread.start()
 
