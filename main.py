@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 SIGZY 15M + 5M ZONE FLIP / 3-OPPORTUNITY TRACKER & WEB DASHBOARD
-Python 3.10 / Railway ready
+Python 3.10 / Railway ready (RAM Optimized & Headless Friendly)
 
 หลักการ:
 - 15M = Trend + Historical Support/Resistance + Break/Flip
@@ -14,7 +14,7 @@ Python 3.10 / Railway ready
 - ครบ 3 ไม้ -> จบ Series แล้ว scan ใหม่
 - คู่เดิมสามารถกลับมาได้ หากเป็น setup ใหม่
 - Memory ไม่ถูก reset
-- พร้อม Flask Web Dashboard สำหรับแสดงผลบนมือถือ/เว็บ
+- พร้อม Flask Web Dashboard สำหรับแสดงผลบนมือถือ/เว็บ (Lightweight View)
 """
 
 import os
@@ -22,12 +22,12 @@ import json
 import time
 import math
 import requests
+import gc
 from datetime import datetime, timezone, timedelta
 from threading import Thread, Lock
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import yfinance as yf
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, jsonify
 
 try:
     from google import genai
@@ -246,7 +246,6 @@ def clean_dataframe(df):
         return None
 
     try:
-        # Remove timezone only for easier candle comparison.
         if getattr(df.index, "tz", None) is not None:
             df = df.copy()
             df.index = df.index.tz_convert("UTC").tz_localize(None)
@@ -274,8 +273,6 @@ def get_candles(symbol, interval, period="5d", closed_only=False):
         if df is None or len(df) < 10:
             return []
 
-        # Yahoo's last intraday candle may still be forming.
-        # For analysis that requires closed candles, remove it.
         if closed_only and len(df) > 1:
             df = df.iloc[:-1]
 
@@ -314,7 +311,6 @@ def ema(values, period):
         return None
 
     multiplier = 2.0 / (period + 1.0)
-
     value = sum(values[:period]) / period
 
     for price in values[period:]:
@@ -332,7 +328,6 @@ def rsi_wilder(values, period=14):
 
     for i in range(1, len(values)):
         diff = values[i] - values[i - 1]
-
         gains.append(max(diff, 0.0))
         losses.append(max(-diff, 0.0))
 
@@ -347,7 +342,6 @@ def rsi_wilder(values, period=14):
         return 100.0
 
     rs = avg_gain / avg_loss
-
     return 100.0 - (100.0 / (1.0 + rs))
 
 
@@ -366,7 +360,6 @@ def atr(candles, period=14):
             abs(c["high"] - p["close"]),
             abs(c["low"] - p["close"]),
         )
-
         trs.append(tr)
 
     return sum(trs[-period:]) / period
@@ -378,38 +371,18 @@ def atr(candles, period=14):
 
 def candle_features(c0, c1):
     body = abs(c0["close"] - c0["open"])
-
-    full_range = max(
-        c0["high"] - c0["low"],
-        1e-12,
-    )
+    full_range = max(c0["high"] - c0["low"], 1e-12)
 
     upper = c0["high"] - max(c0["open"], c0["close"])
     lower = min(c0["open"], c0["close"]) - c0["low"]
 
     body_ratio = body / full_range
 
-    strong_bull = (
-        c0["close"] > c0["open"]
-        and body_ratio >= 0.65
-    )
+    strong_bull = (c0["close"] > c0["open"] and body_ratio >= 0.65)
+    strong_bear = (c0["close"] < c0["open"] and body_ratio >= 0.65)
 
-    strong_bear = (
-        c0["close"] < c0["open"]
-        and body_ratio >= 0.65
-    )
-
-    hammer = (
-        lower >= body * 2.0
-        and upper <= full_range * 0.25
-        and body_ratio <= 0.45
-    )
-
-    shooting_star = (
-        upper >= body * 2.0
-        and lower <= full_range * 0.25
-        and body_ratio <= 0.45
-    )
+    hammer = (lower >= body * 2.0 and upper <= full_range * 0.25 and body_ratio <= 0.45)
+    shooting_star = (upper >= body * 2.0 and lower <= full_range * 0.25 and body_ratio <= 0.45)
 
     bull_engulf = (
         c0["close"] > c0["open"]
@@ -467,40 +440,22 @@ def build_zones(candles, lookback=240):
         )
 
         if is_swing_high:
-            zones.append({
-                "type": "RESISTANCE",
-                "price": h,
-                "timestamp": data[i]["timestamp"],
-            })
+            zones.append({"type": "RESISTANCE", "price": h, "timestamp": data[i]["timestamp"]})
 
         if is_swing_low:
-            zones.append({
-                "type": "SUPPORT",
-                "price": l,
-                "timestamp": data[i]["timestamp"],
-            })
+            zones.append({"type": "SUPPORT", "price": l, "timestamp": data[i]["timestamp"]})
 
     return zones
 
 
 def zone_analysis(candles, price, direction):
     if len(candles) < 40:
-        return {
-            "state": "NONE",
-            "score": 0,
-            "distance": None,
-            "level": None,
-        }
+        return {"state": "NONE", "score": 0, "distance": None, "level": None}
 
     current_atr = atr(candles, 14)
 
     if not current_atr or current_atr <= 0:
-        return {
-            "state": "NONE",
-            "score": 0,
-            "distance": None,
-            "level": None,
-        }
+        return {"state": "NONE", "score": 0, "distance": None, "level": None}
 
     zones = build_zones(candles)
     tolerance = current_atr * 0.35
@@ -512,27 +467,15 @@ def zone_analysis(candles, price, direction):
             candidates.append((distance, z))
 
     if not candidates:
-        return {
-            "state": "NONE",
-            "score": 0,
-            "distance": None,
-            "level": None,
-        }
+        return {"state": "NONE", "score": 0, "distance": None, "level": None}
 
     candidates.sort(key=lambda x: x[0])
     distance, nearest = candidates[0]
 
     recent = candles[-12:]
 
-    broke_above = any(
-        c["close"] > nearest["price"] + tolerance * 0.15
-        for c in recent[:-2]
-    )
-
-    broke_below = any(
-        c["close"] < nearest["price"] - tolerance * 0.15
-        for c in recent[:-2]
-    )
+    broke_above = any(c["close"] > nearest["price"] + tolerance * 0.15 for c in recent[:-2])
+    broke_below = any(c["close"] < nearest["price"] - tolerance * 0.15 for c in recent[:-2])
 
     state = nearest["type"]
     score = 10
@@ -568,11 +511,7 @@ def zone_analysis(candles, price, direction):
 
 def analyze_15m(symbol, candles):
     if len(candles) < 80:
-        return {
-            "decision": "WAIT",
-            "score": 0,
-            "reason": "not enough 15M candles",
-        }
+        return {"decision": "WAIT", "score": 0, "reason": "not enough 15M candles"}
 
     c0 = candles[-1]
     c1 = candles[-2]
@@ -585,11 +524,7 @@ def analyze_15m(symbol, candles):
     rsi = rsi_wilder(closes, 14)
 
     if None in (ema20, ema50, current_atr, rsi):
-        return {
-            "decision": "WAIT",
-            "score": 0,
-            "reason": "indicator unavailable",
-        }
+        return {"decision": "WAIT", "score": 0, "reason": "indicator unavailable"}
 
     pattern = candle_features(c0, c1)
 
@@ -680,14 +615,8 @@ def analyze_15m(symbol, candles):
         "rsi": rsi,
         "ema20": ema20,
         "ema50": ema50,
-        "zone_state": (
-            z_call["state"] if decision == "CALL"
-            else z_put["state"]
-        ),
-        "zone_level": (
-            z_call["level"] if decision == "CALL"
-            else z_put["level"]
-        ),
+        "zone_state": (z_call["state"] if decision == "CALL" else z_put["state"]),
+        "zone_level": (z_call["level"] if decision == "CALL" else z_put["level"]),
         "reasons": " | ".join(reasons),
         "candle_time": c0["datetime"],
     }
@@ -699,11 +628,7 @@ def analyze_15m(symbol, candles):
 
 def analyze_5m(symbol, candles, master_direction):
     if len(candles) < 70:
-        return {
-            "decision": "UNKNOWN",
-            "score": 50,
-            "reason": "not enough 5M data",
-        }
+        return {"decision": "UNKNOWN", "score": 50, "reason": "not enough 5M data"}
 
     c0 = candles[-1]
     c1 = candles[-2]
@@ -785,44 +710,22 @@ def analyze_5m(symbol, candles, master_direction):
 # ============================================================
 
 def scan_symbol(symbol):
-    candles15 = get_candles(
-        symbol,
-        MASTER_INTERVAL,
-        period="5d",
-        closed_only=True,
-    )
-
+    candles15 = get_candles(symbol, MASTER_INTERVAL, period="5d", closed_only=True)
     if len(candles15) < 80:
         return None
 
     master = analyze_15m(symbol, candles15)
-
     if master["decision"] not in ("CALL", "PUT"):
         return None
 
-    candles5 = get_candles(
-        symbol,
-        ENTRY_INTERVAL,
-        period="5d",
-        closed_only=True,
-    )
-
+    candles5 = get_candles(symbol, ENTRY_INTERVAL, period="5d", closed_only=True)
     if len(candles5) < 70:
         return None
 
-    timing = analyze_5m(
-        symbol,
-        candles5,
-        master["decision"],
-    )
+    timing = analyze_5m(symbol, candles5, master["decision"])
 
     if timing["decision"] == master["decision"]:
-        final_score = min(
-            99,
-            master["score"] * 0.70
-            + timing["score"] * 0.30
-            + 5
-        )
+        final_score = min(99, master["score"] * 0.70 + timing["score"] * 0.30 + 5)
         context = "5M_CONFIRM"
     elif timing["decision"] == "UNKNOWN":
         final_score = master["score"] * 0.75
@@ -861,26 +764,16 @@ def scan_symbol(symbol):
 # ============================================================
 
 def series_key(signal):
-    return (
-        signal["symbol"],
-        signal["decision"],
-        signal["signal_candle_15m"],
-    )
+    return (signal["symbol"], signal["decision"], signal["signal_candle_15m"])
 
 
 def has_active_series(symbol):
     with LOCK:
-        return any(
-            x["symbol"] == symbol
-            for x in ACTIVE_SERIES
-        )
+        return any(x["symbol"] == symbol for x in ACTIVE_SERIES)
 
 
 def create_series(signal):
-    series_id = (
-        f"{signal['symbol'].replace('/', '')}_"
-        f"{int(signal['created_ts'])}"
-    )
+    series_id = f"{signal['symbol'].replace('/', '')}_{int(signal['created_ts'])}"
 
     tracker = {
         "series_id": series_id,
@@ -919,34 +812,23 @@ def find_first_closed_5m_after(candles, timestamp):
     for c in candles:
         start = c["timestamp"]
         end = start + FIVE_MIN_SECONDS
-
         if start <= timestamp < end:
             return c
-
     return None
 
 
 def find_closed_candles_after(candles, timestamp):
     result = []
-
     for c in candles:
         close_time = c["timestamp"] + FIVE_MIN_SECONDS
-
         if close_time > timestamp:
             result.append(c)
-
     return result
 
 
 def evaluate_one_opportunity(tracker):
     symbol = tracker["symbol"]
-
-    candles = get_candles(
-        symbol,
-        ENTRY_INTERVAL,
-        period="2d",
-        closed_only=True,
-    )
+    candles = get_candles(symbol, ENTRY_INTERVAL, period="2d", closed_only=True)
 
     if len(candles) < 20:
         return None
@@ -954,25 +836,14 @@ def evaluate_one_opportunity(tracker):
     signal_ts = tracker["signal_ts"]
     step = tracker["opportunity"]
 
-    first_candle = find_first_closed_5m_after(
-        candles,
-        signal_ts,
-    )
+    first_candle = find_first_closed_5m_after(candles, signal_ts)
 
     if step == 1 and first_candle is not None:
         candidate = first_candle
     else:
-        candidates = find_closed_candles_after(
-            candles,
-            signal_ts,
-        )
-
+        candidates = find_closed_candles_after(candles, signal_ts)
         used = set(tracker["processed_5m"])
-
-        candidates = [
-            c for c in candidates
-            if c["datetime"] not in used
-        ]
+        candidates = [c for c in candidates if c["datetime"] not in used]
 
         if not candidates:
             return None
@@ -1001,17 +872,8 @@ def evaluate_one_opportunity(tracker):
     else:
         raw_result = "DRAW"
 
-    mfe = (
-        candidate["high"] - entry_price
-        if direction == "CALL"
-        else entry_price - candidate["low"]
-    )
-
-    mae = (
-        entry_price - candidate["low"]
-        if direction == "CALL"
-        else candidate["high"] - entry_price
-    )
+    mfe = candidate["high"] - entry_price if direction == "CALL" else entry_price - candidate["low"]
+    mae = entry_price - candidate["low"] if direction == "CALL" else candidate["high"] - entry_price
 
     return {
         "result": raw_result,
@@ -1025,19 +887,10 @@ def evaluate_one_opportunity(tracker):
 
 
 def record_opportunity(tracker, outcome):
-    tracker["processed_5m"].append(
-        outcome["candle"]["datetime"]
-    )
+    tracker["processed_5m"].append(outcome["candle"]["datetime"])
 
-    tracker["max_mfe"] = max(
-        tracker.get("max_mfe", 0),
-        outcome["mfe"],
-    )
-
-    tracker["max_mae"] = max(
-        tracker.get("max_mae", 0),
-        outcome["mae"],
-    )
+    tracker["max_mfe"] = max(tracker.get("max_mfe", 0), outcome["mfe"])
+    tracker["max_mae"] = max(tracker.get("max_mae", 0), outcome["mae"])
 
     result = outcome["result"]
 
@@ -1114,15 +967,10 @@ def tracker_loop():
             if trackers:
                 for tracker in trackers:
                     outcome = evaluate_one_opportunity(tracker)
-
                     if outcome is None:
                         continue
 
-                    result = record_opportunity(
-                        tracker,
-                        outcome,
-                    )
-
+                    result = record_opportunity(tracker, outcome)
                     candle = outcome["candle"]
 
                     log(
@@ -1158,14 +1006,13 @@ def tracker_loop():
                                 ACTIVE_SERIES.remove(tracker)
                     else:
                         tracker["opportunity"] += 1
-                        log(
-                            f"{tracker['symbol']} -> "
-                            f"move to OPP{tracker['opportunity']}"
-                        )
+                        log(f"{tracker['symbol']} -> move to OPP{tracker['opportunity']}")
 
         except Exception as e:
             log(f"Tracker loop error: {e}")
 
+        # Garbage Collection ป้องกัน RAM เต็ม
+        gc.collect()
         time.sleep(20)
 
 
@@ -1186,10 +1033,7 @@ def scanner_loop():
                 except Exception as e:
                     log(f"Scanner {symbol} error: {e}")
 
-            best.sort(
-                key=lambda x: x["score"],
-                reverse=True,
-            )
+            best.sort(key=lambda x: x["score"], reverse=True)
 
             for signal in best:
                 key = series_key(signal)
@@ -1211,7 +1055,6 @@ def scanner_loop():
                 )
 
                 zone_text = signal["zone_state"]
-
                 if signal.get("zone_level") is not None:
                     zone_text += f" @ {signal['zone_level']:.6f}"
 
@@ -1248,6 +1091,8 @@ def scanner_loop():
         except Exception as e:
             log(f"Scanner loop error: {e}")
 
+        # Garbage Collection
+        gc.collect()
         time.sleep(SCAN_SECONDS)
 
 
@@ -1257,16 +1102,8 @@ def scanner_loop():
 
 def calculate_stats():
     with LOCK:
-        total = (
-            STATS["wins"]
-            + STATS["losses"]
-            + STATS["draws"]
-        )
-
-        if total:
-            wr = STATS["wins"] / total * 100
-        else:
-            wr = 0
+        total = STATS["wins"] + STATS["losses"] + STATS["draws"]
+        wr = (STATS["wins"] / total * 100) if total else 0
 
         return {
             **STATS,
@@ -1303,7 +1140,7 @@ def reporter_loop():
 
 
 # ============================================================
-# FLASK WEB DASHBOARD & HEALTH SERVER
+# LIGHTWEIGHT FLASK WEB DASHBOARD & HEALTH SERVER
 # ============================================================
 
 DASHBOARD_HTML = """
@@ -1312,73 +1149,80 @@ DASHBOARD_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SIGZY Multi-Chart Dashboard</title>
-    <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+    <title>SIGZY Signal Tracker Dashboard</title>
     <style>
         * { box-sizing: border-box; }
-        body { margin: 0; padding: 5px; background: #0b0e14; color: #d1d4dc; font-family: Arial, sans-serif; }
-        .header { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; background: #131722; border-radius: 4px; margin-bottom: 5px; }
-        .header h2 { margin: 0; font-size: 14px; color: #26a69a; }
-        .status-badge { font-size: 11px; background: #1e222d; padding: 3px 8px; border-radius: 3px; color: #00e676; }
-        .charts-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 5px; }
-        .chart-container { background: #131722; border: 1px solid #2a2e39; border-radius: 4px; overflow: hidden; position: relative; }
-        .chart-title { font-size: 11px; padding: 4px 6px; background: #1e222d; color: #fff; display: flex; justify-content: space-between; }
-        .chart-box { width: 100%; height: 160px; }
+        body { margin: 0; padding: 15px; background: #0b0e14; color: #d1d4dc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        .header { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; background: #131722; border-radius: 6px; margin-bottom: 15px; border: 1px solid #2a2e39; }
+        .header h2 { margin: 0; font-size: 16px; color: #26a69a; }
+        .status-badge { font-size: 12px; background: #1e222d; padding: 4px 10px; border-radius: 4px; color: #00e676; font-weight: bold; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 15px; margin-bottom: 15px; }
+        .card { background: #131722; border: 1px solid #2a2e39; border-radius: 6px; padding: 15px; }
+        .card h3 { margin-top: 0; font-size: 14px; color: #848e9c; border-bottom: 1px solid #2a2e39; padding-bottom: 8px; }
+        .stat-value { font-size: 24px; font-weight: bold; color: #fff; margin: 8px 0; }
+        .active-list { list-style: none; padding: 0; margin: 0; }
+        .active-item { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #1e222d; font-size: 13px; }
+        .badge-call { color: #00e676; font-weight: bold; }
+        .badge-put { color: #ef5350; font-weight: bold; }
     </style>
 </head>
 <body>
 
 <div class="header">
-    <h2>⚡ SIGZY Live Monitor</h2>
-    <div class="status-badge">● RUNNING</div>
+    <h2>⚡ SIGZY Live Signal Monitor</h2>
+    <div class="status-badge">● ONLINE</div>
 </div>
 
-<div class="charts-grid" id="grid">
-    <div class="chart-container"><div class="chart-title"><span>EUR/USD</span><span id="t-EURUSD" style="color:#00e676">--:--</span></div><div id="c-EURUSD" class="chart-box"></div></div>
-    <div class="chart-container"><div class="chart-title"><span>GBP/USD</span><span id="t-GBPUSD" style="color:#00e676">--:--</span></div><div id="c-GBPUSD" class="chart-box"></div></div>
-    <div class="chart-container"><div class="chart-title"><span>AUD/USD</span><span id="t-AUDUSD" style="color:#00e676">--:--</span></div><div id="c-AUDUSD" class="chart-box"></div></div>
-    <div class="chart-container"><div class="chart-title"><span>EUR/JPY</span><span id="t-EURJPY" style="color:#00e676">--:--</span></div><div id="c-EURJPY" class="chart-box"></div></div>
-    <div class="chart-container"><div class="chart-title"><span>USD/JPY</span><span id="t-USDJPY" style="color:#00e676">--:--</span></div><div id="c-USDJPY" class="chart-box"></div></div>
-    <div class="chart-container"><div class="chart-title"><span>USD/CHF</span><span id="t-USDCHF" style="color:#00e676">--:--</span></div><div id="c-USDCHF" class="chart-box"></div></div>
+<div class="grid">
+    <div class="card">
+        <h3>WIN RATE (5M)</h3>
+        <div class="stat-value" id="win-rate">0.0%</div>
+        <div style="font-size:12px; color:#848e9c;" id="win-loss-detail">WIN: 0 | LOSS: 0</div>
+    </div>
+    <div class="card">
+        <h3>ACTIVE SERIES</h3>
+        <div class="stat-value" id="active-count">0</div>
+        <div style="font-size:12px; color:#848e9c;">กำลังติดตามสัญญาณขณะนี้</div>
+    </div>
+</div>
+
+<div class="card">
+    <h3>📌 สัญญาณที่กำลังทำงาน (Active Signals)</h3>
+    <div id="active-container">
+        <ul class="active-list" id="active-signals">
+            <li class="active-item">ไม่มีสัญญาณที่กำลังทำงานอยู่ในขณะนี้</li>
+        </ul>
+    </div>
 </div>
 
 <script>
-    const chartOptions = {
-        layout: { background: { color: '#131722' }, textColor: '#d1d4dc' },
-        grid: { vertLines: { color: '#1f293d' }, horzLines: { color: '#1f293d' } },
-        rightPriceScale: { visible: false },
-        timeScale: { visible: false }
-    };
-
-    function initMiniChart(containerId, basePrice, isCall) {
-        const container = document.getElementById(containerId);
-        if (!container) return;
-        const chart = LightweightCharts.createChart(container, { ...chartOptions, width: container.clientWidth, height: 160 });
-        const series = chart.addCandlestickSeries({ upColor: '#26a69a', downColor: '#ef5350' });
-        
-        let p = basePrice;
-        let data = [];
-        let time = Math.floor(Date.now() / 1000) - 300 * 20;
-        
-        for(let i=0; i<20; i++) {
-            let open = p;
-            let close = open + (Math.random() - 0.48) * (basePrice * 0.001);
-            let high = Math.max(open, close) + Math.random() * 0.0005;
-            let low = Math.min(open, close) - Math.random() * 0.0005;
-            data.push({ time: time, open, high, low, close });
-            p = close;
-            time += 300;
+    async function updateDashboard() {
+        try {
+            const res = await fetch('/api/status');
+            const data = await res.json();
+            
+            document.getElementById('win-rate').innerText = data.win_rate + '%';
+            document.getElementById('win-loss-detail').innerText = `WIN: ${data.wins} | LOSS: ${data.losses} | DRAW: ${data.draws}`;
+            document.getElementById('active-count').innerText = data.active_series;
+            
+            const list = document.getElementById('active-signals');
+            if (data.active_list && data.active_list.length > 0) {
+                list.innerHTML = data.active_list.map(s => `
+                    <li class="active-item">
+                        <span><b>${s.symbol}</b> <span class="${s.direction === 'CALL' ? 'badge-call' : 'badge-put'}">[${s.direction}]</span></span>
+                        <span>ไม้ที่ ${s.opportunity}/3</span>
+                        <span>Score: ${s.score}</span>
+                    </li>
+                `).join('');
+            } else {
+                list.innerHTML = '<li class="active-item" style="color:#848e9c;">ไม่มีสัญญาณที่กำลังทำงานอยู่ในขณะนี้</li>';
+            }
+        } catch(e) {
+            console.error(e);
         }
-        series.setData(data);
-        chart.timeScale().fitContent();
     }
-
-    initMiniChart('c-EURUSD', 1.0850, true);
-    initMiniChart('c-GBPUSD', 1.2850, true);
-    initMiniChart('c-AUDUSD', 0.6580, true);
-    initMiniChart('c-EURJPY', 155.90, false);
-    initMiniChart('c-USDJPY', 147.50, true);
-    initMiniChart('c-USDCHF', 0.9020, false);
+    setInterval(updateDashboard, 5000);
+    updateDashboard();
 </script>
 
 </body>
@@ -1392,6 +1236,22 @@ app = Flask(__name__)
 @app.route("/status")
 def index():
     return render_template_string(DASHBOARD_HTML)
+
+
+@app.route("/api/status")
+def api_status():
+    s = calculate_stats()
+    with LOCK:
+        active_list = [
+            {
+                "symbol": x["symbol"],
+                "direction": x["master_direction"],
+                "opportunity": x["opportunity"],
+                "score": x["signal_score"],
+            }
+            for x in ACTIVE_SERIES
+        ]
+    return jsonify({**s, "active_list": active_list})
 
 
 def run_health_server():
@@ -1408,7 +1268,7 @@ def run_health_server():
 
 def startup_message():
     msg = (
-        "🚀 **SIGZY STARTED**\n"
+        "🚀 **SIGZY STARTED (RAM OPTIMIZED)**\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "🧭 15M = Trend + Historical Zone + Break/Flip\n"
         "⏱️ 5M = Entry / Closed Candle Result\n"
@@ -1420,7 +1280,6 @@ def startup_message():
         f"🌐 Port = {PORT}\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
-
     send_discord(msg)
 
 
@@ -1431,33 +1290,20 @@ def main():
 
     load_memory()
 
-    # Health / Web Dashboard Server.
-    Thread(
-        target=run_health_server,
-        daemon=True,
-    ).start()
+    # Health / Web Dashboard Server
+    Thread(target=run_health_server, daemon=True).start()
 
-    # Tracker.
-    Thread(
-        target=tracker_loop,
-        daemon=True,
-    ).start()
+    # Tracker
+    Thread(target=tracker_loop, daemon=True).start()
 
-    # Scanner.
-    Thread(
-        target=scanner_loop,
-        daemon=True,
-    ).start()
+    # Scanner
+    Thread(target=scanner_loop, daemon=True).start()
 
-    # Reporter.
-    Thread(
-        target=reporter_loop,
-        daemon=True,
-    ).start()
+    # Reporter
+    Thread(target=reporter_loop, daemon=True).start()
 
     startup_message()
 
-    # Keep main process alive.
     while True:
         try:
             time.sleep(60)
