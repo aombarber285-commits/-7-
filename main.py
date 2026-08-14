@@ -31,7 +31,6 @@ try:
 except Exception:
     genai = None
 
-
 # ============================================================
 # CONFIG
 # ============================================================
@@ -82,31 +81,25 @@ STATS = {
     "series_full_loss": 0,
 }
 
-
 # ============================================================
 # TIME / MODE
 # ============================================================
 
 THAI_TZ = timezone(timedelta(hours=7))
 
-
 def now_utc():
     return datetime.now(timezone.utc)
 
-
 def now_thai():
     return now_utc().astimezone(THAI_TZ)
-
 
 def thai_text(dt=None):
     dt = dt or now_thai()
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
-
 def thai_hm(dt=None):
     dt = dt or now_thai()
     return dt.strftime("%H:%M")
-
 
 def mode_now():
     if MARKET_MODE in ("LIVE", "OTC"):
@@ -115,14 +108,11 @@ def mode_now():
     # AUTO: เสาร์/อาทิตย์ = OTC, จันทร์-ศุกร์ = LIVE
     return "OTC" if now_thai().weekday() >= 5 else "LIVE"
 
-
 def utc_to_thai(ts):
     return datetime.fromtimestamp(ts, timezone.utc).astimezone(THAI_TZ)
 
-
 def log(msg):
     print(f"[{thai_text()}] {msg}", flush=True)
-
 
 # ============================================================
 # DISCORD
@@ -150,7 +140,6 @@ def send_discord(message):
         log(f"Discord error: {e}")
         return False
 
-
 # ============================================================
 # GEMINI - OPTIONAL COMMENT ONLY
 # ============================================================
@@ -163,7 +152,6 @@ if genai and GEMINI_API_KEY:
         log("Gemini ready")
     except Exception as e:
         log(f"Gemini init failed: {e}")
-
 
 def ai_comment(signal):
     if AI_CLIENT is None:
@@ -191,7 +179,6 @@ def ai_comment(signal):
     except Exception as e:
         # AI ไม่ควรทำให้ระบบ signal หยุด
         return f"AI unavailable: {str(e)[:80]}"
-
 
 # ============================================================
 # MEMORY
@@ -222,7 +209,6 @@ def load_memory():
         log(f"Memory load error: {e}")
         HISTORICAL_MEMORY = []
 
-
 def save_memory():
     try:
         tmp = MEMORY_FILE + ".tmp"
@@ -239,7 +225,6 @@ def save_memory():
 
     except Exception as e:
         log(f"Memory save error: {e}")
-
 
 # ============================================================
 # MARKET DATA
@@ -259,7 +244,6 @@ def clean_dataframe(df):
 
     except Exception:
         return df
-
 
 def get_candles(symbol, interval, period="5d"):
     ticker_symbol = SYMBOL_MAP.get(symbol, symbol)
@@ -304,20 +288,16 @@ def get_candles(symbol, interval, period="5d"):
         log(f"Yahoo {symbol} {interval}: {e}")
         return []
 
-
 def candle_close_ts(c):
     return c["timestamp"] + TF5_SECONDS
-
 
 def is_closed_5m(c, current_ts=None):
     current_ts = current_ts or time.time()
     return candle_close_ts(c) <= current_ts
 
-
 def closed_only(candles):
     now_ts = time.time()
     return [c for c in candles if is_closed_5m(c, now_ts)]
-
 
 # ============================================================
 # INDICATORS
@@ -334,7 +314,6 @@ def ema(values, period):
         value = (price - value) * multiplier + value
 
     return value
-
 
 def rsi_wilder(values, period=14):
     if len(values) < period + 1:
@@ -361,7 +340,6 @@ def rsi_wilder(values, period=14):
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
 
-
 def atr(candles, period=14):
     if len(candles) < period + 1:
         return None
@@ -379,7 +357,6 @@ def atr(candles, period=14):
         ))
 
     return sum(trs[-period:]) / period
-
 
 # ============================================================
 # CANDLE PATTERN
@@ -414,7 +391,6 @@ def candle_features(c0, c1):
             and body > abs(c1["close"] - c1["open"])
         ),
     }
-
 
 # ============================================================
 # ZONES
@@ -458,7 +434,6 @@ def build_zones(candles, lookback=240):
             })
 
     return zones
-
 
 def zone_analysis(candles, price, direction):
     current_atr = atr(candles, 14)
@@ -520,7 +495,6 @@ def zone_analysis(candles, price, direction):
         "score": min(score, 45),
         "level": nearest["price"],
     }
-
 
 # ============================================================
 # 15M MASTER
@@ -625,7 +599,6 @@ def analyze_15m(candles):
         "candle_time": c0["datetime"],
     }
 
-
 # ============================================================
 # 5M CONTEXT
 # ============================================================
@@ -710,7 +683,6 @@ def analyze_5m(candles, master_direction):
         "reasons": " | ".join(reasons),
     }
 
-
 # ============================================================
 # HISTORICAL RATE
 # ============================================================
@@ -722,7 +694,6 @@ def setup_signature(symbol, mode, direction, zone_state):
         direction,
         zone_state,
     )
-
 
 def historical_stats(signature):
     """
@@ -773,7 +744,6 @@ def historical_stats(signature):
         "first_win_rate": first_rate,
         "confidence": confidence,
     }
-
 
 # ============================================================
 # SIGNAL
@@ -858,7 +828,6 @@ def scan_symbol(symbol):
         "created_at": thai_text(),
     }
 
-
 # ============================================================
 # SERIES
 # ============================================================
@@ -869,7 +838,6 @@ def has_active_series(symbol):
             s["symbol"] == symbol
             for s in ACTIVE_SERIES
         )
-
 
 def create_series(signal):
     series_id = (
@@ -912,7 +880,6 @@ def create_series(signal):
 
     return tracker
 
-
 # ============================================================
 # OPPORTUNITY ENGINE
 # ============================================================
@@ -938,7 +905,6 @@ def find_candle_for_entry(candles, entry_ts):
         return None
 
     return c
-
 
 def evaluate_opportunity(tracker):
     candles = closed_only(
@@ -990,7 +956,6 @@ def evaluate_opportunity(tracker):
         "mae": max(0.0, mae),
     }
 
-
 def record_opportunity(tracker, outcome):
     tracker["processed_5m"].append(
         outcome["candle"]["datetime"]
@@ -1024,7 +989,6 @@ def record_opportunity(tracker, outcome):
         tracker["first_opportunity_result"] = result
 
     return result
-
 
 # ============================================================
 # FINALIZE
@@ -1098,7 +1062,6 @@ def finalize_series(tracker, status):
         f"🧭 Zone: **{tracker['zone_state']}**\n"
         f"🕐 เวลาไทย: **{thai_text()}**"
     )
-
 
 # ============================================================
 # TRACKER LOOP
@@ -1196,7 +1159,6 @@ def tracker_loop():
             log(f"Tracker error: {e}")
 
         time.sleep(10)
-
 
 # ============================================================
 # SCANNER LOOP
@@ -1307,7 +1269,6 @@ def scanner_loop():
 
         time.sleep(SCAN_SECONDS)
 
-
 # ============================================================
 # REPORT
 # ============================================================
@@ -1329,7 +1290,6 @@ def calculate_stats():
             "active_series": len(ACTIVE_SERIES),
             "memory_records": len(HISTORICAL_MEMORY),
         }
-
 
 def reporter_loop():
     while True:
@@ -1363,7 +1323,6 @@ def reporter_loop():
             log(f"Reporter error: {e}")
 
         time.sleep(REPORT_SECONDS)
-
 
 # ============================================================
 # HEALTH SERVER
@@ -1413,7 +1372,6 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
-
 def run_health_server():
     try:
         server = HTTPServer(
@@ -1426,7 +1384,6 @@ def run_health_server():
 
     except Exception as e:
         log(f"Health server error: {e}")
-
 
 # ============================================================
 # STARTUP
@@ -1447,7 +1404,6 @@ def startup_message():
         f"⚠️ OTC เป็น proxy จาก public FX feed "
         f"ไม่ใช่ราคา OTC จาก 8X โดยตรง"
     )
-
 
 def main():
     log("=" * 70)
@@ -1485,7 +1441,6 @@ def main():
             log("Stopping...")
             break
 
-
 if __name__ == "__main__":
     main()
 '''
@@ -1494,3 +1449,4 @@ path = Path("/mnt/data/tradeify.py")
 path.write_text(code, encoding="utf-8")
 print(f"สร้างไฟล์เรียบร้อย: {path}")
 print(f"จำนวนบรรทัด: {len(code.splitlines())}")
+อันนี้นะ
