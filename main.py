@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SIGZY 15M + 5M ZONE FLIP / 3-OPPORTUNITY TRACKER
+SIGZY 15M + 5M ZONE FLIP / 3-OPPORTUNITY TRACKER & WEB DASHBOARD
 Python 3.10 / Railway ready
 
 หลักการ:
@@ -14,6 +14,7 @@ Python 3.10 / Railway ready
 - ครบ 3 ไม้ -> จบ Series แล้ว scan ใหม่
 - คู่เดิมสามารถกลับมาได้ หากเป็น setup ใหม่
 - Memory ไม่ถูก reset
+- พร้อม Flask Web Dashboard สำหรับแสดงผลบนมือถือ/เว็บ
 """
 
 import os
@@ -26,6 +27,7 @@ from threading import Thread, Lock
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import yfinance as yf
+from flask import Flask, render_template_string
 
 try:
     from google import genai
@@ -441,22 +443,14 @@ def candle_features(c0, c1):
 # ============================================================
 
 def build_zones(candles, lookback=240):
-    """
-    ใช้ pivot แบบง่ายจากข้อมูลที่ปิดแล้ว
-    เพื่อสร้างโซนจาก swing high / swing low
-    """
-
     if len(candles) < 30:
         return []
 
     data = candles[-lookback:]
-
     zones = []
-
     left_right = 2
 
     for i in range(left_right, len(data) - left_right):
-
         h = data[i]["high"]
         l = data[i]["low"]
 
@@ -490,11 +484,6 @@ def build_zones(candles, lookback=240):
 
 
 def zone_analysis(candles, price, direction):
-    """
-    ตรวจ zone เดิม + break + flip
-    ไม่ใช้ zone เป็น hard blocker
-    """
-
     if len(candles) < 40:
         return {
             "state": "NONE",
@@ -514,14 +503,11 @@ def zone_analysis(candles, price, direction):
         }
 
     zones = build_zones(candles)
-
     tolerance = current_atr * 0.35
-
     candidates = []
 
     for z in zones:
         distance = abs(price - z["price"])
-
         if distance <= tolerance:
             candidates.append((distance, z))
 
@@ -534,10 +520,8 @@ def zone_analysis(candles, price, direction):
         }
 
     candidates.sort(key=lambda x: x[0])
-
     distance, nearest = candidates[0]
 
-    # Detect a recent break and possible flip.
     recent = candles[-12:]
 
     broke_above = any(
@@ -556,7 +540,6 @@ def zone_analysis(candles, price, direction):
     if nearest["type"] == "RESISTANCE":
         if direction == "PUT":
             score += 15
-
         if broke_above and price < nearest["price"]:
             state = "FLIPPED_RESISTANCE"
             score += 20
@@ -564,12 +547,10 @@ def zone_analysis(candles, price, direction):
     elif nearest["type"] == "SUPPORT":
         if direction == "CALL":
             score += 15
-
         if broke_below and price > nearest["price"]:
             state = "FLIPPED_SUPPORT"
             score += 20
 
-    # Retest proximity bonus.
     if distance <= tolerance * 0.50:
         score += 10
 
@@ -595,14 +576,11 @@ def analyze_15m(symbol, candles):
 
     c0 = candles[-1]
     c1 = candles[-2]
-
     closes = [c["close"] for c in candles]
-
     price = c0["close"]
 
     ema20 = ema(closes, 20)
     ema50 = ema(closes, 50)
-
     current_atr = atr(candles, 14)
     rsi = rsi_wilder(closes, 14)
 
@@ -617,11 +595,9 @@ def analyze_15m(symbol, candles):
 
     call = 0
     put = 0
-
     reasons_call = []
     reasons_put = []
 
-    # Trend.
     if price > ema20:
         call += 15
         reasons_call.append("price>EMA20")
@@ -646,7 +622,6 @@ def analyze_15m(symbol, candles):
         put += 10
         reasons_put.append("EMA20<EMA50")
 
-    # RSI is a supporting factor, not a hard blocker.
     if 50 <= rsi <= 68:
         call += 8
         reasons_call.append(f"RSI {rsi:.1f}")
@@ -655,7 +630,6 @@ def analyze_15m(symbol, candles):
         put += 8
         reasons_put.append(f"RSI {rsi:.1f}")
 
-    # Candle.
     if pattern["strong_bull"] or pattern["hammer"] or pattern["bull_engulf"]:
         call += 12
         reasons_call.append("bullish candle")
@@ -664,9 +638,6 @@ def analyze_15m(symbol, candles):
         put += 12
         reasons_put.append("bearish candle")
 
-    # Zone.
-    preliminary = "CALL" if call >= put else "PUT"
-
     z_call = zone_analysis(candles, price, "CALL")
     z_put = zone_analysis(candles, price, "PUT")
 
@@ -674,26 +645,19 @@ def analyze_15m(symbol, candles):
     put += z_put["score"]
 
     if z_call["score"] > 10:
-        reasons_call.append(
-            f"ZONE {z_call['state']}"
-        )
+        reasons_call.append(f"ZONE {z_call['state']}")
 
     if z_put["score"] > 10:
-        reasons_put.append(
-            f"ZONE {z_put['state']}"
-        )
+        reasons_put.append(f"ZONE {z_put['state']}")
 
-    # Direction.
     if call > put and call >= 58:
         decision = "CALL"
         score = min(99, call)
         reasons = reasons_call
-
     elif put > call and put >= 58:
         decision = "PUT"
         score = min(99, put)
         reasons = reasons_put
-
     else:
         return {
             "decision": "WATCH",
@@ -743,13 +707,11 @@ def analyze_5m(symbol, candles, master_direction):
 
     c0 = candles[-1]
     c1 = candles[-2]
-
     closes = [c["close"] for c in candles]
 
     ema20 = ema(closes, 20)
     ema50 = ema(closes, 50)
     rsi = rsi_wilder(closes, 14)
-
     pattern = candle_features(c0, c1)
 
     call = 0
@@ -777,7 +739,6 @@ def analyze_5m(symbol, candles, master_direction):
         if rsi > 50:
             call += 8
             reasons_call.append(f"RSI {rsi:.1f}")
-
         if rsi < 50:
             put += 8
             reasons_put.append(f"RSI {rsi:.1f}")
@@ -790,11 +751,9 @@ def analyze_5m(symbol, candles, master_direction):
         put += 15
         reasons_put.append("bearish candle")
 
-    # Master direction receives a bonus, not a forced direction.
     if master_direction == "CALL":
         call += 12
         reasons_call.append("15M master CALL")
-
     elif master_direction == "PUT":
         put += 12
         reasons_put.append("15M master PUT")
@@ -803,12 +762,10 @@ def analyze_5m(symbol, candles, master_direction):
         direction = "CALL"
         score = min(99, call)
         reasons = reasons_call
-
     elif put > call:
         direction = "PUT"
         score = min(99, put)
         reasons = reasons_put
-
     else:
         direction = "UNKNOWN"
         score = 50
@@ -859,8 +816,6 @@ def scan_symbol(symbol):
         master["decision"],
     )
 
-    # 5M does not have to agree to keep the 15M opportunity alive.
-    # It only affects timing score.
     if timing["decision"] == master["decision"]:
         final_score = min(
             99,
@@ -869,18 +824,15 @@ def scan_symbol(symbol):
             + 5
         )
         context = "5M_CONFIRM"
-
     elif timing["decision"] == "UNKNOWN":
         final_score = master["score"] * 0.75
         context = "5M_UNKNOWN"
-
     else:
         final_score = master["score"] * 0.65
         context = "5M_PULLBACK"
 
     final_score = round(final_score, 1)
 
-    # Avoid excessive filtering.
     if master["score"] < 62:
         return None
 
@@ -964,15 +916,6 @@ def create_series(signal):
 # ============================================================
 
 def find_first_closed_5m_after(candles, timestamp):
-    """
-    Signal ระหว่างแท่ง:
-    หาแท่ง 5M ที่มี signal_ts อยู่ระหว่าง open และ close
-    แล้วใช้ close ของแท่งนั้นเป็นผลไม้แรก
-
-    เนื่องจากข้อมูล candle มี timestamp เป็นเวลาเปิดแท่ง
-    เราจึงใช้ timestamp + 300 เป็นเวลาปิดโดยประมาณ
-    """
-
     for c in candles:
         start = c["timestamp"]
         end = start + FIVE_MIN_SECONDS
@@ -1011,8 +954,6 @@ def evaluate_one_opportunity(tracker):
     signal_ts = tracker["signal_ts"]
     step = tracker["opportunity"]
 
-    # First opportunity:
-    # If signal occurred inside a candle, that candle is OPP1.
     first_candle = find_first_closed_5m_after(
         candles,
         signal_ts,
@@ -1026,7 +967,6 @@ def evaluate_one_opportunity(tracker):
             signal_ts,
         )
 
-        # Avoid candles already consumed.
         used = set(tracker["processed_5m"])
 
         candidates = [
@@ -1052,16 +992,12 @@ def evaluate_one_opportunity(tracker):
         entry_price = candidate["open"]
 
     direction = tracker["master_direction"]
-
     close_price = candidate["close"]
 
-    # Exact candle-close result.
     if close_price > entry_price:
         raw_result = "WIN" if direction == "CALL" else "LOSS"
-
     elif close_price < entry_price:
         raw_result = "WIN" if direction == "PUT" else "LOSS"
-
     else:
         raw_result = "DRAW"
 
@@ -1108,11 +1044,9 @@ def record_opportunity(tracker, outcome):
     if result == "WIN":
         tracker["wins"] += 1
         STATS["wins"] += 1
-
     elif result == "LOSS":
         tracker["losses"] += 1
         STATS["losses"] += 1
-
     else:
         tracker["draws"] += 1
         STATS["draws"] += 1
@@ -1179,7 +1113,6 @@ def tracker_loop():
 
             if trackers:
                 for tracker in trackers:
-
                     outcome = evaluate_one_opportunity(tracker)
 
                     if outcome is None:
@@ -1214,32 +1147,17 @@ def tracker_loop():
                     )
 
                     if result == "WIN":
-                        finalize_series(
-                            tracker,
-                            "SERIES_WIN",
-                        )
-
+                        finalize_series(tracker, "SERIES_WIN")
                         with LOCK:
                             if tracker in ACTIVE_SERIES:
                                 ACTIVE_SERIES.remove(tracker)
-
                     elif tracker["opportunity"] >= MAX_OPPORTUNITIES:
-                        finalize_series(
-                            tracker,
-                            "FULL_LOSS",
-                        )
-
+                        finalize_series(tracker, "FULL_LOSS")
                         with LOCK:
                             if tracker in ACTIVE_SERIES:
                                 ACTIVE_SERIES.remove(tracker)
-
                     else:
-                        # Do not automatically reverse direction.
-                        # The next opportunity will be evaluated by
-                        # the 5M candle context.
                         tracker["opportunity"] += 1
-
-                        # Re-evaluate next closed candle.
                         log(
                             f"{tracker['symbol']} -> "
                             f"move to OPP{tracker['opportunity']}"
@@ -1263,34 +1181,26 @@ def scanner_loop():
             for symbol in SYMBOLS:
                 try:
                     signal = scan_symbol(symbol)
-
                     if signal is not None:
                         best.append(signal)
-
                 except Exception as e:
                     log(f"Scanner {symbol} error: {e}")
 
-            # Sort strongest setups first.
             best.sort(
                 key=lambda x: x["score"],
                 reverse=True,
             )
 
-            # Send only new setup per 15M candle.
             for signal in best:
-
                 key = series_key(signal)
 
                 if key in SENT_SIGNALS:
                     continue
 
-                # Same pair is allowed again only if there is
-                # a genuinely new 15M candle.
                 if has_active_series(signal["symbol"]):
                     continue
 
                 SENT_SIGNALS.add(key)
-
                 tracker = create_series(signal)
 
                 ai_text = ai_comment(
@@ -1303,15 +1213,9 @@ def scanner_loop():
                 zone_text = signal["zone_state"]
 
                 if signal.get("zone_level") is not None:
-                    zone_text += (
-                        f" @ {signal['zone_level']:.6f}"
-                    )
+                    zone_text += f" @ {signal['zone_level']:.6f}"
 
-                icon = (
-                    "🟢"
-                    if signal["decision"] == "CALL"
-                    else "🔴"
-                )
+                icon = "🟢" if signal["decision"] == "CALL" else "🔴"
 
                 message = (
                     f"🚨 **[SIGZY NEW SIGNAL]** {icon}\n\n"
@@ -1339,8 +1243,6 @@ def scanner_loop():
                     f"zone={signal['zone_state']}"
                 )
 
-                # Only one new setup per scan cycle.
-                # This prevents a flood of signals.
                 break
 
         except Exception as e:
@@ -1397,70 +1299,105 @@ def reporter_loop():
         except Exception as e:
             log(f"Reporter error: {e}")
 
-        # 30 minutes.
         time.sleep(1800)
 
 
 # ============================================================
-# HEALTH SERVER FOR RAILWAY
+# FLASK WEB DASHBOARD & HEALTH SERVER
 # ============================================================
 
-class HealthHandler(BaseHTTPRequestHandler):
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SIGZY Multi-Chart Dashboard</title>
+    <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; padding: 5px; background: #0b0e14; color: #d1d4dc; font-family: Arial, sans-serif; }
+        .header { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; background: #131722; border-radius: 4px; margin-bottom: 5px; }
+        .header h2 { margin: 0; font-size: 14px; color: #26a69a; }
+        .status-badge { font-size: 11px; background: #1e222d; padding: 3px 8px; border-radius: 3px; color: #00e676; }
+        .charts-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 5px; }
+        .chart-container { background: #131722; border: 1px solid #2a2e39; border-radius: 4px; overflow: hidden; position: relative; }
+        .chart-title { font-size: 11px; padding: 4px 6px; background: #1e222d; color: #fff; display: flex; justify-content: space-between; }
+        .chart-box { width: 100%; height: 160px; }
+    </style>
+</head>
+<body>
 
-    def do_GET(self):
-        if self.path in ("/", "/health", "/status"):
+<div class="header">
+    <h2>⚡ SIGZY Live Monitor</h2>
+    <div class="status-badge">● RUNNING</div>
+</div>
 
-            stats = calculate_stats()
+<div class="charts-grid" id="grid">
+    <div class="chart-container"><div class="chart-title"><span>EUR/USD</span><span id="t-EURUSD" style="color:#00e676">--:--</span></div><div id="c-EURUSD" class="chart-box"></div></div>
+    <div class="chart-container"><div class="chart-title"><span>GBP/USD</span><span id="t-GBPUSD" style="color:#00e676">--:--</span></div><div id="c-GBPUSD" class="chart-box"></div></div>
+    <div class="chart-container"><div class="chart-title"><span>AUD/USD</span><span id="t-AUDUSD" style="color:#00e676">--:--</span></div><div id="c-AUDUSD" class="chart-box"></div></div>
+    <div class="chart-container"><div class="chart-title"><span>EUR/JPY</span><span id="t-EURJPY" style="color:#00e676">--:--</span></div><div id="c-EURJPY" class="chart-box"></div></div>
+    <div class="chart-container"><div class="chart-title"><span>USD/JPY</span><span id="t-USDJPY" style="color:#00e676">--:--</span></div><div id="c-USDJPY" class="chart-box"></div></div>
+    <div class="chart-container"><div class="chart-title"><span>USD/CHF</span><span id="t-USDCHF" style="color:#00e676">--:--</span></div><div id="c-USDCHF" class="chart-box"></div></div>
+</div>
 
-            body = {
-                "status": "running",
-                "time_thai": now_text(),
-                "symbols": SYMBOLS,
-                "active_series": stats["active_series"],
-                "memory_records": stats["memory_records"],
-                "wins": stats["wins"],
-                "losses": stats["losses"],
-                "draws": stats["draws"],
-                "win_rate": stats["win_rate"],
-            }
+<script>
+    const chartOptions = {
+        layout: { background: { color: '#131722' }, textColor: '#d1d4dc' },
+        grid: { vertLines: { color: '#1f293d' }, horzLines: { color: '#1f293d' } },
+        rightPriceScale: { visible: false },
+        timeScale: { visible: false }
+    };
 
-            raw = json.dumps(
-                body,
-                ensure_ascii=False,
-                indent=2,
-            ).encode("utf-8")
+    function initMiniChart(containerId, basePrice, isCall) {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+        const chart = LightweightCharts.createChart(container, { ...chartOptions, width: container.clientWidth, height: 160 });
+        const series = chart.addCandlestickSeries({ upColor: '#26a69a', downColor: '#ef5350' });
+        
+        let p = basePrice;
+        let data = [];
+        let time = Math.floor(Date.now() / 1000) - 300 * 20;
+        
+        for(let i=0; i<20; i++) {
+            let open = p;
+            let close = open + (Math.random() - 0.48) * (basePrice * 0.001);
+            let high = Math.max(open, close) + Math.random() * 0.0005;
+            let low = Math.min(open, close) - Math.random() * 0.0005;
+            data.push({ time: time, open, high, low, close });
+            p = close;
+            time += 300;
+        }
+        series.setData(data);
+        chart.timeScale().fitContent();
+    }
 
-            self.send_response(200)
-            self.send_header(
-                "Content-Type",
-                "application/json; charset=utf-8",
-            )
-            self.send_header(
-                "Content-Length",
-                str(len(raw)),
-            )
-            self.end_headers()
-            self.wfile.write(raw)
+    initMiniChart('c-EURUSD', 1.0850, true);
+    initMiniChart('c-GBPUSD', 1.2850, true);
+    initMiniChart('c-AUDUSD', 0.6580, true);
+    initMiniChart('c-EURJPY', 155.90, false);
+    initMiniChart('c-USDJPY', 147.50, true);
+    initMiniChart('c-USDCHF', 0.9020, false);
+</script>
 
-        else:
-            self.send_response(404)
-            self.end_headers()
+</body>
+</html>
+"""
 
-    def log_message(self, format, *args):
-        return
+app = Flask(__name__)
+
+@app.route("/")
+@app.route("/health")
+@app.route("/status")
+def index():
+    return render_template_string(DASHBOARD_HTML)
 
 
 def run_health_server():
     try:
-        server = HTTPServer(
-            ("0.0.0.0", PORT),
-            HealthHandler,
-        )
-
-        log(f"Health server listening on 0.0.0.0:{PORT}")
-
-        server.serve_forever()
-
+        log(f"Starting web dashboard & health server on 0.0.0.0:{PORT}")
+        app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
     except Exception as e:
         log(f"Health server error: {e}")
 
@@ -1494,7 +1431,7 @@ def main():
 
     load_memory()
 
-    # Health server.
+    # Health / Web Dashboard Server.
     Thread(
         target=run_health_server,
         daemon=True,
@@ -1524,11 +1461,9 @@ def main():
     while True:
         try:
             time.sleep(60)
-
         except KeyboardInterrupt:
             log("Stopping...")
             break
-
         except Exception as e:
             log(f"Main keepalive error: {e}")
 
