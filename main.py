@@ -1,26 +1,19 @@
-# -*- coding: utf-8 -*-
+from pathlib import Path
+
+code = r'''# -*- coding: utf-8 -*-
 """
 TRADEIFY.py
-============================================================
-TRADEIFY 24/7 + LIVE + OTC + 15M + 5M + 3 OPPORTUNITIES
-THAI TIME + DISCORD + MEMORY
-
-Python 3.10+
-
-ระบบ:
-- 15M = Master Trend / Zone / Break / Flip
-- 5M  = Timing / Candle Confirmation
-- สูงสุด 3 Opportunities ต่อ Series
-- Memory ไม่ reset
-- LIVE / OTC แยกโหมด
-- เวลาไทยทุกข้อความ
-- Discord แจ้งละเอียด
-- Health server สำหรับ Railway
-- Gemini เป็นเพียงคำอธิบาย ไม่ใช่ตัวตัดสินหลัก
+15M MASTER + 5M ENTRY + 3 OPPORTUNITIES + MEMORY + DISCORD + THAI TIME
+LIVE / OTC AUTO MODE
 
 สำคัญ:
-ข้อมูลจาก Yahoo ไม่ใช่ข้อมูลแท่งของ 8X โดยตรง
-ดังนั้น OTC / Weekend อาจไม่ตรงกับกราฟ 8X 100%
+- โหมด OTC ในไฟล์นี้เป็น "โหมดการทำงาน" ไม่ใช่ข้อมูลราคาจาก 8X โดยตรง
+- yfinance ไม่มีฟีด OTC ของ 8X ดังนั้น OTC ที่ทดสอบด้วยไฟล์นี้ใช้ข้อมูล FX สาธารณะเป็น proxy
+- ห้ามตีความ Historical Win Rate เป็นการการันตีกำไร
+- WIN/LOSS จะตัดสินจากแท่ง 5M ที่ "ปิดแล้ว" เท่านั้น
+- เมื่อ signal ออกหลังแท่งปัจจุบันปิด ระบบจะเตรียมเข้าแท่ง 5M ถัดไป
+- หลังแพ้ไม้ 1 จะยังคงทิศทางเดิมสำหรับไม้ 2/3 ตามกติกา Series
+- ครบ 3 ไม้ = จบ Series
 """
 
 import os
@@ -33,10 +26,6 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import yfinance as yf
 
-# ============================================================
-# OPTIONAL GEMINI
-# ============================================================
-
 try:
     from google import genai
 except Exception:
@@ -47,70 +36,23 @@ except Exception:
 # CONFIG
 # ============================================================
 
-APP_NAME = "TRADEIFY"
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-DISCORD_WEBHOOK_URL = os.getenv(
-    "DISCORD_WEBHOOK_URL",
-    ""
-).strip()
+PORT = int(os.getenv("PORT", "8080"))
+SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "60"))
+REPORT_SECONDS = int(os.getenv("REPORT_SECONDS", "1800"))
 
-GEMINI_API_KEY = os.getenv(
-    "GEMINI_API_KEY",
-    ""
-).strip()
+MEMORY_FILE = os.getenv("MEMORY_FILE", "tradeify_memory.json")
 
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-2.5-flash"
-)
-
-PORT = int(
-    os.getenv("PORT", "8080")
-)
-
-SCAN_SECONDS = int(
-    os.getenv("SCAN_SECONDS", "60")
-)
-
-REPORT_SECONDS = int(
-    os.getenv("REPORT_SECONDS", "1800")
-)
-
-FIVE_MIN_SECONDS = 300
+# AUTO = เสาร์/อาทิตย์เป็น OTC, วันธรรมดาเป็น LIVE
+# LIVE / OTC = บังคับโหมด
+MARKET_MODE = os.getenv("MARKET_MODE", "AUTO").upper()
 
 MAX_OPPORTUNITIES = 3
-
-MEMORY_FILE = os.getenv(
-    "MEMORY_FILE",
-    "tradeify_memory.json"
-)
-
-# ------------------------------------------------------------
-# SIGNAL THRESHOLDS
-# ------------------------------------------------------------
-
-MASTER_MIN_SCORE = 58
-
-STRONG_SCORE = 75
-
-# ------------------------------------------------------------
-# MARKET MODES
-# ------------------------------------------------------------
-
-LIVE_MODE = "LIVE"
-OTC_MODE = "OTC"
-
-# ตั้งค่า default เป็น AUTO
-# LIVE วันธรรมดา
-# OTC เสาร์/อาทิตย์
-MARKET_MODE = os.getenv(
-    "MARKET_MODE",
-    "AUTO"
-).upper()
-
-# ------------------------------------------------------------
-# SYMBOLS
-# ------------------------------------------------------------
+TF5_SECONDS = 300
+MIN_HISTORY_FOR_RATE = int(os.getenv("MIN_HISTORY_FOR_RATE", "10"))
 
 SYMBOL_MAP = {
     "EUR/USD": "EURUSD=X",
@@ -125,20 +67,9 @@ SYMBOL_MAP = {
 
 SYMBOLS = list(SYMBOL_MAP.keys())
 
-MASTER_INTERVAL = "15m"
-ENTRY_INTERVAL = "5m"
-
-
-# ============================================================
-# GLOBAL STATE
-# ============================================================
-
 LOCK = Lock()
-
 HISTORICAL_MEMORY = []
-
 ACTIVE_SERIES = []
-
 SENT_SIGNALS = set()
 
 STATS = {
@@ -153,12 +84,10 @@ STATS = {
 
 
 # ============================================================
-# TIME / THAI
+# TIME / MODE
 # ============================================================
 
-THAI_TZ = timezone(
-    timedelta(hours=7)
-)
+THAI_TZ = timezone(timedelta(hours=7))
 
 
 def now_utc():
@@ -166,72 +95,33 @@ def now_utc():
 
 
 def now_thai():
-    return datetime.now(THAI_TZ)
+    return now_utc().astimezone(THAI_TZ)
 
 
 def thai_text(dt=None):
-    if dt is None:
-        dt = now_thai()
-
-    return dt.strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+    dt = dt or now_thai()
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def thai_short(dt=None):
-    if dt is None:
-        dt = now_thai()
-
-    return dt.strftime(
-        "%d/%m/%Y %H:%M:%S"
-    )
+def thai_hm(dt=None):
+    dt = dt or now_thai()
+    return dt.strftime("%H:%M")
 
 
-def weekday_thai():
-    names = {
-        0: "จันทร์",
-        1: "อังคาร",
-        2: "พุธ",
-        3: "พฤหัสบดี",
-        4: "ศุกร์",
-        5: "เสาร์",
-        6: "อาทิตย์",
-    }
-
-    return names[now_thai().weekday()]
-
-
-def is_weekend():
-    return now_thai().weekday() >= 5
-
-
-def automatic_market_mode():
-    if MARKET_MODE in (
-        LIVE_MODE,
-        OTC_MODE,
-    ):
+def mode_now():
+    if MARKET_MODE in ("LIVE", "OTC"):
         return MARKET_MODE
 
-    if is_weekend():
-        return OTC_MODE
-
-    return LIVE_MODE
+    # AUTO: เสาร์/อาทิตย์ = OTC, จันทร์-ศุกร์ = LIVE
+    return "OTC" if now_thai().weekday() >= 5 else "LIVE"
 
 
-def market_label():
-    mode = automatic_market_mode()
-
-    if mode == OTC_MODE:
-        return "🟣 OTC / WEEKEND"
-
-    return "🟢 LIVE / WEEKDAY"
+def utc_to_thai(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).astimezone(THAI_TZ)
 
 
-def log(message):
-    print(
-        f"[{thai_text()}] {message}",
-        flush=True
-    )
+def log(msg):
+    print(f"[{thai_text()}] {msg}", flush=True)
 
 
 # ============================================================
@@ -239,97 +129,55 @@ def log(message):
 # ============================================================
 
 def send_discord(message):
-
     if not DISCORD_WEBHOOK_URL:
-        log(
-            "Discord disabled: "
-            "DISCORD_WEBHOOK_URL not set"
-        )
+        log("Discord: webhook not configured")
         return False
 
     try:
-
-        response = requests.post(
+        r = requests.post(
             DISCORD_WEBHOOK_URL,
-            json={
-                "content": message[:1900]
-            },
+            json={"content": message[:1900]},
             timeout=10,
         )
 
-        if response.status_code == 204:
+        if r.status_code in (200, 204):
             return True
 
-        log(
-            f"Discord HTTP "
-            f"{response.status_code}: "
-            f"{response.text[:300]}"
-        )
-
+        log(f"Discord HTTP {r.status_code}: {r.text[:200]}")
         return False
 
-    except Exception as exc:
-
-        log(
-            f"Discord error: {exc}"
-        )
-
+    except Exception as e:
+        log(f"Discord error: {e}")
         return False
 
 
 # ============================================================
-# GEMINI
+# GEMINI - OPTIONAL COMMENT ONLY
 # ============================================================
 
 AI_CLIENT = None
 
 if genai and GEMINI_API_KEY:
-
     try:
-
-        AI_CLIENT = genai.Client(
-            api_key=GEMINI_API_KEY
-        )
-
-        log(
-            "Gemini client ready"
-        )
-
-    except Exception as exc:
-
-        log(
-            f"Gemini init failed: {exc}"
-        )
-
-else:
-
-    log(
-        "Gemini disabled"
-    )
+        AI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
+        log("Gemini ready")
+    except Exception as e:
+        log(f"Gemini init failed: {e}")
 
 
-def ai_comment(
-    symbol,
-    direction,
-    score,
-    zone_state,
-    mode,
-):
-
+def ai_comment(signal):
     if AI_CLIENT is None:
         return "AI: OFF"
 
     try:
-
         prompt = (
-            f"Forex {symbol}. "
-            f"Mode={mode}. "
-            f"15M direction={direction}. "
-            f"score={score}/100. "
-            f"zone={zone_state}. "
-            f"Give a very short Thai analysis, "
-            f"maximum 2 lines. "
-            f"Do not guarantee profit."
+            "Give a short Thai market-context comment, max 2 lines. "
+            "Do not give guaranteed-profit language. "
+            f"Pair={signal['symbol']}, mode={signal['mode']}, "
+            f"direction={signal['decision']}, "
+            f"15M_RSI={signal['rsi15']:.1f}, "
+            f"5M_RSI={signal['rsi5']:.1f}, "
+            f"zone={signal['zone_state']}."
         )
 
         response = AI_CLIENT.models.generate_content(
@@ -337,23 +185,12 @@ def ai_comment(
             contents=prompt,
         )
 
-        text = getattr(
-            response,
-            "text",
-            None
-        )
+        text = getattr(response, "text", None)
+        return text.strip() if text else "AI: no response"
 
-        if text:
-            return text.strip()
-
-        return "AI: no response"
-
-    except Exception as exc:
-
-        return (
-            "AI unavailable: "
-            + str(exc)[:120]
-        )
+    except Exception as e:
+        # AI ไม่ควรทำให้ระบบ signal หยุด
+        return f"AI unavailable: {str(e)[:80]}"
 
 
 # ============================================================
@@ -361,92 +198,47 @@ def ai_comment(
 # ============================================================
 
 def load_memory():
-
     global HISTORICAL_MEMORY
 
-    if not os.path.exists(
-        MEMORY_FILE
-    ):
-
+    if not os.path.exists(MEMORY_FILE):
         HISTORICAL_MEMORY = []
-
-        log(
-            f"Memory new: {MEMORY_FILE}"
-        )
-
+        log(f"Memory new: {MEMORY_FILE}")
         return
 
     try:
-
-        with open(
-            MEMORY_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            data = json.load(file)
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
         if isinstance(data, list):
-
             HISTORICAL_MEMORY = data
-
         elif isinstance(data, dict):
-
-            HISTORICAL_MEMORY = data.get(
-                "history",
-                []
-            )
-
+            HISTORICAL_MEMORY = data.get("history", [])
         else:
-
             HISTORICAL_MEMORY = []
 
-        log(
-            "Memory loaded: "
-            f"{len(HISTORICAL_MEMORY)} records"
-        )
+        log(f"Memory loaded: {len(HISTORICAL_MEMORY)} records")
 
-    except Exception as exc:
-
-        log(
-            f"Memory load error: {exc}"
-        )
-
+    except Exception as e:
+        log(f"Memory load error: {e}")
         HISTORICAL_MEMORY = []
 
 
 def save_memory():
-
     try:
+        tmp = MEMORY_FILE + ".tmp"
 
-        temp_file = (
-            MEMORY_FILE
-            + ".tmp"
-        )
-
-        with open(
-            temp_file,
-            "w",
-            encoding="utf-8"
-        ) as file:
-
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(
                 HISTORICAL_MEMORY,
-                file,
+                f,
                 ensure_ascii=False,
                 indent=2,
             )
 
-        os.replace(
-            temp_file,
-            MEMORY_FILE
-        )
+        os.replace(tmp, MEMORY_FILE)
 
-    except Exception as exc:
-
-        log(
-            f"Memory save error: {exc}"
-        )
+    except Exception as e:
+        log(f"Memory save error: {e}")
 
 
 # ============================================================
@@ -454,57 +246,26 @@ def save_memory():
 # ============================================================
 
 def clean_dataframe(df):
-
     if df is None or df.empty:
         return None
 
     try:
+        df = df.copy()
 
-        if getattr(
-            df.index,
-            "tz",
-            None
-        ) is not None:
+        if getattr(df.index, "tz", None) is not None:
+            df.index = df.index.tz_convert("UTC").tz_localize(None)
 
-            df = df.copy()
-
-            df.index = (
-                df.index
-                .tz_convert("UTC")
-                .tz_localize(None)
-            )
-
-        return df.dropna(
-            subset=[
-                "Open",
-                "High",
-                "Low",
-                "Close",
-            ]
-        )
+        return df.dropna(subset=["Open", "High", "Low", "Close"])
 
     except Exception:
-
         return df
 
 
-def get_candles(
-    symbol,
-    interval,
-    period="5d",
-    closed_only=True,
-):
-
-    ticker_symbol = SYMBOL_MAP.get(
-        symbol,
-        symbol
-    )
+def get_candles(symbol, interval, period="5d"):
+    ticker_symbol = SYMBOL_MAP.get(symbol, symbol)
 
     try:
-
-        ticker = yf.Ticker(
-            ticker_symbol
-        )
+        ticker = yf.Ticker(ticker_symbol)
 
         df = ticker.history(
             period=period,
@@ -518,339 +279,140 @@ def get_candles(
         if df is None or len(df) < 10:
             return []
 
-        # ตัดแท่งล่าสุดออก
-        # เพื่อใช้เฉพาะแท่งที่ปิดแล้ว
-        if (
-            closed_only
-            and len(df) > 1
-        ):
-
-            df = df.iloc[:-1]
-
         candles = []
 
         for idx, row in df.iterrows():
-
             ts = idx.to_pydatetime()
 
             if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
 
-                ts = ts.replace(
-                    tzinfo=timezone.utc
-                )
-
-            ts = ts.astimezone(
-                timezone.utc
-            )
+            ts = ts.astimezone(timezone.utc)
 
             candles.append({
-
-                "datetime":
-                    ts.strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    ),
-
-                "timestamp":
-                    ts.timestamp(),
-
-                "open":
-                    float(row["Open"]),
-
-                "high":
-                    float(row["High"]),
-
-                "low":
-                    float(row["Low"]),
-
-                "close":
-                    float(row["Close"]),
+                "datetime": ts.strftime("%Y-%m-%d %H:%M:%S"),
+                "timestamp": ts.timestamp(),
+                "open": float(row["Open"]),
+                "high": float(row["High"]),
+                "low": float(row["Low"]),
+                "close": float(row["Close"]),
             })
 
         return candles
 
-    except Exception as exc:
-
-        log(
-            f"Data error "
-            f"{symbol} "
-            f"{interval}: "
-            f"{exc}"
-        )
-
+    except Exception as e:
+        log(f"Yahoo {symbol} {interval}: {e}")
         return []
+
+
+def candle_close_ts(c):
+    return c["timestamp"] + TF5_SECONDS
+
+
+def is_closed_5m(c, current_ts=None):
+    current_ts = current_ts or time.time()
+    return candle_close_ts(c) <= current_ts
+
+
+def closed_only(candles):
+    now_ts = time.time()
+    return [c for c in candles if is_closed_5m(c, now_ts)]
 
 
 # ============================================================
 # INDICATORS
 # ============================================================
 
-def ema(
-    values,
-    period
-):
-
+def ema(values, period):
     if len(values) < period:
         return None
 
-    multiplier = (
-        2.0
-        / (period + 1.0)
-    )
-
-    value = sum(
-        values[:period]
-    ) / period
+    multiplier = 2.0 / (period + 1.0)
+    value = sum(values[:period]) / period
 
     for price in values[period:]:
-
-        value = (
-            (price - value)
-            * multiplier
-            + value
-        )
+        value = (price - value) * multiplier + value
 
     return value
 
 
-def rsi_wilder(
-    values,
-    period=14
-):
-
+def rsi_wilder(values, period=14):
     if len(values) < period + 1:
         return None
 
     gains = []
     losses = []
 
-    for i in range(
-        1,
-        len(values)
-    ):
+    for i in range(1, len(values)):
+        d = values[i] - values[i - 1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
 
-        diff = (
-            values[i]
-            - values[i - 1]
-        )
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
 
-        gains.append(
-            max(diff, 0)
-        )
-
-        losses.append(
-            max(-diff, 0)
-        )
-
-    avg_gain = (
-        sum(gains[:period])
-        / period
-    )
-
-    avg_loss = (
-        sum(losses[:period])
-        / period
-    )
-
-    for i in range(
-        period,
-        len(gains)
-    ):
-
-        avg_gain = (
-            (
-                avg_gain
-                * (period - 1)
-            )
-            + gains[i]
-        ) / period
-
-        avg_loss = (
-            (
-                avg_loss
-                * (period - 1)
-            )
-            + losses[i]
-        ) / period
+    for i in range(period, len(gains)):
+        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
+        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
 
     if avg_loss == 0:
         return 100.0
 
-    rs = (
-        avg_gain
-        / avg_loss
-    )
-
-    return (
-        100.0
-        - (
-            100.0
-            / (1.0 + rs)
-        )
-    )
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
-def atr(
-    candles,
-    period=14
-):
-
+def atr(candles, period=14):
     if len(candles) < period + 1:
         return None
 
     trs = []
 
-    for i in range(
-        1,
-        len(candles)
-    ):
+    for i in range(1, len(candles)):
+        c = candles[i]
+        p = candles[i - 1]
 
-        current = candles[i]
-        previous = candles[i - 1]
+        trs.append(max(
+            c["high"] - c["low"],
+            abs(c["high"] - p["close"]),
+            abs(c["low"] - p["close"]),
+        ))
 
-        tr = max(
-            current["high"]
-            - current["low"],
-
-            abs(
-                current["high"]
-                - previous["close"]
-            ),
-
-            abs(
-                current["low"]
-                - previous["close"]
-            ),
-        )
-
-        trs.append(tr)
-
-    return (
-        sum(trs[-period:])
-        / period
-    )
+    return sum(trs[-period:]) / period
 
 
 # ============================================================
 # CANDLE PATTERN
 # ============================================================
 
-def candle_features(
-    c0,
-    c1
-):
+def candle_features(c0, c1):
+    body = abs(c0["close"] - c0["open"])
+    rng = max(c0["high"] - c0["low"], 1e-12)
 
-    body = abs(
-        c0["close"]
-        - c0["open"]
-    )
+    upper = c0["high"] - max(c0["open"], c0["close"])
+    lower = min(c0["open"], c0["close"]) - c0["low"]
 
-    full_range = max(
-        c0["high"]
-        - c0["low"],
-        1e-12
-    )
-
-    upper = (
-        c0["high"]
-        - max(
-            c0["open"],
-            c0["close"]
-        )
-    )
-
-    lower = (
-        min(
-            c0["open"],
-            c0["close"]
-        )
-        - c0["low"]
-    )
-
-    body_ratio = (
-        body
-        / full_range
-    )
-
-    strong_bull = (
-        c0["close"]
-        > c0["open"]
-        and body_ratio >= 0.65
-    )
-
-    strong_bear = (
-        c0["close"]
-        < c0["open"]
-        and body_ratio >= 0.65
-    )
-
-    hammer = (
-        lower >= body * 2
-        and upper
-        <= full_range * 0.25
-        and body_ratio <= 0.45
-    )
-
-    shooting_star = (
-        upper >= body * 2
-        and lower
-        <= full_range * 0.25
-        and body_ratio <= 0.45
-    )
-
-    bull_engulf = (
-        c0["close"]
-        > c0["open"]
-        and c1["close"]
-        < c1["open"]
-        and c0["open"]
-        <= c1["close"]
-        and c0["close"]
-        >= c1["open"]
-        and body
-        > abs(
-            c1["close"]
-            - c1["open"]
-        )
-    )
-
-    bear_engulf = (
-        c0["close"]
-        < c0["open"]
-        and c1["close"]
-        > c1["open"]
-        and c0["open"]
-        >= c1["close"]
-        and c0["close"]
-        <= c1["open"]
-        and body
-        > abs(
-            c1["close"]
-            - c1["open"]
-        )
-    )
+    ratio = body / rng
 
     return {
-
-        "strong_bull":
-            strong_bull,
-
-        "strong_bear":
-            strong_bear,
-
-        "hammer":
-            hammer,
-
-        "shooting_star":
-            shooting_star,
-
-        "bull_engulf":
-            bull_engulf,
-
-        "bear_engulf":
-            bear_engulf,
-
-        "body_ratio":
-            body_ratio,
+        "strong_bull": c0["close"] > c0["open"] and ratio >= 0.65,
+        "strong_bear": c0["close"] < c0["open"] and ratio >= 0.65,
+        "hammer": lower >= body * 2 and upper <= rng * 0.25 and ratio <= 0.45,
+        "shooting_star": upper >= body * 2 and lower <= rng * 0.25 and ratio <= 0.45,
+        "bull_engulf": (
+            c0["close"] > c0["open"]
+            and c1["close"] < c1["open"]
+            and c0["open"] <= c1["close"]
+            and c0["close"] >= c1["open"]
+            and body > abs(c1["close"] - c1["open"])
+        ),
+        "bear_engulf": (
+            c0["close"] < c0["open"]
+            and c1["close"] > c1["open"]
+            and c0["open"] >= c1["close"]
+            and c0["close"] <= c1["open"]
+            and body > abs(c1["close"] - c1["open"])
+        ),
     }
 
 
@@ -858,221 +420,105 @@ def candle_features(
 # ZONES
 # ============================================================
 
-def build_zones(
-    candles,
-    lookback=240
-):
-
+def build_zones(candles, lookback=240):
     if len(candles) < 30:
         return []
 
-    data = candles[
-        -lookback:
-    ]
-
+    data = candles[-lookback:]
     zones = []
 
-    left_right = 2
+    for i in range(2, len(data) - 2):
+        h = data[i]["high"]
+        l = data[i]["low"]
 
-    for i in range(
-        left_right,
-        len(data) - left_right
-    ):
-
-        high = data[i]["high"]
-        low = data[i]["low"]
-
-        swing_high = all(
-            high >= data[j]["high"]
-            for j in range(
-                i - left_right,
-                i + left_right + 1
-            )
+        high_ok = all(
+            h >= data[j]["high"]
+            for j in range(i - 2, i + 3)
             if j != i
         )
 
-        swing_low = all(
-            low <= data[j]["low"]
-            for j in range(
-                i - left_right,
-                i + left_right + 1
-            )
+        low_ok = all(
+            l <= data[j]["low"]
+            for j in range(i - 2, i + 3)
             if j != i
         )
 
-        if swing_high:
-
+        if high_ok:
             zones.append({
-                "type":
-                    "RESISTANCE",
-
-                "price":
-                    high,
-
-                "timestamp":
-                    data[i]["timestamp"],
+                "type": "RESISTANCE",
+                "price": h,
+                "timestamp": data[i]["timestamp"],
             })
 
-        if swing_low:
-
+        if low_ok:
             zones.append({
-                "type":
-                    "SUPPORT",
-
-                "price":
-                    low,
-
-                "timestamp":
-                    data[i]["timestamp"],
+                "type": "SUPPORT",
+                "price": l,
+                "timestamp": data[i]["timestamp"],
             })
 
     return zones
 
 
-def zone_analysis(
-    candles,
-    price,
-    direction
-):
+def zone_analysis(candles, price, direction):
+    current_atr = atr(candles, 14)
 
-    if len(candles) < 40:
+    if not current_atr or current_atr <= 0:
+        return {"state": "NONE", "score": 0, "level": None}
 
-        return {
-            "state": "NONE",
-            "score": 0,
-            "distance": None,
-            "level": None,
-        }
+    zones = build_zones(candles)
+    tolerance = current_atr * 0.35
 
-    current_atr = atr(
-        candles,
-        14
-    )
-
-    if not current_atr:
-
-        return {
-            "state": "NONE",
-            "score": 0,
-            "distance": None,
-            "level": None,
-        }
-
-    zones = build_zones(
-        candles
-    )
-
-    tolerance = (
-        current_atr
-        * 0.35
-    )
-
-    candidates = []
-
-    for zone in zones:
-
-        distance = abs(
-            price
-            - zone["price"]
-        )
-
-        if distance <= tolerance:
-
-            candidates.append(
-                (
-                    distance,
-                    zone
-                )
-            )
+    candidates = [
+        (abs(price - z["price"]), z)
+        for z in zones
+        if abs(price - z["price"]) <= tolerance
+    ]
 
     if not candidates:
+        return {"state": "NONE", "score": 0, "level": None}
 
-        return {
-            "state": "NONE",
-            "score": 0,
-            "distance": None,
-            "level": None,
-        }
-
-    candidates.sort(
-        key=lambda x: x[0]
-    )
-
-    distance, nearest = (
-        candidates[0]
-    )
+    candidates.sort(key=lambda x: x[0])
+    distance, nearest = candidates[0]
 
     recent = candles[-12:]
 
     broke_above = any(
-        c["close"]
-        > nearest["price"]
-        + tolerance * 0.15
+        c["close"] > nearest["price"] + tolerance * 0.15
         for c in recent[:-2]
     )
 
     broke_below = any(
-        c["close"]
-        < nearest["price"]
-        - tolerance * 0.15
+        c["close"] < nearest["price"] - tolerance * 0.15
         for c in recent[:-2]
     )
 
     state = nearest["type"]
-
     score = 10
 
     if nearest["type"] == "RESISTANCE":
-
         if direction == "PUT":
             score += 15
 
-        if (
-            broke_above
-            and price < nearest["price"]
-        ):
-
-            state = (
-                "FLIPPED_RESISTANCE"
-            )
-
+        if broke_above and price < nearest["price"]:
+            state = "FLIPPED_RESISTANCE"
             score += 20
 
-    elif nearest["type"] == "SUPPORT":
-
+    if nearest["type"] == "SUPPORT":
         if direction == "CALL":
             score += 15
 
-        if (
-            broke_below
-            and price > nearest["price"]
-        ):
-
-            state = (
-                "FLIPPED_SUPPORT"
-            )
-
+        if broke_below and price > nearest["price"]:
+            state = "FLIPPED_SUPPORT"
             score += 20
 
-    if (
-        distance
-        <= tolerance * 0.50
-    ):
-
+    if distance <= tolerance * 0.50:
         score += 10
 
     return {
-
         "state": state,
-
-        "score":
-            min(score, 45),
-
-        "distance":
-            distance,
-
-        "level":
-            nearest["price"],
+        "score": min(score, 45),
+        "level": nearest["price"],
     }
 
 
@@ -1080,523 +526,252 @@ def zone_analysis(
 # 15M MASTER
 # ============================================================
 
-def analyze_15m(
-    symbol,
-    candles
-):
-
+def analyze_15m(candles):
     if len(candles) < 80:
-
-        return {
-            "decision":
-                "WAIT",
-
-            "score":
-                0,
-
-            "reason":
-                "not enough 15M candles",
-        }
+        return None
 
     c0 = candles[-1]
     c1 = candles[-2]
 
-    closes = [
-        c["close"]
-        for c in candles
-    ]
+    closes = [c["close"] for c in candles]
+
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
+    rsi = rsi_wilder(closes, 14)
+    current_atr = atr(candles, 14)
+
+    if None in (e20, e50, rsi, current_atr):
+        return None
 
     price = c0["close"]
-
-    ema20 = ema(
-        closes,
-        20
-    )
-
-    ema50 = ema(
-        closes,
-        50
-    )
-
-    current_atr = atr(
-        candles,
-        14
-    )
-
-    rsi = rsi_wilder(
-        closes,
-        14
-    )
-
-    if any(
-        x is None
-        for x in (
-            ema20,
-            ema50,
-            current_atr,
-            rsi
-        )
-    ):
-
-        return {
-            "decision":
-                "WAIT",
-
-            "score":
-                0,
-
-            "reason":
-                "indicator unavailable",
-        }
-
-    pattern = candle_features(
-        c0,
-        c1
-    )
+    p = candle_features(c0, c1)
 
     call = 0
     put = 0
+    rc = []
+    rp = []
 
-    reasons_call = []
-    reasons_put = []
-
-    if price > ema20:
-
+    if price > e20:
         call += 15
-
-        reasons_call.append(
-            "price>EMA20"
-        )
-
-    if price > ema50:
-
-        call += 20
-
-        reasons_call.append(
-            "price>EMA50"
-        )
-
-    if price < ema20:
-
+        rc.append("price>EMA20")
+    else:
         put += 15
+        rp.append("price<EMA20")
 
-        reasons_put.append(
-            "price<EMA20"
-        )
-
-    if price < ema50:
-
+    if price > e50:
+        call += 20
+        rc.append("price>EMA50")
+    else:
         put += 20
+        rp.append("price<EMA50")
 
-        reasons_put.append(
-            "price<EMA50"
-        )
-
-    if ema20 > ema50:
-
+    if e20 > e50:
         call += 10
-
-        reasons_call.append(
-            "EMA20>EMA50"
-        )
-
-    if ema20 < ema50:
-
+        rc.append("EMA20>EMA50")
+    else:
         put += 10
-
-        reasons_put.append(
-            "EMA20<EMA50"
-        )
+        rp.append("EMA20<EMA50")
 
     if 50 <= rsi <= 68:
-
         call += 8
+        rc.append(f"RSI={rsi:.1f}")
 
-        reasons_call.append(
-            f"RSI {rsi:.1f}"
-        )
-
-    if 32 <= rsi <= 50:
-
+    if 32 <= rsi < 50:
         put += 8
+        rp.append(f"RSI={rsi:.1f}")
 
-        reasons_put.append(
-            f"RSI {rsi:.1f}"
-        )
-
-    if (
-        pattern["strong_bull"]
-        or pattern["hammer"]
-        or pattern["bull_engulf"]
-    ):
-
+    if p["strong_bull"] or p["hammer"] or p["bull_engulf"]:
         call += 12
+        rc.append("bullish-candle")
 
-        reasons_call.append(
-            "bullish candle"
-        )
-
-    if (
-        pattern["strong_bear"]
-        or pattern["shooting_star"]
-        or pattern["bear_engulf"]
-    ):
-
+    if p["strong_bear"] or p["shooting_star"] or p["bear_engulf"]:
         put += 12
+        rp.append("bearish-candle")
 
-        reasons_put.append(
-            "bearish candle"
-        )
+    zc = zone_analysis(candles, price, "CALL")
+    zp = zone_analysis(candles, price, "PUT")
 
-    z_call = zone_analysis(
-        candles,
-        price,
-        "CALL"
-    )
+    call += zc["score"]
+    put += zp["score"]
 
-    z_put = zone_analysis(
-        candles,
-        price,
-        "PUT"
-    )
+    if zc["score"] > 10:
+        rc.append(f"ZONE={zc['state']}")
 
-    call += z_call["score"]
-    put += z_put["score"]
+    if zp["score"] > 10:
+        rp.append(f"ZONE={zp['state']}")
 
-    if z_call["score"] > 10:
-
-        reasons_call.append(
-            "ZONE "
-            + z_call["state"]
-        )
-
-    if z_put["score"] > 10:
-
-        reasons_put.append(
-            "ZONE "
-            + z_put["state"]
-        )
-
-    if (
-        call > put
-        and call >= MASTER_MIN_SCORE
-    ):
-
+    if call > put and call >= 58:
         decision = "CALL"
-
-        score = min(
-            99,
-            call
-        )
-
-        reasons = reasons_call
-
-        zone = z_call
-
-    elif (
-        put > call
-        and put >= MASTER_MIN_SCORE
-    ):
-
+        setup_strength = min(99, call)
+        reasons = rc
+        zone = zc
+    elif put > call and put >= 58:
         decision = "PUT"
-
-        score = min(
-            99,
-            put
-        )
-
-        reasons = reasons_put
-
-        zone = z_put
-
+        setup_strength = min(99, put)
+        reasons = rp
+        zone = zp
     else:
-
-        return {
-            "decision":
-                "WATCH",
-
-            "score":
-                max(
-                    call,
-                    put
-                ),
-
-            "price":
-                price,
-
-            "atr":
-                current_atr,
-
-            "rsi":
-                rsi,
-
-            "ema20":
-                ema20,
-
-            "ema50":
-                ema50,
-
-            "zone_state":
-                "MIXED",
-
-            "zone_level":
-                None,
-
-            "reasons":
-                "15M conflict",
-
-            "candle_time":
-                c0["datetime"],
-        }
+        return None
 
     return {
-
-        "decision":
-            decision,
-
-        "score":
-            score,
-
-        "price":
-            price,
-
-        "atr":
-            current_atr,
-
-        "rsi":
-            rsi,
-
-        "ema20":
-            ema20,
-
-        "ema50":
-            ema50,
-
-        "zone_state":
-            zone["state"],
-
-        "zone_level":
-            zone["level"],
-
-        "reasons":
-            " | ".join(
-                reasons
-            ),
-
-        "candle_time":
-            c0["datetime"],
+        "decision": decision,
+        "setup_strength": setup_strength,
+        "price": price,
+        "atr": current_atr,
+        "rsi": rsi,
+        "zone_state": zone["state"],
+        "zone_level": zone["level"],
+        "reasons": " | ".join(reasons),
+        "candle_time": c0["datetime"],
     }
 
 
 # ============================================================
-# 5M TIMING
+# 5M CONTEXT
 # ============================================================
 
-def analyze_5m(
-    symbol,
-    candles,
-    master_direction
-):
-
+def analyze_5m(candles, master_direction):
     if len(candles) < 70:
-
-        return {
-            "decision":
-                "UNKNOWN",
-
-            "score":
-                50,
-
-            "reason":
-                "not enough 5M",
-        }
+        return None
 
     c0 = candles[-1]
     c1 = candles[-2]
 
-    closes = [
-        c["close"]
-        for c in candles
-    ]
+    closes = [c["close"] for c in candles]
 
-    ema20 = ema(
-        closes,
-        20
-    )
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
+    rsi = rsi_wilder(closes, 14)
 
-    ema50 = ema(
-        closes,
-        50
-    )
+    if e20 is None or e50 is None or rsi is None:
+        return None
 
-    rsi = rsi_wilder(
-        closes,
-        14
-    )
-
-    pattern = candle_features(
-        c0,
-        c1
-    )
+    p = candle_features(c0, c1)
 
     call = 0
     put = 0
+    rc = []
+    rp = []
 
-    reasons_call = []
-    reasons_put = []
-
-    if (
-        ema20 is not None
-        and c0["close"] > ema20
-    ):
-
+    if c0["close"] > e20:
         call += 15
-
-        reasons_call.append(
-            "5M>EMA20"
-        )
-
-    if (
-        ema20 is not None
-        and c0["close"] < ema20
-    ):
-
+        rc.append("5M>EMA20")
+    else:
         put += 15
+        rp.append("5M<EMA20")
 
-        reasons_put.append(
-            "5M<EMA20"
-        )
-
-    if (
-        ema50 is not None
-        and c0["close"] > ema50
-    ):
-
+    if c0["close"] > e50:
         call += 10
-
-        reasons_call.append(
-            "5M>EMA50"
-        )
-
-    if (
-        ema50 is not None
-        and c0["close"] < ema50
-    ):
-
+        rc.append("5M>EMA50")
+    else:
         put += 10
+        rp.append("5M<EMA50")
 
-        reasons_put.append(
-            "5M<EMA50"
-        )
+    if rsi > 50:
+        call += 8
+        rc.append(f"RSI={rsi:.1f}")
+    else:
+        put += 8
+        rp.append(f"RSI={rsi:.1f}")
 
-    if rsi is not None:
-
-        if rsi > 50:
-
-            call += 8
-
-            reasons_call.append(
-                f"RSI {rsi:.1f}"
-            )
-
-        if rsi < 50:
-
-            put += 8
-
-            reasons_put.append(
-                f"RSI {rsi:.1f}"
-            )
-
-    if (
-        pattern["strong_bull"]
-        or pattern["bull_engulf"]
-        or pattern["hammer"]
-    ):
-
+    if p["strong_bull"] or p["bull_engulf"] or p["hammer"]:
         call += 15
+        rc.append("bullish-candle")
 
-        reasons_call.append(
-            "bullish candle"
-        )
-
-    if (
-        pattern["strong_bear"]
-        or pattern["bear_engulf"]
-        or pattern["shooting_star"]
-    ):
-
+    if p["strong_bear"] or p["bear_engulf"] or p["shooting_star"]:
         put += 15
-
-        reasons_put.append(
-            "bearish candle"
-        )
+        rp.append("bearish-candle")
 
     if master_direction == "CALL":
-
         call += 12
-
-        reasons_call.append(
-            "15M master CALL"
-        )
-
-    elif master_direction == "PUT":
-
+        rc.append("15M-master-CALL")
+    else:
         put += 12
-
-        reasons_put.append(
-            "15M master PUT"
-        )
+        rp.append("15M-master-PUT")
 
     if call > put:
-
-        direction = "CALL"
-
-        score = min(
-            99,
-            call
-        )
-
-        reasons = reasons_call
-
+        decision = "CALL"
+        score = min(99, call)
+        reasons = rc
     elif put > call:
-
-        direction = "PUT"
-
-        score = min(
-            99,
-            put
-        )
-
-        reasons = reasons_put
-
+        decision = "PUT"
+        score = min(99, put)
+        reasons = rp
     else:
-
-        direction = "UNKNOWN"
-
+        decision = "UNKNOWN"
         score = 50
-
-        reasons = [
-            "5M balanced"
-        ]
+        reasons = ["balanced"]
 
     return {
+        "decision": decision,
+        "score": score,
+        "rsi": rsi,
+        "candle_time": c0["datetime"],
+        "reasons": " | ".join(reasons),
+    }
 
-        "decision":
-            direction,
 
-        "score":
-            score,
+# ============================================================
+# HISTORICAL RATE
+# ============================================================
 
-        "rsi":
-            rsi,
+def setup_signature(symbol, mode, direction, zone_state):
+    return (
+        symbol,
+        mode,
+        direction,
+        zone_state,
+    )
 
-        "candle_time":
-            c0["datetime"],
 
-        "reasons":
-            " | ".join(
-                reasons
-            ),
+def historical_stats(signature):
+    """
+    นับเฉพาะ SERIES ที่จบแล้ว และ signature ตรงกัน
+    Series Win = ชนะภายใน 1-3 opportunities
+    """
+
+    records = []
+
+    with LOCK:
+        for r in HISTORICAL_MEMORY:
+            if r.get("type") != "SERIES":
+                continue
+
+            sig = setup_signature(
+                r.get("symbol"),
+                r.get("mode"),
+                r.get("decision"),
+                r.get("zone_state"),
+            )
+
+            if sig == signature:
+                records.append(r)
+
+    total = len(records)
+    series_wins = sum(
+        1 for r in records
+        if r.get("status") == "SERIES_WIN"
+    )
+
+    first_win = sum(
+        1 for r in records
+        if r.get("first_opportunity_result") == "WIN"
+    )
+
+    if total >= MIN_HISTORY_FOR_RATE:
+        series_rate = round(series_wins / total * 100, 1)
+        first_rate = round(first_win / total * 100, 1)
+        confidence = "USABLE"
+    else:
+        series_rate = None
+        first_rate = None
+        confidence = "INSUFFICIENT_DATA"
+
+    return {
+        "samples": total,
+        "series_win_rate": series_rate,
+        "first_win_rate": first_rate,
+        "confidence": confidence,
     }
 
 
@@ -1605,158 +780,82 @@ def analyze_5m(
 # ============================================================
 
 def scan_symbol(symbol):
-
-    candles15 = get_candles(
-        symbol,
-        MASTER_INTERVAL,
-        period="5d",
-        closed_only=True,
+    c15 = closed_only(
+        get_candles(symbol, "15m", "5d")
     )
 
-    if len(candles15) < 80:
+    if len(c15) < 80:
         return None
 
-    master = analyze_15m(
-        symbol,
-        candles15
-    )
+    master = analyze_15m(c15)
 
-    if master["decision"] not in (
-        "CALL",
-        "PUT"
-    ):
-
+    if not master:
         return None
 
-    candles5 = get_candles(
-        symbol,
-        ENTRY_INTERVAL,
-        period="5d",
-        closed_only=True,
+    c5 = closed_only(
+        get_candles(symbol, "5m", "5d")
     )
 
-    if len(candles5) < 70:
+    if len(c5) < 70:
         return None
 
-    timing = analyze_5m(
-        symbol,
-        candles5,
-        master["decision"]
-    )
+    timing = analyze_5m(c5, master["decision"])
 
-    if (
-        timing["decision"]
-        == master["decision"]
-    ):
+    if not timing:
+        return None
 
-        final_score = min(
-            99,
-            master["score"]
-            * 0.70
-            + timing["score"]
-            * 0.30
-            + 5
-        )
-
-        context = (
-            "5M_CONFIRM"
-        )
-
-    elif (
-        timing["decision"]
-        == "UNKNOWN"
-    ):
-
-        final_score = (
-            master["score"]
-            * 0.75
-        )
-
-        context = (
-            "5M_UNKNOWN"
-        )
-
+    if timing["decision"] == master["decision"]:
+        context = "5M_CONFIRM"
+    elif timing["decision"] == "UNKNOWN":
+        context = "5M_UNKNOWN"
     else:
+        context = "5M_PULLBACK"
 
-        final_score = (
-            master["score"]
-            * 0.65
-        )
+    # ไม่ hard-block ถ้า 5M สวนชั่วคราว
+    if master["setup_strength"] < 62:
+        return None
 
-        context = (
-            "5M_PULLBACK"
-        )
+    mode = mode_now()
 
-    final_score = round(
-        final_score,
-        1
+    signature = setup_signature(
+        symbol,
+        mode,
+        master["decision"],
+        master["zone_state"],
     )
 
-    if (
-        master["score"]
-        < MASTER_MIN_SCORE
-    ):
+    hist = historical_stats(signature)
 
-        return None
+    # Signal time = ตอนระบบตรวจพบ setup
+    signal_ts = time.time()
+
+    # เข้าแท่ง 5M ถัดไปจากแท่งที่ปิดล่าสุด
+    latest5 = c5[-1]
+    next_open_ts = latest5["timestamp"] + TF5_SECONDS
+    next_close_ts = next_open_ts + TF5_SECONDS
 
     return {
-
-        "symbol":
-            symbol,
-
-        "mode":
-            automatic_market_mode(),
-
-        "decision":
-            master["decision"],
-
-        "score":
-            final_score,
-
-        "master_score":
-            master["score"],
-
-        "entry_score":
-            timing["score"],
-
-        "entry_context":
-            context,
-
-        "price":
-            master["price"],
-
-        "atr":
-            master["atr"],
-
-        "zone_state":
-            master["zone_state"],
-
-        "zone_level":
-            master.get(
-                "zone_level"
-            ),
-
-        "reasons_15m":
-            master["reasons"],
-
-        "reasons_5m":
-            timing["reasons"],
-
-        "signal_candle_15m":
-            master[
-                "candle_time"
-            ],
-
-        "last_5m_candle":
-            timing[
-                "candle_time"
-            ],
-
-        "created_at":
-            thai_text(),
-
-        "created_ts":
-            time.time(),
+        "symbol": symbol,
+        "mode": mode,
+        "decision": master["decision"],
+        "setup_strength": round(master["setup_strength"], 1),
+        "rsi15": master["rsi"],
+        "rsi5": timing["rsi"],
+        "entry_score": timing["score"],
+        "entry_context": context,
+        "zone_state": master["zone_state"],
+        "zone_level": master["zone_level"],
+        "price": master["price"],
+        "atr": master["atr"],
+        "reasons15": master["reasons"],
+        "reasons5": timing["reasons"],
+        "signal_candle15": master["candle_time"],
+        "last_closed_5m": latest5["datetime"],
+        "signal_ts": signal_ts,
+        "next_open_ts": next_open_ts,
+        "next_close_ts": next_close_ts,
+        "history": hist,
+        "created_at": thai_text(),
     }
 
 
@@ -1764,544 +863,240 @@ def scan_symbol(symbol):
 # SERIES
 # ============================================================
 
-def series_key(signal):
-
-    return (
-        signal["symbol"],
-        signal["decision"],
-        signal["signal_candle_15m"],
-    )
-
-
-def has_active_series(
-    symbol
-):
-
+def has_active_series(symbol):
     with LOCK:
-
         return any(
-            x["symbol"]
-            == symbol
-
-            for x in ACTIVE_SERIES
+            s["symbol"] == symbol
+            for s in ACTIVE_SERIES
         )
 
 
 def create_series(signal):
-
     series_id = (
         f"{signal['symbol'].replace('/', '')}_"
-        f"{int(signal['created_ts'])}"
+        f"{int(signal['signal_ts'])}"
     )
 
     tracker = {
+        "type": "ACTIVE_SERIES",
+        "series_id": series_id,
+        "symbol": signal["symbol"],
+        "mode": signal["mode"],
+        "master_direction": signal["decision"],
+        "setup_strength": signal["setup_strength"],
+        "entry_context": signal["entry_context"],
+        "zone_state": signal["zone_state"],
+        "zone_level": signal["zone_level"],
+        "signal_time": signal["created_at"],
+        "signal_ts": signal["signal_ts"],
 
-        "series_id":
-            series_id,
+        # OPP1 = แท่งถัดไป
+        "next_entry_ts": signal["next_open_ts"],
+        "next_close_ts": signal["next_close_ts"],
 
-        "symbol":
-            signal["symbol"],
+        "opportunity": 1,
+        "wins": 0,
+        "losses": 0,
+        "draws": 0,
 
-        "mode":
-            signal["mode"],
+        "first_opportunity_result": None,
+        "processed_5m": [],
 
-        "master_direction":
-            signal["decision"],
-
-        "master_score":
-            signal["master_score"],
-
-        "signal_score":
-            signal["score"],
-
-        "entry_context":
-            signal["entry_context"],
-
-        "zone_state":
-            signal["zone_state"],
-
-        "zone_level":
-            signal.get(
-                "zone_level"
-            ),
-
-        "signal_candle_15m":
-            signal[
-                "signal_candle_15m"
-            ],
-
-        "signal_time":
-            signal["created_at"],
-
-        "signal_ts":
-            signal["created_ts"],
-
-        "opportunity":
-            1,
-
-        "completed":
-            False,
-
-        "wins":
-            0,
-
-        "losses":
-            0,
-
-        "draws":
-            0,
-
-        "max_mfe":
-            0.0,
-
-        "max_mae":
-            0.0,
-
-        "processed_5m":
-            [],
-
-        "entry_price":
-            signal["price"],
+        "max_mfe": 0.0,
+        "max_mae": 0.0,
     }
 
     with LOCK:
-
-        ACTIVE_SERIES.append(
-            tracker
-        )
-
+        ACTIVE_SERIES.append(tracker)
         STATS["signals"] += 1
 
     return tracker
 
 
 # ============================================================
-# RESULT ENGINE
+# OPPORTUNITY ENGINE
 # ============================================================
 
-def find_first_closed_5m_after(
-    candles,
-    timestamp
-):
+def find_candle_for_entry(candles, entry_ts):
+    """
+    หาแท่งที่เปิดตรง/หลังเวลา entry_ts
+    และแท่งนั้นต้องปิดแล้วจึงจะนำมาตัดสินผล
+    """
 
-    for candle in candles:
-
-        start = candle[
-            "timestamp"
-        ]
-
-        end = (
-            start
-            + FIVE_MIN_SECONDS
-        )
-
-        if (
-            start
-            <= timestamp
-            < end
-        ):
-
-            return candle
-
-    return None
-
-
-def find_closed_candles_after(
-    candles,
-    timestamp
-):
-
-    result = []
-
-    for candle in candles:
-
-        close_time = (
-            candle["timestamp"]
-            + FIVE_MIN_SECONDS
-        )
-
-        if close_time > timestamp:
-
-            result.append(
-                candle
-            )
-
-    return result
-
-
-def evaluate_one_opportunity(
-    tracker
-):
-
-    symbol = tracker[
-        "symbol"
+    candidates = [
+        c for c in candles
+        if c["timestamp"] >= entry_ts
+        and c["datetime"] not in []
     ]
 
-    candles = get_candles(
-        symbol,
-        ENTRY_INTERVAL,
-        period="2d",
-        closed_only=True,
+    if not candidates:
+        return None
+
+    c = candidates[0]
+
+    if not is_closed_5m(c):
+        return None
+
+    return c
+
+
+def evaluate_opportunity(tracker):
+    candles = closed_only(
+        get_candles(
+            tracker["symbol"],
+            "5m",
+            "2d",
+        )
     )
 
     if len(candles) < 20:
         return None
 
-    signal_ts = tracker[
-        "signal_ts"
-    ]
+    # ใช้ next_entry_ts ที่ระบบกำหนดไว้
+    entry_ts = tracker["next_entry_ts"]
 
-    step = tracker[
-        "opportunity"
-    ]
+    candidate = find_candle_for_entry(candles, entry_ts)
 
-    first_candle = (
-        find_first_closed_5m_after(
-            candles,
-            signal_ts
-        )
-    )
-
-    if (
-        step == 1
-        and first_candle is not None
-    ):
-
-        candidate = first_candle
-
-    else:
-
-        candidates = (
-            find_closed_candles_after(
-                candles,
-                signal_ts
-            )
-        )
-
-        used = set(
-            tracker[
-                "processed_5m"
-            ]
-        )
-
-        candidates = [
-            candle
-            for candle in candidates
-            if candle[
-                "datetime"
-            ] not in used
-        ]
-
-        if not candidates:
-            return None
-
-        candidate = candidates[0]
-
-    if (
-        candidate["datetime"]
-        in tracker["processed_5m"]
-    ):
-
+    if not candidate:
         return None
 
-    entry_price = (
-        tracker.get(
-            "entry_price"
-        )
-        if step == 1
-        else candidate["open"]
-    )
+    if candidate["datetime"] in tracker["processed_5m"]:
+        return None
 
-    if entry_price is None:
-        entry_price = candidate[
-            "open"
-        ]
-
-    direction = tracker[
-        "master_direction"
-    ]
-
-    close_price = candidate[
-        "close"
-    ]
+    entry_price = candidate["open"]
+    close_price = candidate["close"]
+    direction = tracker["master_direction"]
 
     if close_price > entry_price:
-
-        raw_result = (
-            "WIN"
-            if direction == "CALL"
-            else "LOSS"
-        )
-
+        result = "WIN" if direction == "CALL" else "LOSS"
     elif close_price < entry_price:
-
-        raw_result = (
-            "WIN"
-            if direction == "PUT"
-            else "LOSS"
-        )
-
+        result = "WIN" if direction == "PUT" else "LOSS"
     else:
-
-        raw_result = "DRAW"
+        result = "DRAW"
 
     if direction == "CALL":
-
-        mfe = (
-            candidate["high"]
-            - entry_price
-        )
-
-        mae = (
-            entry_price
-            - candidate["low"]
-        )
-
+        mfe = candidate["high"] - entry_price
+        mae = entry_price - candidate["low"]
     else:
-
-        mfe = (
-            entry_price
-            - candidate["low"]
-        )
-
-        mae = (
-            candidate["high"]
-            - entry_price
-        )
+        mfe = entry_price - candidate["low"]
+        mae = candidate["high"] - entry_price
 
     return {
-
-        "result":
-            raw_result,
-
-        "step":
-            step,
-
-        "candle":
-            candidate,
-
-        "entry_price":
-            entry_price,
-
-        "close_price":
-            close_price,
-
-        "mfe":
-            max(0, mfe),
-
-        "mae":
-            max(0, mae),
+        "result": result,
+        "candle": candidate,
+        "entry_price": entry_price,
+        "close_price": close_price,
+        "mfe": max(0.0, mfe),
+        "mae": max(0.0, mae),
     }
 
 
-def record_opportunity(
-    tracker,
-    outcome
-):
-
-    tracker[
-        "processed_5m"
-    ].append(
-        outcome[
-            "candle"
-        ]["datetime"]
+def record_opportunity(tracker, outcome):
+    tracker["processed_5m"].append(
+        outcome["candle"]["datetime"]
     )
 
     tracker["max_mfe"] = max(
-        tracker.get(
-            "max_mfe",
-            0
-        ),
-        outcome["mfe"]
+        tracker["max_mfe"],
+        outcome["mfe"],
     )
 
     tracker["max_mae"] = max(
-        tracker.get(
-            "max_mae",
-            0
-        ),
-        outcome["mae"]
+        tracker["max_mae"],
+        outcome["mae"],
     )
 
-    result = outcome[
-        "result"
-    ]
+    result = outcome["result"]
 
     if result == "WIN":
-
         tracker["wins"] += 1
         STATS["wins"] += 1
 
     elif result == "LOSS":
-
         tracker["losses"] += 1
         STATS["losses"] += 1
 
     else:
-
         tracker["draws"] += 1
         STATS["draws"] += 1
+
+    if tracker["opportunity"] == 1:
+        tracker["first_opportunity_result"] = result
 
     return result
 
 
 # ============================================================
-# FINALIZE SERIES
+# FINALIZE
 # ============================================================
 
-def finalize_series(
-    tracker,
-    final_status
-):
-
+def finalize_series(tracker, status):
     record = {
-
-        "type":
-            "SERIES",
-
-        "series_id":
-            tracker[
-                "series_id"
-            ],
-
-        "symbol":
-            tracker[
-                "symbol"
-            ],
-
-        "mode":
-            tracker[
-                "mode"
-            ],
-
-        "decision":
-            tracker[
-                "master_direction"
-            ],
-
-        "master_score":
-            tracker[
-                "master_score"
-            ],
-
-        "signal_score":
-            tracker[
-                "signal_score"
-            ],
-
-        "entry_context":
-            tracker[
-                "entry_context"
-            ],
-
-        "zone_state":
-            tracker[
-                "zone_state"
-            ],
-
-        "zone_level":
-            tracker[
-                "zone_level"
-            ],
-
-        "signal_candle_15m":
-            tracker[
-                "signal_candle_15m"
-            ],
-
-        "signal_time":
-            tracker[
-                "signal_time"
-            ],
-
-        "status":
-            final_status,
-
-        "wins":
-            tracker[
-                "wins"
-            ],
-
-        "losses":
-            tracker[
-                "losses"
-            ],
-
-        "draws":
-            tracker[
-                "draws"
-            ],
-
-        "opportunities_used":
-            tracker[
-                "opportunity"
-            ],
-
-        "max_mfe":
-            tracker[
-                "max_mfe"
-            ],
-
-        "max_mae":
-            tracker[
-                "max_mae"
-            ],
-
-        "recorded_at":
-            thai_text(),
+        "type": "SERIES",
+        "series_id": tracker["series_id"],
+        "symbol": tracker["symbol"],
+        "mode": tracker["mode"],
+        "decision": tracker["master_direction"],
+        "setup_strength": tracker["setup_strength"],
+        "entry_context": tracker["entry_context"],
+        "zone_state": tracker["zone_state"],
+        "zone_level": tracker["zone_level"],
+        "signal_time": tracker["signal_time"],
+        "status": status,
+        "wins": tracker["wins"],
+        "losses": tracker["losses"],
+        "draws": tracker["draws"],
+        "opportunities_used": tracker["opportunity"],
+        "first_opportunity_result": tracker["first_opportunity_result"],
+        "max_mfe": tracker["max_mfe"],
+        "max_mae": tracker["max_mae"],
+        "recorded_at": thai_text(),
     }
 
     with LOCK:
+        HISTORICAL_MEMORY.append(record)
+        STATS["series_completed"] += 1
 
-        HISTORICAL_MEMORY.append(
-            record
-        )
+        if status == "SERIES_WIN":
+            STATS["series_wins"] += 1
 
-        STATS[
-            "series_completed"
-        ] += 1
-
-        if final_status == "SERIES_WIN":
-
-            STATS[
-                "series_wins"
-            ] += 1
-
-        if final_status == "FULL_LOSS":
-
-            STATS[
-                "series_full_loss"
-            ] += 1
+        if status == "FULL_LOSS":
+            STATS["series_full_loss"] += 1
 
     save_memory()
 
-    if final_status == "SERIES_WIN":
+    hist = historical_stats(
+        setup_signature(
+            tracker["symbol"],
+            tracker["mode"],
+            tracker["master_direction"],
+            tracker["zone_state"],
+        )
+    )
 
-        icon = "🟢"
+    rate_text = (
+        f"{hist['series_win_rate']}%"
+        if hist["series_win_rate"] is not None
+        else "INSUFFICIENT_DATA"
+    )
 
-    else:
-
-        icon = "🔴"
+    icon = "🟢" if status == "SERIES_WIN" else "🔴"
 
     send_discord(
-
         f"{icon} **[TRADEIFY SERIES COMPLETE]**\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💱 คู่: **{tracker['symbol']}**\n"
         f"🌐 Mode: **{tracker['mode']}**\n"
         f"📌 Direction: **{tracker['master_direction']}**\n"
-        f"🏁 Status: **{final_status}**\n"
+        f"🏁 Status: **{status}**\n"
         f"🎯 WIN: **{tracker['wins']}**\n"
         f"❌ LOSS: **{tracker['losses']}**\n"
         f"➖ DRAW: **{tracker['draws']}**\n"
-        f"🔢 Opportunities: "
-        f"**{tracker['opportunity']}/{MAX_OPPORTUNITIES}**\n"
-        f"📊 15M Score: "
-        f"**{tracker['master_score']}/100**\n"
-        f"🧭 Zone: "
-        f"**{tracker['zone_state']}**\n"
-        f"🕐 เวลาไทย: "
-        f"**{thai_text()}**"
+        f"🔢 Opportunities: **{tracker['opportunity']}/3**\n"
+        f"📈 Historical Series Win Rate: **{rate_text}**\n"
+        f"📚 Historical Samples: **{hist['samples']}**\n"
+        f"🧭 Zone: **{tracker['zone_state']}**\n"
+        f"🕐 เวลาไทย: **{thai_text()}**"
     )
 
 
@@ -2310,133 +1105,97 @@ def finalize_series(
 # ============================================================
 
 def tracker_loop():
-
     while True:
-
         try:
-
             with LOCK:
-
-                trackers = list(
-                    ACTIVE_SERIES
-                )
+                trackers = list(ACTIVE_SERIES)
 
             for tracker in trackers:
-
-                outcome = (
-                    evaluate_one_opportunity(
-                        tracker
-                    )
-                )
+                outcome = evaluate_opportunity(tracker)
 
                 if outcome is None:
                     continue
 
-                result = (
-                    record_opportunity(
-                        tracker,
-                        outcome
-                    )
+                result = record_opportunity(
+                    tracker,
+                    outcome,
                 )
 
-                candle = outcome[
-                    "candle"
-                ]
-
-                log(
-                    f"TRACKER "
-                    f"{tracker['symbol']} "
-                    f"OPP{tracker['opportunity']} "
-                    f"{result}"
-                )
-
-                icon = (
-                    "🟢"
-                    if result == "WIN"
-                    else
-                    "🔴"
-                    if result == "LOSS"
-                    else
-                    "🟡"
-                )
+                candle = outcome["candle"]
 
                 send_discord(
-
-                    f"{icon} **[TRADEIFY 5M RESULT]**\n"
+                    f"{'🟢' if result == 'WIN' else '🔴' if result == 'LOSS' else '🟡'} "
+                    f"**[TRADEIFY 5M RESULT]**\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"💱 **{tracker['symbol']}**\n"
                     f"🌐 Mode: **{tracker['mode']}**\n"
                     f"📌 Master: **{tracker['master_direction']}**\n"
-                    f"🎯 OPP: **{tracker['opportunity']}/{MAX_OPPORTUNITIES}**\n"
+                    f"🎯 OPP: **{tracker['opportunity']}/3**\n"
                     f"🏁 Result: **{result}**\n"
-                    f"💰 Entry: **{outcome['entry_price']:.6f}**\n"
-                    f"🔚 Close: **{outcome['close_price']:.6f}**\n"
-                    f"🕐 Candle: **{candle['datetime']} UTC**\n"
+                    f"💰 Entry: **{outcome['entry_price']:.8f}**\n"
+                    f"🔚 Close: **{outcome['close_price']:.8f}**\n"
+                    f"🕐 Candle UTC: **{candle['datetime']}**\n"
                     f"🇹🇭 เวลาแจ้ง: **{thai_text()}**\n"
-                    f"📈 MFE: **{outcome['mfe']:.6f}**\n"
-                    f"📉 MAE: **{outcome['mae']:.6f}**"
+                    f"📈 MFE: **{outcome['mfe']:.8f}**\n"
+                    f"📉 MAE: **{outcome['mae']:.8f}**\n"
+                    f"⚠️ ผลถูกตัดสินหลังแท่ง 5M ปิดแล้วเท่านั้น"
                 )
 
                 if result == "WIN":
-
                     finalize_series(
                         tracker,
-                        "SERIES_WIN"
+                        "SERIES_WIN",
                     )
 
                     with LOCK:
+                        if tracker in ACTIVE_SERIES:
+                            ACTIVE_SERIES.remove(tracker)
 
-                        if (
-                            tracker
-                            in ACTIVE_SERIES
-                        ):
-
-                            ACTIVE_SERIES.remove(
-                                tracker
-                            )
-
-                elif (
-                    tracker[
-                        "opportunity"
-                    ]
-                    >= MAX_OPPORTUNITIES
-                ):
-
+                elif tracker["opportunity"] >= MAX_OPPORTUNITIES:
                     finalize_series(
                         tracker,
-                        "FULL_LOSS"
+                        "FULL_LOSS",
                     )
 
                     with LOCK:
-
-                        if (
-                            tracker
-                            in ACTIVE_SERIES
-                        ):
-
-                            ACTIVE_SERIES.remove(
-                                tracker
-                            )
+                        if tracker in ACTIVE_SERIES:
+                            ACTIVE_SERIES.remove(tracker)
 
                 else:
+                    # แพ้ = เดินหน้าทิศทางเดิม
+                    tracker["opportunity"] += 1
 
-                    tracker[
-                        "opportunity"
-                    ] += 1
+                    # เข้าแท่ง 5M ถัดจากแท่งที่เพิ่งตัดสิน
+                    next_ts = candle["timestamp"] + TF5_SECONDS
+
+                    tracker["next_entry_ts"] = next_ts
+                    tracker["next_close_ts"] = next_ts + TF5_SECONDS
 
                     log(
-                        f"{tracker['symbol']} "
-                        f"-> OPP"
-                        f"{tracker['opportunity']}"
+                        f"{tracker['symbol']} LOSS -> "
+                        f"keep {tracker['master_direction']} "
+                        f"for OPP{tracker['opportunity']}"
                     )
 
-        except Exception as exc:
+                    dt_open = utc_to_thai(next_ts)
+                    dt_close = utc_to_thai(next_ts + TF5_SECONDS)
 
-            log(
-                f"Tracker error: {exc}"
-            )
+                    send_discord(
+                        f"🔁 **[TRADEIFY NEXT OPPORTUNITY]**\n"
+                        f"💱 {tracker['symbol']}\n"
+                        f"🌐 Mode: {tracker['mode']}\n"
+                        f"📌 Direction เดิม: **{tracker['master_direction']}**\n"
+                        f"🎯 OPP: **{tracker['opportunity']}/3**\n"
+                        f"🟢 เตรียมเข้าแท่งหน้า\n"
+                        f"⏰ เข้า: **{thai_hm(dt_open)}**\n"
+                        f"🔚 ปิดแท่ง: **{thai_hm(dt_close)}**\n"
+                        f"⚠️ รอแท่งปิดก่อนตัดผล"
+                    )
 
-        time.sleep(20)
+        except Exception as e:
+            log(f"Tracker error: {e}")
+
+        time.sleep(10)
 
 
 # ============================================================
@@ -2444,582 +1203,294 @@ def tracker_loop():
 # ============================================================
 
 def scanner_loop():
-
     while True:
-
         try:
-
             best = []
 
             for symbol in SYMBOLS:
-
                 try:
+                    signal = scan_symbol(symbol)
 
-                    signal = scan_symbol(
-                        symbol
-                    )
+                    if signal:
+                        best.append(signal)
 
-                    if signal is not None:
-
-                        best.append(
-                            signal
-                        )
-
-                except Exception as exc:
-
-                    log(
-                        f"Scanner "
-                        f"{symbol}: "
-                        f"{exc}"
-                    )
+                except Exception as e:
+                    log(f"Scanner {symbol}: {e}")
 
             best.sort(
-                key=lambda x:
-                x["score"],
-                reverse=True
+                key=lambda x: x["setup_strength"],
+                reverse=True,
             )
 
             for signal in best:
-
-                key = series_key(
-                    signal
+                # ใช้แท่ง 15M เป็นตัวกันสัญญาณซ้ำ
+                key = (
+                    signal["symbol"],
+                    signal["mode"],
+                    signal["decision"],
+                    signal["signal_candle15"],
                 )
 
                 if key in SENT_SIGNALS:
                     continue
 
-                if has_active_series(
-                    signal["symbol"]
-                ):
+                if has_active_series(signal["symbol"]):
                     continue
 
-                SENT_SIGNALS.add(
-                    key
-                )
+                SENT_SIGNALS.add(key)
 
-                tracker = create_series(
-                    signal
-                )
+                tracker = create_series(signal)
 
-                mode = signal[
-                    "mode"
-                ]
+                hist = signal["history"]
 
-                if (
-                    signal["score"]
-                    >= STRONG_SCORE
-                ):
-
-                    strength = (
-                        "🔥 STRONG"
-                    )
-
-                elif (
-                    signal["score"]
-                    >= MASTER_MIN_SCORE
-                ):
-
-                    strength = (
-                        "🟡 VALID SETUP"
-                    )
-
+                if hist["series_win_rate"] is None:
+                    hist_text = "INSUFFICIENT_DATA"
                 else:
+                    hist_text = f"{hist['series_win_rate']}%"
 
-                    strength = (
-                        "⚪ WATCH"
-                    )
+                dt_open = utc_to_thai(signal["next_open_ts"])
+                dt_close = utc_to_thai(signal["next_close_ts"])
 
-                ai_text = ai_comment(
-                    signal["symbol"],
-                    signal["decision"],
-                    signal["score"],
-                    signal["zone_state"],
-                    mode,
+                direction_icon = (
+                    "🟢" if signal["decision"] == "CALL"
+                    else "🔴"
                 )
 
-                zone_text = (
-                    signal[
-                        "zone_state"
-                    ]
-                )
-
-                if (
-                    signal.get(
-                        "zone_level"
-                    )
-                    is not None
-                ):
-
-                    zone_text += (
-                        " @ "
-                        f"{signal['zone_level']:.6f}"
-                    )
-
-                icon = (
-                    "🟢"
-                    if signal[
-                        "decision"
-                    ] == "CALL"
-                    else
-                    "🔴"
-                )
+                ai_text = ai_comment(signal)
 
                 message = (
-
-                    f"{icon} **[TRADEIFY NEW SIGNAL]**\n"
+                    f"🚨 **[TRADEIFY SIGNAL]**\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-
-                    f"💱 คู่เงิน: "
-                    f"**{signal['symbol']}**\n"
-
-                    f"🌐 ตลาด: "
-                    f"**{mode}**\n"
-
-                    f"📅 วัน: "
-                    f"**{weekday_thai()}**\n"
-
-                    f"🟢🔴 สถานะ: "
-                    f"**{strength}**\n"
-
-                    f"📌 15M Direction: "
-                    f"**{signal['decision']}**\n"
-
-                    f"🏆 Final Score: "
-                    f"**{signal['score']}/100**\n"
-
-                    f"📊 15M Score: "
-                    f"**{signal['master_score']}/100**\n"
-
-                    f"⏱️ 5M Score: "
-                    f"**{signal['entry_score']}/100**\n"
-
-                    f"🧭 5M Context: "
-                    f"**{signal['entry_context']}**\n"
-
-                    f"🧱 Zone: "
-                    f"**{zone_text}**\n"
-
-                    f"💰 Price: "
-                    f"**{signal['price']:.6f}**\n\n"
-
-                    f"🔎 15M:\n"
-                    f"{signal['reasons_15m']}\n\n"
-
-                    f"🔎 5M:\n"
-                    f"{signal['reasons_5m']}\n\n"
-
-                    f"🤖 AI:\n"
-                    f"{ai_text}\n\n"
-
-                    f"🎯 Series: "
-                    f"**สูงสุด {MAX_OPPORTUNITIES} ไม้**\n"
-
-                    f"🕐 เวลาไทย:\n"
-                    f"**{signal['created_at']}**\n"
-
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"⚠️ Signal "
-                    f"ไม่ใช่การรับประกันผลลัพธ์"
+                    f"⏱️ TF: **5M**\n"
+                    f"💱 คู่: **{signal['symbol']}**\n\n"
+                    f"⭐️ **เตือนเวลา {thai_hm()} น.** ⭐️\n"
+                    f"🇹🇭 เวลาไทย\n\n"
+                    f"🌐 Mode: **{signal['mode']}**\n"
+                    f"📌 Direction: **{signal['decision']}** {direction_icon}\n"
+                    f"🟢 **เตรียมซื้อแท่งหน้า**\n\n"
+                    f"📊 SETUP STRENGTH: **{signal['setup_strength']}/100**\n"
+                    f"📈 15M RSI: **{signal['rsi15']:.1f}**\n"
+                    f"📉 5M RSI: **{signal['rsi5']:.1f}**\n"
+                    f"⏱️ 5M Context: **{signal['entry_context']}**\n"
+                    f"🧭 Zone: **{signal['zone_state']}**\n\n"
+                    f"📚 HISTORICAL (เฉพาะ setup นี้)\n"
+                    f"• Samples: **{hist['samples']}**\n"
+                    f"• Series Win Rate 1–3: **{hist_text}**\n"
+                    f"• First Entry Win Rate: **"
+                    f"{hist['first_win_rate'] if hist['first_win_rate'] is not None else 'INSUFFICIENT_DATA'}"
+                    f"{'%' if hist['first_win_rate'] is not None else ''}**\n\n"
+                    f"🎯 Opportunity: **1/3**\n"
+                    f"⏰ เข้าแท่ง: **{thai_hm(dt_open)} น.**\n"
+                    f"🔚 ปิดแท่ง: **{thai_hm(dt_close)} น.**\n\n"
+                    f"🔎 15M: {signal['reasons15']}\n"
+                    f"🔎 5M: {signal['reasons5']}\n"
+                    f"🤖 {ai_text}\n\n"
+                    f"⚠️ **รอแท่งใหม่ก่อนเข้า**\n"
+                    f"⚠️ **ผล WIN/LOSS ตัดสินหลังแท่ง 5M ปิดเท่านั้น**\n"
+                    f"🕐 Signal: **{signal['created_at']}**"
                 )
 
-                send_discord(
-                    message
-                )
+                send_discord(message)
 
                 log(
-                    f"NEW "
-                    f"{signal['symbol']} "
+                    f"NEW {signal['symbol']} "
                     f"{signal['decision']} "
-                    f"score="
-                    f"{signal['score']} "
-                    f"mode={mode}"
+                    f"mode={signal['mode']} "
+                    f"strength={signal['setup_strength']}"
                 )
 
-                # 1 setup ต่อ scan cycle
+                # 1 signal ต่อ scan cycle
                 break
 
-        except Exception as exc:
+        except Exception as e:
+            log(f"Scanner loop error: {e}")
 
-            log(
-                f"Scanner loop error: "
-                f"{exc}"
-            )
-
-        time.sleep(
-            SCAN_SECONDS
-        )
+        time.sleep(SCAN_SECONDS)
 
 
 # ============================================================
-# REPORTER
+# REPORT
 # ============================================================
 
 def calculate_stats():
-
     with LOCK:
-
         total = (
             STATS["wins"]
             + STATS["losses"]
             + STATS["draws"]
         )
 
-        if total:
-
-            win_rate = (
-                STATS["wins"]
-                / total
-                * 100
-            )
-
-        else:
-
-            win_rate = 0
-
         return {
-
             **STATS,
-
-            "total_opportunities":
-                total,
-
-            "win_rate":
-                round(
-                    win_rate,
-                    2
-                ),
-
-            "active_series":
-                len(
-                    ACTIVE_SERIES
-                ),
-
-            "memory_records":
-                len(
-                    HISTORICAL_MEMORY
-                ),
+            "total_opportunities": total,
+            "win_rate": round(
+                STATS["wins"] / total * 100, 2
+            ) if total else None,
+            "active_series": len(ACTIVE_SERIES),
+            "memory_records": len(HISTORICAL_MEMORY),
         }
 
 
 def reporter_loop():
-
     while True:
-
         try:
+            s = calculate_stats()
 
-            stats = calculate_stats()
+            wr = (
+                f"{s['win_rate']}%"
+                if s["win_rate"] is not None
+                else "INSUFFICIENT_DATA"
+            )
 
             send_discord(
-
                 f"📊 **[TRADEIFY STATUS]**\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🌐 Mode: **{automatic_market_mode()}**\n"
-                f"📅 {weekday_thai()}\n"
-                f"🕐 เวลาไทย: **{thai_text()}**\n\n"
-
-                f"📡 Signals: "
-                f"**{stats['signals']}**\n"
-
-                f"🟢 WIN: "
-                f"**{stats['wins']}**\n"
-
-                f"🔴 LOSS: "
-                f"**{stats['losses']}**\n"
-
-                f"🟡 DRAW: "
-                f"**{stats['draws']}**\n"
-
-                f"📈 Win Rate: "
-                f"**{stats['win_rate']}%**\n\n"
-
-                f"🏁 Series Completed: "
-                f"**{stats['series_completed']}**\n"
-
-                f"🟢 Series WIN: "
-                f"**{stats['series_wins']}**\n"
-
-                f"🔴 Full Loss: "
-                f"**{stats['series_full_loss']}**\n"
-
-                f"🔥 Active Series: "
-                f"**{stats['active_series']}**\n"
-
-                f"🧠 Memory: "
-                f"**{stats['memory_records']}**"
+                f"🇹🇭 เวลาไทย: **{thai_text()}**\n"
+                f"📡 Mode ตอนนี้: **{mode_now()}**\n"
+                f"📣 Signals: **{s['signals']}**\n"
+                f"🟢 WIN: **{s['wins']}**\n"
+                f"🔴 LOSS: **{s['losses']}**\n"
+                f"🟡 DRAW: **{s['draws']}**\n"
+                f"📈 Opportunity Win Rate: **{wr}**\n"
+                f"🏁 Series Complete: **{s['series_completed']}**\n"
+                f"🟢 Series Win: **{s['series_wins']}**\n"
+                f"🔴 Full Loss: **{s['series_full_loss']}**\n"
+                f"🔄 Active Series: **{s['active_series']}**\n"
+                f"💾 Memory: **{s['memory_records']}**"
             )
 
-        except Exception as exc:
+        except Exception as e:
+            log(f"Reporter error: {e}")
 
-            log(
-                f"Reporter error: "
-                f"{exc}"
-            )
-
-        time.sleep(
-            REPORT_SECONDS
-        )
+        time.sleep(REPORT_SECONDS)
 
 
 # ============================================================
 # HEALTH SERVER
 # ============================================================
 
-class HealthHandler(
-    BaseHTTPRequestHandler
-):
+class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
-
-        if self.path in (
-            "/",
-            "/health",
-            "/status"
-        ):
-
-            stats = (
-                calculate_stats()
-            )
+        if self.path in ("/", "/health", "/status"):
+            s = calculate_stats()
 
             body = {
-
-                "app":
-                    APP_NAME,
-
-                "status":
-                    "running",
-
-                "market_mode":
-                    automatic_market_mode(),
-
-                "market_label":
-                    market_label(),
-
-                "weekday":
-                    weekday_thai(),
-
-                "time_thai":
-                    thai_text(),
-
-                "symbols":
-                    SYMBOLS,
-
-                "active_series":
-                    stats[
-                        "active_series"
-                    ],
-
-                "memory_records":
-                    stats[
-                        "memory_records"
-                    ],
-
-                "signals":
-                    stats[
-                        "signals"
-                    ],
-
-                "wins":
-                    stats[
-                        "wins"
-                    ],
-
-                "losses":
-                    stats[
-                        "losses"
-                    ],
-
-                "draws":
-                    stats[
-                        "draws"
-                    ],
-
-                "win_rate":
-                    stats[
-                        "win_rate"
-                    ],
+                "status": "running",
+                "time_thai": thai_text(),
+                "mode": mode_now(),
+                "symbols": SYMBOLS,
+                "active_series": s["active_series"],
+                "memory_records": s["memory_records"],
+                "wins": s["wins"],
+                "losses": s["losses"],
+                "draws": s["draws"],
+                "win_rate": s["win_rate"],
             }
 
             raw = json.dumps(
                 body,
                 ensure_ascii=False,
-                indent=2
-            ).encode(
-                "utf-8"
-            )
+                indent=2,
+            ).encode("utf-8")
 
-            self.send_response(
-                200
-            )
-
+            self.send_response(200)
             self.send_header(
                 "Content-Type",
-                "application/json; "
-                "charset=utf-8"
+                "application/json; charset=utf-8",
             )
-
             self.send_header(
                 "Content-Length",
-                str(len(raw))
+                str(len(raw)),
             )
-
             self.end_headers()
+            self.wfile.write(raw)
+            return
 
-            self.wfile.write(
-                raw
-            )
+        self.send_response(404)
+        self.end_headers()
 
-        else:
-
-            self.send_response(
-                404
-            )
-
-            self.end_headers()
-
-    def log_message(
-        self,
-        format,
-        *args
-    ):
-
+    def log_message(self, format, *args):
         return
 
 
 def run_health_server():
-
     try:
-
         server = HTTPServer(
-            (
-                "0.0.0.0",
-                PORT
-            ),
-            HealthHandler
+            ("0.0.0.0", PORT),
+            HealthHandler,
         )
 
-        log(
-            f"Health server "
-            f"0.0.0.0:{PORT}"
-        )
-
+        log(f"Health server :{PORT}")
         server.serve_forever()
 
-    except Exception as exc:
-
-        log(
-            f"Health server error: "
-            f"{exc}"
-        )
+    except Exception as e:
+        log(f"Health server error: {e}")
 
 
 # ============================================================
-# STARTUP DISCORD
+# STARTUP
 # ============================================================
 
 def startup_message():
-
-    mode = (
-        automatic_market_mode()
-    )
-
     send_discord(
-
         f"🚀 **[TRADEIFY STARTED]**\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-
-        f"🌐 Market Mode: "
-        f"**{mode}**\n"
-
-        f"📅 วัน: "
-        f"**{weekday_thai()}**\n"
-
-        f"🕐 เวลาไทย: "
-        f"**{thai_text()}**\n\n"
-
-        f"🧭 15M = Trend + Zone + Break/Flip\n"
-        f"⏱️ 5M = Timing + Candle\n"
-        f"🎯 Series = สูงสุด "
-        f"**{MAX_OPPORTUNITIES} opportunities**\n"
-        f"🧠 Memory = Persistent\n"
-        f"📡 Symbols = "
-        f"**{len(SYMBOLS)}**\n"
-        f"⏳ Scanner = "
-        f"**{SCAN_SECONDS}s**\n"
-        f"🌐 Port = "
-        f"**{PORT}**\n\n"
-
-        f"⚠️ LIVE/OTC label "
-        f"ไม่ได้ทำให้ข้อมูล Yahoo "
-        f"กลายเป็นราคา 8X โดยอัตโนมัติ\n"
-        f"⚠️ OTC ต้องใช้ feed ของ OTC "
-        f"ที่ตรงกับแพลตฟอร์ม หากต้องการ "
-        f"ให้แท่งตรงกับ 8X"
+        f"🇹🇭 เวลาไทย: **{thai_text()}**\n"
+        f"🌐 Mode: **{mode_now()}**\n"
+        f"⏱️ Master: **15M**\n"
+        f"🎯 Entry/Result: **5M**\n"
+        f"🔢 Opportunities: **1–3**\n"
+        f"💾 Memory: **ON**\n"
+        f"📡 Symbols: **{len(SYMBOLS)}**\n"
+        f"⏳ Scanner: **{SCAN_SECONDS}s**\n\n"
+        f"⚠️ OTC เป็น proxy จาก public FX feed "
+        f"ไม่ใช่ราคา OTC จาก 8X โดยตรง"
     )
 
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
-
-    log("=" * 65)
-
-    log(
-        "TRADEIFY 24/7 "
-        "LIVE + OTC STARTING"
-    )
-
-    log("=" * 65)
+    log("=" * 70)
+    log("TRADEIFY 15M + 5M + 3 OPPORTUNITIES")
+    log("=" * 70)
 
     load_memory()
 
     Thread(
         target=run_health_server,
-        daemon=True
+        daemon=True,
     ).start()
 
     Thread(
         target=tracker_loop,
-        daemon=True
+        daemon=True,
     ).start()
 
     Thread(
         target=scanner_loop,
-        daemon=True
+        daemon=True,
     ).start()
 
     Thread(
         target=reporter_loop,
-        daemon=True
+        daemon=True,
     ).start()
 
     startup_message()
 
     while True:
-
         try:
-
-            time.sleep(
-                60
-            )
-
+            time.sleep(60)
         except KeyboardInterrupt:
-
-            log(
-                "Stopping..."
-            )
-
+            log("Stopping...")
             break
-
-        except Exception as exc:
-
-            log(
-                f"Main error: "
-                f"{exc}"
-            )
 
 
 if __name__ == "__main__":
-
     main()
+'''
+
+path = Path("/mnt/data/tradeify.py")
+path.write_text(code, encoding="utf-8")
+print(f"สร้างไฟล์เรียบร้อย: {path}")
+print(f"จำนวนบรรทัด: {len(code.splitlines())}")
