@@ -2,13 +2,26 @@ from pathlib import Path
 
 code = r'''#!/usr/bin/env python3
 """
-TRADEIFY 2.2.2 STABLE
-- Robust output directory creation
-- Discord webhook with timeout/retry
-- Real HTTP status verification
+TRADEIFY 2.2.3 STABLE - RUNNABLE
+
+This file is the actual runtime, not a file-generator.
+
+Features:
+- Creates /app/output safely
+- Discord webhook with HTTP verification, retries and timeout
+- Never reports Discord PASS unless the webhook actually returns 2xx
 - Duplicate signal protection
 - OTC-aware warnings
-- Self-test reports Discord status honestly
+- Writes last signal/state/log
+- Startup self-test
+- Optional continuous heartbeat loop
+- No external Python packages required
+
+ENV:
+  TRADEIFY_DISCORD_WEBHOOK=...
+  TRADEIFY_OUTPUT_DIR=/app/output
+  TRADEIFY_RUN_ONCE=1       # optional; default 0 = keep process alive
+  TRADEIFY_HEARTBEAT=60     # seconds; default 60
 """
 
 from __future__ import annotations
@@ -17,14 +30,16 @@ import hashlib
 import json
 import logging
 import os
+import signal as os_signal
+import sys
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
-from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
-APP_VERSION = "2.2.2"
+APP_VERSION = "2.2.3"
 OUTPUT_DIR = Path(os.getenv("TRADEIFY_OUTPUT_DIR", "/app/output"))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -35,7 +50,10 @@ LOG_FILE = OUTPUT_DIR / "tradeify.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE, encoding="utf-8")],
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
 )
 log = logging.getLogger("TRADEIFY")
 
@@ -64,27 +82,26 @@ class Signal:
     warnings: tuple[str, ...] = ()
 
 
-def _state() -> dict:
+def load_state() -> dict:
     try:
         if STATE_FILE.exists():
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
     except Exception:
-        log.exception("Unable to read state file")
+        log.exception("State read failed")
     return {}
 
 
-def _save_state(state: dict) -> None:
-    tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+def save_state(state: dict) -> None:
+    tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
+    tmp.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     tmp.replace(STATE_FILE)
 
 
-def signal_fingerprint(signal: Signal) -> str:
-    payload = json.dumps(asdict(signal), ensure_ascii=False, sort_keys=True)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def discord_webhook_url() -> str:
+def webhook_url() -> str:
     return (
         os.getenv("TRADEIFY_DISCORD_WEBHOOK", "").strip()
         or os.getenv("DISCORD_WEBHOOK_URL", "").strip()
@@ -92,46 +109,95 @@ def discord_webhook_url() -> str:
     )
 
 
+def webhook_configured() -> bool:
+    return bool(webhook_url())
+
+
+def signal_fingerprint(s: Signal) -> str:
+    payload = json.dumps(
+        asdict(s),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def send_discord(
     content: str,
     *,
-    username: str = "TRADEIFY",
     retries: int = 3,
     timeout: float = 10.0,
 ) -> tuple[bool, str]:
-    """Send a Discord webhook and verify the actual HTTP response."""
-    url = discord_webhook_url()
+    """
+    Discord webhook sender.
+    Success is only a real HTTP 2xx response.
+    Discord commonly returns 204 No Content.
+    """
+    url = webhook_url()
     if not url:
         return False, "NOT_CONFIGURED"
 
     body = json.dumps(
-        {"username": username, "content": content[:1900], "allowed_mentions": {"parse": []}},
+        {
+            "username": "TRADEIFY",
+            "content": content[:1900],
+            "allowed_mentions": {"parse": []},
+        },
         ensure_ascii=False,
     ).encode("utf-8")
 
     last_error = "UNKNOWN"
+
     for attempt in range(1, retries + 1):
         try:
-            req = Request(
+            request = Request(
                 url,
                 data=body,
-                headers={"Content-Type": "application/json", "User-Agent": f"TRADEIFY/{APP_VERSION}"},
                 method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": f"TRADEIFY/{APP_VERSION}",
+                },
             )
-            with urlopen(req, timeout=timeout) as response:
-                status = int(response.status)
-                if 200 <= status < 300:
-                    log.info("Discord sent successfully: HTTP %s", status)
-                    return True, f"HTTP_{status}"
-                last_error = f"HTTP_{status}"
-        except HTTPError as e:
-            last_error = f"HTTP_{e.code}"
-            log.warning("Discord attempt %s/%s failed: %s", attempt, retries, last_error)
-        except (URLError, TimeoutError, OSError) as e:
-            last_error = f"{type(e).__name__}: {e}"
-            log.warning("Discord attempt %s/%s failed: %s", attempt, retries, last_error)
-        except Exception as e:
-            last_error = f"{type(e).__name__}: {e}"
+
+            with urlopen(request, timeout=timeout) as response:
+                status = int(getattr(response, "status", 0))
+
+            if 200 <= status < 300:
+                return True, f"HTTP_{status}"
+
+            last_error = f"HTTP_{status}"
+
+        except HTTPError as exc:
+            last_error = f"HTTP_{exc.code}"
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:500]
+                if detail:
+                    log.warning(
+                        "Discord attempt %s/%s failed: %s | %s",
+                        attempt, retries, last_error, detail
+                    )
+                else:
+                    log.warning(
+                        "Discord attempt %s/%s failed: %s",
+                        attempt, retries, last_error
+                    )
+            except Exception:
+                log.warning(
+                    "Discord attempt %s/%s failed: %s",
+                    attempt, retries, last_error
+                )
+
+        except (URLError, TimeoutError, OSError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            log.warning(
+                "Discord attempt %s/%s failed: %s",
+                attempt, retries, last_error
+            )
+
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
             log.exception("Unexpected Discord error")
 
         if attempt < retries:
@@ -140,62 +206,64 @@ def send_discord(
     return False, last_error
 
 
-def format_signal(signal: Signal) -> str:
-    reasons = "\n".join(f"• {x}" for x in signal.reasons) or "• ไม่มี"
-    warnings = "\n".join(f"⚠️ {x}" for x in signal.warnings) or "ไม่มี"
+def format_signal(s: Signal) -> str:
+    icon = "🟢" if s.signal.upper() == "BUY" else "🔴" if s.signal.upper() == "SELL" else "🟡"
 
-    return f"""🚨 **TRADEIFY {APP_VERSION} — {signal.signal}**
+    reasons = "\n".join(f"• {x}" for x in s.reasons) or "• ไม่มี"
+    warnings = "\n".join(f"⚠️ {x}" for x in s.warnings) or "ไม่มี"
+
+    return f"""🚨 **TRADEIFY {APP_VERSION} — {icon} {s.signal.upper()}**
 ━━━━━━━━━━━━━━━━━━━━
-**Market:** {signal.market}
-**Symbol:** `{signal.symbol}`
-**TF:** `{signal.timeframe}`
-**Trend:** {signal.trend}
-**Structure:** {signal.structure}
-**Confidence:** {signal.confidence:.0f}%
+**Market:** {s.market}
+**Symbol:** `{s.symbol}`
+**Timeframe:** `{s.timeframe}`
+**Trend:** {s.trend}
+**Structure:** {s.structure}
+**Confidence:** `{s.confidence:.0f}%`
 
-**Entry:** `{signal.entry:.5f}`
-**SL:** `{signal.sl:.5f}`
-**TP1:** `{signal.tp1:.5f}`
-**TP2:** `{signal.tp2:.5f}`
+**ENTRY:** `{s.entry:.5f}`
+**SL:** `{s.sl:.5f}`
+**TP1:** `{s.tp1:.5f}`
+**TP2:** `{s.tp2:.5f}`
 
-**RSI14:** {signal.rsi14 if signal.rsi14 is not None else "-"}
-**MACD Hist:** {signal.macd_histogram if signal.macd_histogram is not None else "-"}
-**EMA20:** {signal.ema20 if signal.ema20 is not None else "-"}
-**EMA50:** {signal.ema50 if signal.ema50 is not None else "-"}
+**RSI14:** `{s.rsi14 if s.rsi14 is not None else "-"}`
+**MACD Hist:** `{s.macd_histogram if s.macd_histogram is not None else "-"}`
+**EMA20:** `{s.ema20 if s.ema20 is not None else "-"}`
+**EMA50:** `{s.ema50 if s.ema50 is not None else "-"}`
 
 **REASONS**
 {reasons}
 
 **WARNINGS**
 {warnings}
+
 ━━━━━━━━━━━━━━━━━━━━
-OTC: สัญญาณเป็นการวิเคราะห์จากราคา OTC ไม่รับประกันว่าตรงกับตลาดจริง
+⚠️ OTC: ราคาจาก OTC อาจแตกต่างจากตลาดจริง
 """
 
 
-def notify_signal(signal: Signal, force: bool = False) -> tuple[bool, str]:
-    fp = signal_fingerprint(signal)
-    state = _state()
+def notify_signal(s: Signal, force: bool = False) -> tuple[bool, str]:
+    fp = signal_fingerprint(s)
+    state = load_state()
 
     if not force and state.get("last_fingerprint") == fp:
-        log.info("Duplicate signal suppressed")
         return True, "DUPLICATE_SUPPRESSED"
 
-    ok, status = send_discord(format_signal(signal))
+    ok, status = send_discord(format_signal(s))
+
+    state["last_attempt_at"] = int(time.time())
+    state["last_discord_status"] = status
+
     if ok:
         state["last_fingerprint"] = fp
         state["last_sent_at"] = int(time.time())
-        state["last_discord_status"] = status
-        _save_state(state)
-    else:
-        state["last_discord_status"] = status
-        _save_state(state)
 
+    save_state(state)
     return ok, status
 
 
-def self_test() -> dict:
-    test = Signal(
+def make_test_signal() -> Signal:
+    return Signal(
         market="OTC",
         symbol="TEST-OTC",
         timeframe="1m",
@@ -225,47 +293,157 @@ def self_test() -> dict:
         ),
     )
 
-    ok, status = notify_signal(test, force=True)
+
+def write_last_result(result: dict) -> None:
+    tmp = SIGNAL_FILE.with_name(SIGNAL_FILE.name + ".tmp")
+    tmp.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp.replace(SIGNAL_FILE)
+
+
+def self_test() -> dict:
+    s = make_test_signal()
+
+    print("SELF TEST   : RUNNING", flush=True)
+
+    if not webhook_configured():
+        ok = False
+        status = "NOT_CONFIGURED"
+    else:
+        ok, status = notify_signal(s, force=True)
 
     result = {
         "version": APP_VERSION,
         "self_test": "PASS" if ok else "FAIL",
         "discord": "CONNECTED" if ok else status,
-        "signal": asdict(test),
+        "signal": asdict(s),
         "timestamp": int(time.time()),
     }
-    SIGNAL_FILE.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    write_last_result(result)
     return result
 
 
-if __name__ == "__main__":
-    print("=" * 59)
-    print(f"             TRADEIFY {APP_VERSION} STABLE")
-    print("=" * 59)
-    result = self_test()
-    print("SELF TEST :", result["self_test"])
-    print("DISCORD   :", result["discord"])
-    print("JSON saved:", SIGNAL_FILE)
+STOP = False
 
-    if result["self_test"] != "PASS":
-        print()
-        print("⚠️ Discord ยังส่งไม่ได้")
-        print("ตั้ง environment variable:")
-        print("TRADEIFY_DISCORD_WEBHOOK=<YOUR_DISCORD_WEBHOOK>")
-        print("แล้ว restart container")
+
+def stop_handler(signum, frame):
+    global STOP
+    STOP = True
+    log.info("Shutdown signal received")
+
+
+def startup() -> dict:
+    print("=" * 60, flush=True)
+    print(f"             TRADEIFY {APP_VERSION} STABLE", flush=True)
+    print("=" * 60, flush=True)
+    print(f"OUTPUT      : {OUTPUT_DIR}", flush=True)
+    print(
+        f"DISCORD     : {'CONFIGURED' if webhook_configured() else 'NOT_CONFIGURED'}",
+        flush=True,
+    )
+
+    if not webhook_configured():
+        print("", flush=True)
+        print("⚠️ DISCORD WEBHOOK ยังไม่ได้ตั้งค่า", flush=True)
+        print(
+            "ตั้ง TRADEIFY_DISCORD_WEBHOOK ใน Environment ของ Container",
+            flush=True,
+        )
+        print("", flush=True)
+
+    result = self_test()
+
+    print(f"SELF TEST   : {result['self_test']}", flush=True)
+    print(f"DISCORD     : {result['discord']}", flush=True)
+    print(f"JSON        : {SIGNAL_FILE}", flush=True)
+    print("=" * 60, flush=True)
+
+    if result["self_test"] == "PASS":
+        print("✅ DISCORD TEST SENT — ตรวจห้อง Discord ได้เลย", flush=True)
+    else:
+        print(
+            f"❌ DISCORD TEST FAILED — {result['discord']}",
+            flush=True,
+        )
+
+    return result
+
+
+def run_forever() -> None:
+    global STOP
+
+    heartbeat = os.getenv("TRADEIFY_HEARTBEAT", "60")
+    try:
+        heartbeat_seconds = max(5, int(heartbeat))
+    except ValueError:
+        heartbeat_seconds = 60
+
+    print(
+        f"STATUS      : ONLINE | heartbeat={heartbeat_seconds}s",
+        flush=True,
+    )
+
+    while not STOP:
+        time.sleep(heartbeat_seconds)
+        if not STOP:
+            log.info("TRADEIFY heartbeat: ONLINE")
+
+    print("STATUS      : STOPPED", flush=True)
+
+
+def main() -> int:
+    os_signal.signal(os_signal.SIGTERM, stop_handler)
+    os_signal.signal(os_signal.SIGINT, stop_handler)
+
+    result = startup()
+
+    # Explicit one-shot mode for testing/deployment health checks.
+    run_once = os.getenv("TRADEIFY_RUN_ONCE", "0").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+    if run_once:
+        return 0 if result["self_test"] == "PASS" else 2
+
+    # Keep the container alive after startup test.
+    run_forever()
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception:
+        log.exception("FATAL: TRADEIFY crashed")
+        raise
 '''
+
 out = Path("/mnt/data")
 out.mkdir(parents=True, exist_ok=True)
-path = out / "tradeify_v2_2_2_stable.py"
-path.write_text(code, encoding="utf-8")
 
-# Also make a small config example for deployment.
-env = """# TRADEIFY Discord configuration
-TRADEIFY_DISCORD_WEBHOOK=https://discord.com/api/webhooks/PUT_YOUR_WEBHOOK_HERE
-TRADEIFY_OUTPUT_DIR=/app/output
-"""
+py_path = out / "tradeify_2_2_3_stable.py"
+py_path.write_text(code, encoding="utf-8")
+
 env_path = out / "tradeify.env.example"
-env_path.write_text(env, encoding="utf-8")
+env_path.write_text(
+    """# Required for Discord notifications
+TRADEIFY_DISCORD_WEBHOOK=https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN
 
-print(f"สร้างไฟล์สำเร็จ: {path}")
+# Keep container alive (default 0)
+TRADEIFY_RUN_ONCE=0
+
+# Heartbeat in seconds
+TRADEIFY_HEARTBEAT=60
+
+# Optional output location
+TRADEIFY_OUTPUT_DIR=/app/output
+""",
+    encoding="utf-8",
+)
+
+print(f"สร้างไฟล์สำเร็จ: {py_path}")
 print(f"ไฟล์ตั้งค่า: {env_path}")
