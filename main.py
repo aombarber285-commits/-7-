@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 SIGZY 15M + 5M ZONE FLIP / 3-OPPORTUNITY TRACKER & WEB DASHBOARD
@@ -25,7 +24,6 @@ import math
 import requests
 from datetime import datetime, timezone, timedelta
 from threading import Thread, Lock
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import yfinance as yf
 from flask import Flask, render_template_string
@@ -43,7 +41,8 @@ except Exception:
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# แก้ไข default model จาก gemini-2.5-flash เป็น gemini-1.5-flash เพื่อป้องกัน 404
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -247,7 +246,6 @@ def clean_dataframe(df):
         return None
 
     try:
-        # Remove timezone only for easier candle comparison.
         if getattr(df.index, "tz", None) is not None:
             df = df.copy()
             df.index = df.index.tz_convert("UTC").tz_localize(None)
@@ -272,11 +270,9 @@ def get_candles(symbol, interval, period="5d", closed_only=False):
 
         df = clean_dataframe(df)
 
-        if df is None or len(df) < 10:
+        if df is None or df.empty or len(df) < 10:
             return []
 
-        # Yahoo's last intraday candle may still be forming.
-        # For analysis that requires closed candles, remove it.
         if closed_only and len(df) > 1:
             df = df.iloc[:-1]
 
@@ -302,7 +298,7 @@ def get_candles(symbol, interval, period="5d", closed_only=False):
         return candles
 
     except Exception as e:
-        log(f"Yahoo {symbol} {interval} error: {e}")
+        log(f"Yahoo {symbol} {interval} fetch warning/error: {e}")
         return []
 
 
@@ -315,7 +311,6 @@ def ema(values, period):
         return None
 
     multiplier = 2.0 / (period + 1.0)
-
     value = sum(values[:period]) / period
 
     for price in values[period:]:
@@ -333,7 +328,6 @@ def rsi_wilder(values, period=14):
 
     for i in range(1, len(values)):
         diff = values[i] - values[i - 1]
-
         gains.append(max(diff, 0.0))
         losses.append(max(-diff, 0.0))
 
@@ -348,7 +342,6 @@ def rsi_wilder(values, period=14):
         return 100.0
 
     rs = avg_gain / avg_loss
-
     return 100.0 - (100.0 / (1.0 + rs))
 
 
@@ -357,17 +350,14 @@ def atr(candles, period=14):
         return None
 
     trs = []
-
     for i in range(1, len(candles)):
         c = candles[i]
         p = candles[i - 1]
-
         tr = max(
             c["high"] - c["low"],
             abs(c["high"] - p["close"]),
             abs(c["low"] - p["close"]),
         )
-
         trs.append(tr)
 
     return sum(trs[-period:]) / period
@@ -379,26 +369,14 @@ def atr(candles, period=14):
 
 def candle_features(c0, c1):
     body = abs(c0["close"] - c0["open"])
-
-    full_range = max(
-        c0["high"] - c0["low"],
-        1e-12,
-    )
+    full_range = max(c0["high"] - c0["low"], 1e-12)
 
     upper = c0["high"] - max(c0["open"], c0["close"])
     lower = min(c0["open"], c0["close"]) - c0["low"]
-
     body_ratio = body / full_range
 
-    strong_bull = (
-        c0["close"] > c0["open"]
-        and body_ratio >= 0.65
-    )
-
-    strong_bear = (
-        c0["close"] < c0["open"]
-        and body_ratio >= 0.65
-    )
+    strong_bull = (c0["close"] > c0["open"] and body_ratio >= 0.65)
+    strong_bear = (c0["close"] < c0["open"] and body_ratio >= 0.65)
 
     hammer = (
         lower >= body * 2.0
@@ -486,22 +464,11 @@ def build_zones(candles, lookback=240):
 
 def zone_analysis(candles, price, direction):
     if len(candles) < 40:
-        return {
-            "state": "NONE",
-            "score": 0,
-            "distance": None,
-            "level": None,
-        }
+        return {"state": "NONE", "score": 0, "distance": None, "level": None}
 
     current_atr = atr(candles, 14)
-
     if not current_atr or current_atr <= 0:
-        return {
-            "state": "NONE",
-            "score": 0,
-            "distance": None,
-            "level": None,
-        }
+        return {"state": "NONE", "score": 0, "distance": None, "level": None}
 
     zones = build_zones(candles)
     tolerance = current_atr * 0.35
@@ -513,16 +480,10 @@ def zone_analysis(candles, price, direction):
             candidates.append((distance, z))
 
     if not candidates:
-        return {
-            "state": "NONE",
-            "score": 0,
-            "distance": None,
-            "level": None,
-        }
+        return {"state": "NONE", "score": 0, "distance": None, "level": None}
 
     candidates.sort(key=lambda x: x[0])
     distance, nearest = candidates[0]
-
     recent = candles[-12:]
 
     broke_above = any(
@@ -569,11 +530,7 @@ def zone_analysis(candles, price, direction):
 
 def analyze_15m(symbol, candles):
     if len(candles) < 80:
-        return {
-            "decision": "WAIT",
-            "score": 0,
-            "reason": "not enough 15M candles",
-        }
+        return {"decision": "WAIT", "score": 0, "reason": "not enough 15M candles"}
 
     c0 = candles[-1]
     c1 = candles[-2]
@@ -586,11 +543,7 @@ def analyze_15m(symbol, candles):
     rsi = rsi_wilder(closes, 14)
 
     if None in (ema20, ema50, current_atr, rsi):
-        return {
-            "decision": "WAIT",
-            "score": 0,
-            "reason": "indicator unavailable",
-        }
+        return {"decision": "WAIT", "score": 0, "reason": "indicator unavailable"}
 
     pattern = candle_features(c0, c1)
 
@@ -681,14 +634,8 @@ def analyze_15m(symbol, candles):
         "rsi": rsi,
         "ema20": ema20,
         "ema50": ema50,
-        "zone_state": (
-            z_call["state"] if decision == "CALL"
-            else z_put["state"]
-        ),
-        "zone_level": (
-            z_call["level"] if decision == "CALL"
-            else z_put["level"]
-        ),
+        "zone_state": (z_call["state"] if decision == "CALL" else z_put["state"]),
+        "zone_level": (z_call["level"] if decision == "CALL" else z_put["level"]),
         "reasons": " | ".join(reasons),
         "candle_time": c0["datetime"],
     }
@@ -700,11 +647,7 @@ def analyze_15m(symbol, candles):
 
 def analyze_5m(symbol, candles, master_direction):
     if len(candles) < 70:
-        return {
-            "decision": "UNKNOWN",
-            "score": 50,
-            "reason": "not enough 5M data",
-        }
+        return {"decision": "UNKNOWN", "score": 50, "reason": "not enough 5M data"}
 
     c0 = candles[-1]
     c1 = candles[-2]
@@ -929,10 +872,8 @@ def find_first_closed_5m_after(candles, timestamp):
 
 def find_closed_candles_after(candles, timestamp):
     result = []
-
     for c in candles:
         close_time = c["timestamp"] + FIVE_MIN_SECONDS
-
         if close_time > timestamp:
             result.append(c)
 
@@ -969,7 +910,6 @@ def evaluate_one_opportunity(tracker):
         )
 
         used = set(tracker["processed_5m"])
-
         candidates = [
             c for c in candidates
             if c["datetime"] not in used
@@ -1026,19 +966,10 @@ def evaluate_one_opportunity(tracker):
 
 
 def record_opportunity(tracker, outcome):
-    tracker["processed_5m"].append(
-        outcome["candle"]["datetime"]
-    )
+    tracker["processed_5m"].append(outcome["candle"]["datetime"])
 
-    tracker["max_mfe"] = max(
-        tracker.get("max_mfe", 0),
-        outcome["mfe"],
-    )
-
-    tracker["max_mae"] = max(
-        tracker.get("max_mae", 0),
-        outcome["mae"],
-    )
+    tracker["max_mfe"] = max(tracker.get("max_mfe", 0), outcome["mfe"])
+    tracker["max_mae"] = max(tracker.get("max_mae", 0), outcome["mae"])
 
     result = outcome["result"]
 
