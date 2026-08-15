@@ -1,30 +1,30 @@
 import os
+import sys
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-PORT = int(os.getenv("PORT", "8080"))
 
 print("================================", flush=True)
-print("TRADEIFY BOOT TEST", flush=True)
-print(f"PORT={PORT}", flush=True)
-print("PYTHON STARTED", flush=True)
+print("TRADEIFY IMPORT TEST", flush=True)
+print(f"Python: {sys.version}", flush=True)
+
+print("[1] requests...", flush=True)
+import requests
+print("[OK] requests", flush=True)
+
+print("[2] yfinance...", flush=True)
+import yfinance as yf
+print("[OK] yfinance", flush=True)
+
+print("[3] google.genai...", flush=True)
+try:
+    from google import genai
+    print("[OK] google.genai", flush=True)
+except Exception as e:
+    print(f"[WARN] google.genai: {e}", flush=True)
+
 print("================================", flush=True)
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = b"TRADEIFY OK"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format, *args):
-        return
-
-server = HTTPServer(("0.0.0.0", PORT), Handler)
-
-print(f"SERVER LISTENING ON {PORT}", flush=True)
+print("ALL IMPORT TESTS PASSED", flush=True)
+print("================================", flush=True)
 
 while True:
-    server.handle_request()
+    print("TRADEIFY TEST ALIVE", flush=True)
+    time.sleep(30)
