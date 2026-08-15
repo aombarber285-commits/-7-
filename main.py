@@ -156,12 +156,56 @@ def release_process_lock():
 
 # ---------------- DISCORD ----------------
 
+def repair_mojibake(value):
+    """Repair common UTF-8 -> Latin-1/CP1252 mojibake before Discord send."""
+    if not isinstance(value, str):
+        return value
+
+    # Only attempt repair when typical mojibake markers are present.
+    markers = ("Ã°", "Ã", "Ã", "Ã¢", "Ã Â¸", "Ã Â¹", "Ã¯Â¸")
+    if not any(m in value for m in markers):
+        return value
+
+    for encoding in ("latin1", "cp1252"):
+        try:
+            fixed = value.encode(encoding).decode("utf-8")
+            # Keep the repair only if it removed the common mojibake markers.
+            if sum(value.count(m) for m in markers) > sum(fixed.count(m) for m in markers):
+                return fixed
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+
+    return value
+
+
 def send_discord(message):
     if not DISCORD_WEBHOOK_URL:
         log("Discord: webhook not configured")
         return False
     try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json={"content": message[:1900]}, timeout=10)
+        # Normalize any already-corrupted UTF-8 text first.
+        message = repair_mojibake(str(message))
+
+        # Send explicit UTF-8 bytes + charset so no intermediary guesses
+        # Latin-1/ASCII for Thai text or emoji.
+        payload = json.dumps(
+            {"content": message[:1900]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json",
+        }
+
+        r = requests.post(
+            DISCORD_WEBHOOK_URL,
+            data=payload,
+            headers=headers,
+            timeout=10,
+        )
+
         if r.status_code in (200, 204):
             return True
         log(f"Discord HTTP {r.status_code}: {r.text[:200]}")
@@ -972,7 +1016,7 @@ def startup_message():
         f"â³ Cooldown: **{SIGNAL_COOLDOWN_SECONDS}s**\nð¾ Memory: **ON**\n"
         f"ð¡ Symbols: **{len(SYMBOLS)}**\nð¤ Gemini: **{GEMINI_MODEL if AI_CHAT else 'OFF'}**\n"
         f"ð¡ OTC API: **{'ON' if OTC_API_URL else 'OFF'}**\n\n"
-        f"â ï¸ à¸à¹à¸² OTC API OFF à¸£à¸°à¸à¸à¹à¸à¹ Yahoo public FX proxy à¹à¸¥à¸°à¸à¸°à¹à¸¡à¹à¸ªà¸£à¹à¸²à¸ signal à¸à¸²à¸à¸à¹à¸­à¸¡à¸¹à¸¥à¹à¸à¹à¸²"
+        f"â ï¸ OTC API OFF: à¹à¸à¹ Yahoo public FX proxy à¹à¸à¹à¸à¹à¸«à¸¥à¹à¸à¸à¹à¸­à¸¡à¸¹à¸¥à¸ªà¸³à¸£à¸­à¸ à¹à¸¥à¸°à¸«à¹à¸²à¸¡à¸ªà¸£à¹à¸²à¸ signal à¸à¸²à¸à¸à¹à¸­à¸¡à¸¹à¸¥à¹à¸à¹à¸²"
     )
 
 def main():
