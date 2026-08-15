@@ -1,1060 +1,747 @@
-# -*- coding: utf-8 -*-
-"""
-TRADEIFY V2.1
-15M MASTER + 5M ENTRY + 3 OPPORTUNITIES + MEMORY + DISCORD
+# ============================================================
+# TRADEIFY V2.2 CORE PATCH
+# Fixes:
+# - Strict OTC source handling
+# - Data freshness validation
+# - Exact 15M -> 5M synchronization
+# - Persistent ACTIVE_SERIES
+# - Persistent SENT_SIGNALS
+# - Rebuild statistics from memory
+# - Deterministic signal IDs
+# ============================================================
 
-V2.1 fixes:
-- 15M uses 900-second candle close; 5M uses 300-second close.
-- Never uses an incomplete candle.
-- Never creates a new signal from an unchanged candle.
-- OPP1/2/3 uses the exact expected 5M candle; no jumping to later candles.
-- Gemini uses Chat.send_message() and no tools/function calling.
-- Gemini is optional and cannot stop the scanner.
-- Active series is hard-limited and a Linux PID lock prevents duplicate processes.
-- Memory uses a relative path and atomic writes.
-- Weekend OTC: Yahoo is only a public FX proxy. For REAL broker OTC data,
-  configure OTC_API_URL. If no fresh data exists, the bot pauses instead
-  of inventing a signal.
+MEMORY_SCHEMA_VERSION = 2
 
-Optional OTC API:
-GET {OTC_API_URL}?symbol=EURUSD&interval=5m&limit=300
-Expected JSON: {"candles":[{"timestamp":...,"open":...,"high":...,"low":...,"close":...}]}
-timestamp may be Unix seconds/milliseconds or ISO-8601.
-"""
+DATA_SOURCE_REAL_OTC = "OTC_REAL"
+DATA_SOURCE_YAHOO = "YAHOO_PROXY"
 
-import atexit
-import json
-import os
-import sys
-import time
-import requests
-from datetime import datetime, timezone, timedelta
-from threading import Thread, Lock
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
-import yfinance as yf
+# ---------------- DATA SOURCE ----------------
 
-try:
-    from google import genai
-except Exception:
-    genai = None
+def get_data_source_mode():
+    """
+    Returns:
+        OTC_REAL     = configured OTC provider
+        YAHOO_PROXY  = public Yahoo FX proxy
+    """
+    if mode_now() == "OTC":
+        return DATA_SOURCE_REAL_OTC if OTC_API_URL else DATA_SOURCE_YAHOO
+    return DATA_SOURCE_YAHOO
 
-# ---------------- CONFIG ----------------
 
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
+def get_candles(symbol, interval, period="5d", limit=300):
+    """
+    V2.2:
+    Never silently fall back from REAL OTC to Yahoo.
 
-PORT = int(os.getenv("PORT", "8080"))
-SCAN_SECONDS = max(15, int(os.getenv("SCAN_SECONDS", "60")))
-REPORT_SECONDS = max(60, int(os.getenv("REPORT_SECONDS", "1800")))
-MEMORY_FILE = os.getenv("MEMORY_FILE", "tradeify_memory.json").strip()
-MARKET_MODE = os.getenv("MARKET_MODE", "AUTO").upper()
+    If OTC_API_URL is configured and OTC fails:
+        return []
 
-MAX_OPPORTUNITIES = 3
-MAX_ACTIVE_SERIES = max(1, int(os.getenv("MAX_ACTIVE_SERIES", "3")))
-SIGNAL_COOLDOWN_SECONDS = max(60, int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "900")))
-MAX_NEW_SIGNALS_PER_SCAN = max(1, int(os.getenv("MAX_NEW_SIGNALS_PER_SCAN", "1")))
-MIN_HISTORY_FOR_RATE = max(1, int(os.getenv("MIN_HISTORY_FOR_RATE", "10")))
+    This prevents accidental REAL-OTC signals from public proxy data.
+    """
 
-OTC_API_URL = os.getenv("OTC_API_URL", "").strip()
-OTC_API_KEY = os.getenv("OTC_API_KEY", "").strip()
-REQUEST_TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "15")))
-YF_RETRIES = max(1, int(os.getenv("YF_RETRIES", "2")))
-MAX_DATA_AGE_SECONDS = max(0, int(os.getenv("MAX_DATA_AGE_SECONDS", "1200")))
-LOCK_FILE = os.getenv("TRADEIFY_LOCK_FILE", "tradeify_v21.lock").strip()
+    if mode_now() == "OTC" and OTC_API_URL:
+        otc = get_otc_candles(symbol, interval, limit)
 
-SYMBOL_MAP = {
-    "EUR/USD": "EURUSD=X", "GBP/USD": "GBPUSD=X", "USD/JPY": "JPY=X",
-    "AUD/USD": "AUDUSD=X", "USD/CHF": "CHF=X", "USD/CAD": "CAD=X",
-    "NZD/USD": "NZDUSD=X", "EUR/JPY": "EURJPY=X",
-}
-SYMBOLS_ENV = os.getenv("SYMBOLS", "").strip()
-SYMBOLS = [s.strip() for s in SYMBOLS_ENV.split(",") if s.strip() in SYMBOL_MAP] if SYMBOLS_ENV else list(SYMBOL_MAP)
-if not SYMBOLS:
-    SYMBOLS = list(SYMBOL_MAP)
+        if otc:
+            return otc
 
-TF5 = 300
-TF15 = 900
-THAI_TZ = timezone(timedelta(hours=7))
+        log(
+            f"{symbol} {interval}: "
+            f"REAL OTC unavailable -> PAUSE"
+        )
+        return []
 
-LOCK = Lock()
-HISTORICAL_MEMORY = []
-ACTIVE_SERIES = []
-SENT_SIGNALS = {}
-LAST_CLOSED = {"5m": {}, "15m": {}}
-LAST_STALE_LOG = {}
-STATS = {
-    "signals": 0, "wins": 0, "losses": 0, "draws": 0,
-    "series_completed": 0, "series_wins": 0, "series_full_loss": 0,
-}
-AI_CLIENT = None
-AI_CHAT = None
-LOCK_HANDLE = None
+    return get_yahoo_candles(symbol, interval, period)
 
-# ---------------- TIME / LOG ----------------
 
-def now_thai():
-    return datetime.now(timezone.utc).astimezone(THAI_TZ)
+# ---------------- FRESHNESS ----------------
 
-def thai_text(dt=None):
-    return (dt or now_thai()).strftime("%Y-%m-%d %H:%M:%S")
+def candle_age_seconds(candle, interval):
+    if candle is None:
+        return float("inf")
 
-def thai_hm(dt=None):
-    return (dt or now_thai()).strftime("%H:%M")
+    close_ts = candle["timestamp"] + interval_seconds(interval)
+    return max(0.0, time.time() - close_ts)
 
-def mode_now():
-    if MARKET_MODE in ("LIVE", "OTC"):
-        return MARKET_MODE
-    return "OTC" if now_thai().weekday() >= 5 else "LIVE"
 
-def utc_to_thai(ts):
-    return datetime.fromtimestamp(float(ts), timezone.utc).astimezone(THAI_TZ)
+def fresh_candle(candle, interval, max_age=None):
+    if candle is None:
+        return False
 
-def log(msg):
-    print(f"[{thai_text()}] {msg}", flush=True)
+    if max_age is None:
+        max_age = MAX_DATA_AGE_SECONDS
 
-def interval_seconds(interval):
-    return TF5 if interval == "5m" else TF15 if interval == "15m" else 0
-
-# ---------------- PROCESS LOCK ----------------
-
-def acquire_process_lock():
-    global LOCK_HANDLE
-    try:
-        import fcntl
-        LOCK_HANDLE = open(LOCK_FILE, "a+", encoding="utf-8")
-        fcntl.flock(LOCK_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        LOCK_HANDLE.seek(0)
-        LOCK_HANDLE.truncate()
-        LOCK_HANDLE.write(str(os.getpid()))
-        LOCK_HANDLE.flush()
-        atexit.register(release_process_lock)
-        log(f"Process lock acquired: {LOCK_FILE} pid={os.getpid()}")
+    if max_age <= 0:
         return True
-    except BlockingIOError:
-        log(f"ABORT: another TRADEIFY process owns {LOCK_FILE}")
+
+    return candle_age_seconds(candle, interval) <= max_age
+
+
+# ---------------- EXACT 15M / 5M SYNC ----------------
+
+def expected_5m_timestamp_for_15m(master_candle):
+    """
+    A 15M candle ending at T must use the final 5M candle
+    inside that 15M block.
+
+    Example:
+        15M open 12:45
+        15M close 13:00
+
+        Expected 5M:
+        12:55 -> 13:00
+    """
+    return master_candle["timestamp"] + TF15 - TF5
+
+
+def exact_candle_by_timestamp(candles, timestamp):
+    for candle in candles:
+        if abs(candle["timestamp"] - timestamp) < 1:
+            return candle
+    return None
+
+
+def validate_master_entry_sync(master_candle, entry_candle):
+    if master_candle is None or entry_candle is None:
         return False
-    except Exception as e:
-        log(f"Process lock error: {e}")
+
+    expected_ts = expected_5m_timestamp_for_15m(master_candle)
+
+    if abs(entry_candle["timestamp"] - expected_ts) >= 1:
+        log(
+            "SYNC_MISMATCH "
+            f"15M={master_candle['datetime']} "
+            f"expected_5M_ts={expected_ts} "
+            f"actual_5M={entry_candle['datetime']}"
+        )
         return False
 
-def release_process_lock():
-    global LOCK_HANDLE
-    if LOCK_HANDLE is None:
-        return
-    try:
-        import fcntl
-        fcntl.flock(LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
-    except Exception:
-        pass
-    try:
-        LOCK_HANDLE.close()
-    except Exception:
-        pass
-    LOCK_HANDLE = None
-
-# ---------------- DISCORD ----------------
-
-def repair_mojibake(value):
-    """Repair common UTF-8 -> Latin-1/CP1252 mojibake before Discord send."""
-    if not isinstance(value, str):
-        return value
-
-    # Only attempt repair when typical mojibake markers are present.
-    markers = ("Ã°", "Ã", "Ã", "Ã¢", "Ã Â¸", "Ã Â¹", "Ã¯Â¸")
-    if not any(m in value for m in markers):
-        return value
-
-    for encoding in ("latin1", "cp1252"):
-        try:
-            fixed = value.encode(encoding).decode("utf-8")
-            # Keep the repair only if it removed the common mojibake markers.
-            if sum(value.count(m) for m in markers) > sum(fixed.count(m) for m in markers):
-                return fixed
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            pass
-
-    return value
+    return True
 
 
-def send_discord(message):
-    if not DISCORD_WEBHOOK_URL:
-        log("Discord: webhook not configured")
-        return False
-    try:
-        # Normalize any already-corrupted UTF-8 text first.
-        message = repair_mojibake(str(message))
+# ---------------- SIGNAL ID ----------------
 
-        # Send explicit UTF-8 bytes + charset so no intermediary guesses
-        # Latin-1/ASCII for Thai text or emoji.
-        payload = json.dumps(
-            {"content": message[:1900]},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
+def make_signal_id(
+    symbol,
+    mode,
+    direction,
+    master_candle_ts
+):
+    return (
+        f"{symbol.replace('/', '')}_"
+        f"{mode}_"
+        f"{direction}_"
+        f"{int(master_candle_ts)}"
+    )
 
-        headers = {
-            "Content-Type": "application/json; charset=utf-8",
-            "Accept": "application/json",
+
+# ---------------- MEMORY SCHEMA ----------------
+
+def normalize_memory_payload(data):
+    """
+    V2.2 supports:
+        old V2.1 list
+        new V2.2 dict
+    """
+
+    if isinstance(data, list):
+        return {
+            "schema_version": 1,
+            "history": data,
+            "active_series": [],
+            "sent_signals": {},
         }
 
-        r = requests.post(
-            DISCORD_WEBHOOK_URL,
-            data=payload,
-            headers=headers,
-            timeout=10,
-        )
+    if isinstance(data, dict):
+        return {
+            "schema_version": data.get(
+                "schema_version",
+                MEMORY_SCHEMA_VERSION
+            ),
+            "history": (
+                data.get("history", [])
+                if isinstance(data.get("history", []), list)
+                else []
+            ),
+            "active_series": (
+                data.get("active_series", [])
+                if isinstance(data.get("active_series", []), list)
+                else []
+            ),
+            "sent_signals": (
+                data.get("sent_signals", {})
+                if isinstance(data.get("sent_signals", {}), dict)
+                else {}
+            ),
+        }
 
-        if r.status_code in (200, 204):
-            return True
-        log(f"Discord HTTP {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        log(f"Discord error: {e}")
-    return False
+    return {
+        "schema_version": MEMORY_SCHEMA_VERSION,
+        "history": [],
+        "active_series": [],
+        "sent_signals": {},
+    }
 
-# ---------------- GEMINI ----------------
-
-def init_gemini():
-    global AI_CLIENT, AI_CHAT
-    if genai is None or not GEMINI_API_KEY:
-        log("Gemini OFF")
-        return
-    try:
-        AI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
-        AI_CHAT = AI_CLIENT.chats.create(model=GEMINI_MODEL)
-        log(f"Gemini ready model={GEMINI_MODEL}")
-    except Exception as e:
-        AI_CLIENT = AI_CHAT = None
-        log(f"Gemini init failed: {e}")
-
-def ai_comment(signal):
-    if AI_CHAT is None:
-        return "AI: OFF"
-    prompt = (
-        "ตอบภาษาไทยไม่เกิน 2 บรรทัด ให้เป็นเพียง market-context comment "
-        "ห้ามรับประกันกำไรและห้ามอ้างว่าเป็นคำแนะนำทางการเงิน "
-        f"Pair={signal['symbol']}; Mode={signal['mode']}; "
-        f"Direction={signal['decision']}; 15M_RSI={signal['rsi15']:.1f}; "
-        f"5M_RSI={signal['rsi5']:.1f}; Zone={signal['zone_state']}."
-    )
-    try:
-        response = AI_CHAT.send_message(prompt)
-        text = getattr(response, "text", None)
-        return text.strip()[:400] if text else "AI: no response"
-    except Exception as e:
-        return f"AI unavailable: {str(e)[:100]}"
-
-# ---------------- MEMORY ----------------
 
 def load_memory():
     global HISTORICAL_MEMORY
-    # --- แก้ไขเฉพาะจุดนี้: สร้างโฟลเดอร์รองรับให้อัตโนมัติ ป้องกัน Errno 2 ---
+    global ACTIVE_SERIES
+    global SENT_SIGNALS
+
     dirname = os.path.dirname(os.path.abspath(MEMORY_FILE))
-    if dirname:
-        os.makedirs(dirname, exist_ok=True)
-    # ------------------------------------------------------------------------
+    os.makedirs(dirname, exist_ok=True)
+
     if not os.path.exists(MEMORY_FILE):
         HISTORICAL_MEMORY = []
+        ACTIVE_SERIES = []
+        SENT_SIGNALS = {}
         log(f"Memory new: {MEMORY_FILE}")
         return
+
     try:
         with open(MEMORY_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        HISTORICAL_MEMORY = data if isinstance(data, list) else data.get("history", []) if isinstance(data, dict) else []
-        if not isinstance(HISTORICAL_MEMORY, list):
-            HISTORICAL_MEMORY = []
-        log(f"Memory loaded: {len(HISTORICAL_MEMORY)} records")
+
+        payload = normalize_memory_payload(data)
+
+        HISTORICAL_MEMORY = payload["history"]
+        ACTIVE_SERIES = payload["active_series"]
+        SENT_SIGNALS = payload["sent_signals"]
+
+        log(
+            f"Memory loaded: "
+            f"history={len(HISTORICAL_MEMORY)} "
+            f"active={len(ACTIVE_SERIES)} "
+            f"signals={len(SENT_SIGNALS)}"
+        )
+
     except Exception as e:
         log(f"Memory load error: {e}")
+
         try:
-            backup = f"{MEMORY_FILE}.corrupt.{int(time.time())}"
+            backup = (
+                f"{MEMORY_FILE}.corrupt."
+                f"{int(time.time())}"
+            )
             os.replace(MEMORY_FILE, backup)
             log(f"Corrupt memory backed up: {backup}")
         except Exception:
             pass
+
         HISTORICAL_MEMORY = []
+        ACTIVE_SERIES = []
+        SENT_SIGNALS = {}
+
 
 def save_memory():
+    """
+    Atomic V2.2 state persistence.
+    """
+
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(MEMORY_FILE)), exist_ok=True)
+        dirname = os.path.dirname(
+            os.path.abspath(MEMORY_FILE)
+        )
+        os.makedirs(dirname, exist_ok=True)
+
+        with LOCK:
+            payload = {
+                "schema_version": MEMORY_SCHEMA_VERSION,
+                "history": HISTORICAL_MEMORY,
+                "active_series": ACTIVE_SERIES,
+                "sent_signals": SENT_SIGNALS,
+                "saved_at": thai_text(),
+            }
+
         tmp = MEMORY_FILE + ".tmp"
+
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(HISTORICAL_MEMORY, f, ensure_ascii=False, indent=2)
+            json.dump(
+                payload,
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+            f.flush()
+            os.fsync(f.fileno())
+
         os.replace(tmp, MEMORY_FILE)
+
     except Exception as e:
         log(f"Memory save error: {e}")
 
-# ---------------- DATA ----------------
 
-def parse_timestamp(value):
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        v = float(value)
-        return v / 1000 if v > 10_000_000_000 else v
-    text = str(value).strip()
-    try:
-        return float(text)
-    except Exception:
-        pass
-    try:
-        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
-    except Exception:
-        return None
+# ---------------- STATS REBUILD ----------------
 
-def normalize_candle(raw):
-    if not isinstance(raw, dict):
-        return None
-    ts = parse_timestamp(raw.get("timestamp", raw.get("time", raw.get("datetime", raw.get("date")))))
-    if ts is None:
-        return None
-    def num(*keys):
-        for k in keys:
-            if raw.get(k) is not None:
-                try:
-                    return float(raw[k])
-                except Exception:
-                    return None
-        return None
-    o, h, l, c = num("open", "Open", "o"), num("high", "High", "h"), num("low", "Low", "l"), num("close", "Close", "c")
-    if None in (o, h, l, c) or h < max(o, c) or l > min(o, c):
-        return None
-    return {
-        "datetime": datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-        "timestamp": ts, "open": o, "high": h, "low": l, "close": c,
-    }
+def rebuild_stats_from_memory():
+    global STATS
 
-def normalize_otc_response(data):
-    raw = data.get("candles") or data.get("data") or data.get("results") or data.get("quotes") if isinstance(data, dict) else data
-    if not isinstance(raw, list):
-        return []
-    out = {}
-    for item in raw:
-        c = normalize_candle(item)
-        if c:
-            out[c["timestamp"]] = c
-    return [out[k] for k in sorted(out)]
+    with LOCK:
+        STATS = {
+            "signals": 0,
+            "wins": 0,
+            "losses": 0,
+            "draws": 0,
+            "series_completed": 0,
+            "series_wins": 0,
+            "series_full_loss": 0,
+        }
 
-def clean_dataframe(df):
-    if df is None or df.empty:
-        return None
-    try:
-        df = df.copy()
-        if getattr(df.index, "tz", None) is not None:
-            df.index = df.index.tz_convert("UTC").tz_localize(None)
-        return df.dropna(subset=["Open", "High", "Low", "Close"])
-    except Exception:
-        return df
+        for record in HISTORICAL_MEMORY:
 
-def get_otc_candles(symbol, interval, limit=300):
-    if not OTC_API_URL:
-        return []
-    params = {"symbol": symbol.replace("/", ""), "interval": interval, "limit": limit}
-    if OTC_API_KEY:
-        params["apikey"] = OTC_API_KEY
-    try:
-        r = requests.get(OTC_API_URL, params=params, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        candles = normalize_otc_response(r.json())
-        if candles:
-            return candles
-        log(f"OTC provider: no valid candles for {symbol} {interval}")
-    except Exception as e:
-        log(f"OTC provider error {symbol} {interval}: {e}")
-    return []
-
-def get_yahoo_candles(symbol, interval, period):
-    ticker_symbol = SYMBOL_MAP.get(symbol, symbol)
-    for attempt in range(1, YF_RETRIES + 1):
-        try:
-            df = yf.Ticker(ticker_symbol).history(
-                period=period, interval=interval,
-                auto_adjust=False, prepost=False
-            )
-            df = clean_dataframe(df)
-            if df is None or len(df) < 10:
-                if attempt < YF_RETRIES:
-                    time.sleep(1)
+            if record.get("type") != "SERIES":
                 continue
-            out = []
-            for idx, row in df.iterrows():
-                ts = idx.to_pydatetime()
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                ts = ts.astimezone(timezone.utc)
-                out.append({
-                    "datetime": ts.strftime("%Y-%m-%d %H:%M:%S"),
-                    "timestamp": ts.timestamp(),
-                    "open": float(row["Open"]), "high": float(row["High"]),
-                    "low": float(row["Low"]), "close": float(row["Close"]),
-                })
-            return out
-        except Exception as e:
-            log(f"Yahoo {symbol} {interval} attempt={attempt}: {e}")
-            if attempt < YF_RETRIES:
-                time.sleep(1)
-    return []
 
-def get_candles(symbol, interval, period="5d", limit=300):
-    if mode_now() == "OTC" and OTC_API_URL:
-        otc = get_otc_candles(symbol, interval, limit)
-        if otc:
-            return otc
-        log(f"{symbol} {interval}: OTC empty -> Yahoo proxy fallback")
-    return get_yahoo_candles(symbol, interval, period)
+            STATS["signals"] += 1
 
-def is_closed(candle, interval):
-    return candle["timestamp"] + interval_seconds(interval) <= time.time()
+            STATS["wins"] += int(
+                record.get("wins", 0) or 0
+            )
 
-def closed_only(candles, interval):
-    return [c for c in candles if is_closed(c, interval)]
+            STATS["losses"] += int(
+                record.get("losses", 0) or 0
+            )
 
-def latest_closed(candles, interval):
-    c = closed_only(candles, interval)
-    return c[-1] if c else None
+            STATS["draws"] += int(
+                record.get("draws", 0) or 0
+            )
 
-def five_min_age(candle):
-    return max(0, time.time() - (candle["timestamp"] + TF5))
+            STATS["series_completed"] += 1
 
-def fresh_5m(candle):
-    if candle is None:
-        return False
-    return MAX_DATA_AGE_SECONDS <= 0 or five_min_age(candle) <= MAX_DATA_AGE_SECONDS
+            if record.get("status") == "SERIES_WIN":
+                STATS["series_wins"] += 1
 
-def is_new_closed(symbol, interval, candle):
-    if candle is None:
-        return False
+            if record.get("status") == "FULL_LOSS":
+                STATS["series_full_loss"] += 1
+
+    log(
+        "Stats rebuilt: "
+        f"signals={STATS['signals']} "
+        f"W={STATS['wins']} "
+        f"L={STATS['losses']} "
+        f"D={STATS['draws']}"
+    )
+
+
+# ---------------- PERSISTENT SERIES ----------------
+
+def persist_state():
+    save_memory()
+
+
+def create_series(signal):
+
+    signal_id = make_signal_id(
+        signal["symbol"],
+        signal["mode"],
+        signal["decision"],
+        signal["master_candle_ts"],
+    )
+
     with LOCK:
-        old = LAST_CLOSED[interval].get(symbol)
-    return old is None or candle["timestamp"] > old
 
-def mark_closed(symbol, interval, candle):
-    if candle:
-        with LOCK:
-            LAST_CLOSED[interval][symbol] = candle["timestamp"]
+        if (
+            len(ACTIVE_SERIES)
+            >= MAX_ACTIVE_SERIES
+        ):
+            return None
 
-def stale_log(symbol, interval, candle):
-    stamp = candle["timestamp"] if candle else None
-    key = (symbol, interval, stamp)
-    if time.time() - LAST_STALE_LOG.get(key, 0) < 300:
-        return
-    LAST_STALE_LOG[key] = time.time()
-    if candle:
-        log(f"{symbol} {interval}: STALE DATA last={candle['datetime']} UTC age={five_min_age(candle)/60:.1f}m")
-    else:
-        log(f"{symbol} {interval}: NO CLOSED CANDLE")
+        if any(
+            s["symbol"] == signal["symbol"]
+            for s in ACTIVE_SERIES
+        ):
+            return None
 
-# ---------------- INDICATORS ----------------
+        tracker = {
+            "type": "ACTIVE_SERIES",
 
-def ema(values, period):
-    if len(values) < period:
-        return None
-    k = 2 / (period + 1)
-    value = sum(values[:period]) / period
-    for x in values[period:]:
-        value = (x - value) * k + value
-    return value
+            "series_id": signal_id,
+            "signal_id": signal_id,
 
-def rsi_wilder(values, period=14):
-    if len(values) < period + 1:
-        return None
-    gains, losses = [], []
-    for i in range(1, len(values)):
-        d = values[i] - values[i - 1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    ag, al = sum(gains[:period]) / period, sum(losses[:period]) / period
-    for i in range(period, len(gains)):
-        ag = ((ag * (period - 1)) + gains[i]) / period
-        al = ((al * (period - 1)) + losses[i]) / period
-    if al == 0:
-        return 100.0
-    rs = ag / al
-    return 100 - 100 / (1 + rs)
+            "schema_version":
+                MEMORY_SCHEMA_VERSION,
 
-def atr(candles, period=14):
-    if len(candles) < period + 1:
-        return None
-    trs = []
-    for i in range(1, len(candles)):
-        c, p = candles[i], candles[i - 1]
-        trs.append(max(c["high"] - c["low"], abs(c["high"] - p["close"]), abs(c["low"] - p["close"])))
-    return sum(trs[-period:]) / period
+            "symbol": signal["symbol"],
+            "mode": signal["mode"],
+            "data_source": signal["data_source"],
 
-def candle_features(c0, c1):
-    body = abs(c0["close"] - c0["open"])
-    rng = max(c0["high"] - c0["low"], 1e-12)
-    upper = c0["high"] - max(c0["open"], c0["close"])
-    lower = min(c0["open"], c0["close"]) - c0["low"]
-    ratio = body / rng
-    return {
-        "strong_bull": c0["close"] > c0["open"] and ratio >= .65,
-        "strong_bear": c0["close"] < c0["open"] and ratio >= .65,
-        "hammer": lower >= body * 2 and upper <= rng * .25 and ratio <= .45,
-        "shooting_star": upper >= body * 2 and lower <= rng * .25 and ratio <= .45,
-        "bull_engulf": c0["close"] > c0["open"] and c1["close"] < c1["open"] and c0["open"] <= c1["close"] and c0["close"] >= c1["open"] and body > abs(c1["close"] - c1["open"]),
-        "bear_engulf": c0["close"] < c0["open"] and c1["close"] > c1["open"] and c0["open"] >= c1["close"] and c0["close"] <= c1["open"] and body > abs(c1["close"] - c1["open"]),
-    }
+            "master_direction":
+                signal["decision"],
 
-# ---------------- ZONES ----------------
+            "setup_strength":
+                signal["setup_strength"],
 
-def build_zones(candles, lookback=240):
-    if len(candles) < 30:
-        return []
-    data = candles[-lookback:]
-    zones = []
-    for i in range(2, len(data) - 2):
-        h, l = data[i]["high"], data[i]["low"]
-        if all(h >= data[j]["high"] for j in range(i - 2, i + 3) if j != i):
-            zones.append({"type": "RESISTANCE", "price": h, "timestamp": data[i]["timestamp"]})
-        if all(l <= data[j]["low"] for j in range(i - 2, i + 3) if j != i):
-            zones.append({"type": "SUPPORT", "price": l, "timestamp": data[i]["timestamp"]})
-    return zones
+            "entry_context":
+                signal["entry_context"],
 
-def zone_analysis(candles, price, direction):
-    a = atr(candles, 14)
-    if not a or a <= 0:
-        return {"state": "NONE", "score": 0, "level": None}
-    zones = build_zones(candles)
-    tol = a * .35
-    candidates = [(abs(price - z["price"]), z) for z in zones if abs(price - z["price"]) <= tol]
-    if not candidates:
-        return {"state": "NONE", "score": 0, "level": None}
-    candidates.sort(key=lambda x: x[0])
-    dist, nearest = candidates[0]
-    recent = candles[-12:]
-    above = any(c["close"] > nearest["price"] + tol * .15 for c in recent[:-2])
-    below = any(c["close"] < nearest["price"] - tol * .15 for c in recent[:-2])
-    state, score = nearest["type"], 10
-    if nearest["type"] == "RESISTANCE":
-        if direction == "PUT":
-            score += 15
-        if above and price < nearest["price"]:
-            state, score = "FLIPPED_RESISTANCE", score + 20
-    if nearest["type"] == "SUPPORT":
-        if direction == "CALL":
-            score += 15
-        if below and price > nearest["price"]:
-            state, score = "FLIPPED_SUPPORT", score + 20
-    if dist <= tol * .5:
-        score += 10
-    return {"state": state, "score": min(score, 45), "level": nearest["price"]}
+            "zone_state":
+                signal["zone_state"],
 
-# ---------------- 15M MASTER ----------------
+            "zone_level":
+                signal["zone_level"],
 
-def analyze_15m(candles):
-    if len(candles) < 80:
-        return None
-    c0, c1 = candles[-1], candles[-2]
-    closes = [c["close"] for c in candles]
-    e20, e50, rsi, a = ema(closes, 20), ema(closes, 50), rsi_wilder(closes), atr(candles)
-    if None in (e20, e50, rsi, a):
-        return None
-    price = c0["close"]
-    p = candle_features(c0, c1)
-    call = put = 0
-    rc, rp = [], []
-    if price > e20: call += 15; rc.append("price>EMA20")
-    else: put += 15; rp.append("price<EMA20")
-    if price > e50: call += 20; rc.append("price>EMA50")
-    else: put += 20; rp.append("price<EMA50")
-    if e20 > e50: call += 10; rc.append("EMA20>EMA50")
-    else: put += 10; rp.append("EMA20<EMA50")
-    if 50 <= rsi <= 68: call += 8; rc.append(f"RSI={rsi:.1f}")
-    if 32 <= rsi < 50: put += 8; rp.append(f"RSI={rsi:.1f}")
-    if p["strong_bull"] or p["hammer"] or p["bull_engulf"]: call += 12; rc.append("bullish-candle")
-    if p["strong_bear"] or p["shooting_star"] or p["bear_engulf"]: put += 12; rp.append("bearish-candle")
-    zc, zp = zone_analysis(candles, price, "CALL"), zone_analysis(candles, price, "PUT")
-    call += zc["score"]; put += zp["score"]
-    if zc["score"] > 10: rc.append(f"ZONE={zc['state']}")
-    if zp["score"] > 10: rp.append(f"ZONE={zp['state']}")
-    if call > put and call >= 58:
-        decision, strength, reasons, zone = "CALL", min(99, call), rc, zc
-    elif put > call and put >= 58:
-        decision, strength, reasons, zone = "PUT", min(99, put), rp, zp
-    else:
-        return None
-    return {
-        "decision": decision, "setup_strength": strength, "price": price, "atr": a,
-        "rsi": rsi, "zone_state": zone["state"], "zone_level": zone["level"],
-        "reasons": " | ".join(reasons), "candle_time": c0["datetime"], "candle_ts": c0["timestamp"],
-    }
+            "master_candle_ts":
+                signal["master_candle_ts"],
 
-# ---------------- 5M CONTEXT ----------------
+            "signal_time":
+                signal["created_at"],
 
-def analyze_5m(candles, master_direction):
-    if len(candles) < 70:
-        return None
-    c0, c1 = candles[-1], candles[-2]
-    closes = [c["close"] for c in candles]
-    e20, e50, rsi = ema(closes, 20), ema(closes, 50), rsi_wilder(closes)
-    if None in (e20, e50, rsi):
-        return None
-    p = candle_features(c0, c1)
-    call = put = 0
-    rc, rp = [], []
-    if c0["close"] > e20: call += 15; rc.append("5M>EMA20")
-    else: put += 15; rp.append("5M<EMA20")
-    if c0["close"] > e50: call += 10; rc.append("5M>EMA50")
-    else: put += 10; rp.append("5M<EMA50")
-    if rsi > 50: call += 8; rc.append(f"RSI={rsi:.1f}")
-    else: put += 8; rp.append(f"RSI={rsi:.1f}")
-    if p["strong_bull"] or p["bull_engulf"] or p["hammer"]: call += 15; rc.append("bullish-candle")
-    if p["strong_bear"] or p["bear_engulf"] or p["shooting_star"]: put += 15; rp.append("bearish-candle")
-    if master_direction == "CALL": call += 12; rc.append("15M-master-CALL")
-    else: put += 12; rp.append("15M-master-PUT")
-    if call > put: decision, score, reasons = "CALL", min(99, call), rc
-    elif put > call: decision, score, reasons = "PUT", min(99, put), rp
-    else: decision, score, reasons = "UNKNOWN", 50, ["balanced"]
-    return {"decision": decision, "score": score, "rsi": rsi, "candle_time": c0["datetime"], "candle_ts": c0["timestamp"], "reasons": " | ".join(reasons)}
+            "signal_ts":
+                signal["signal_ts"],
 
-# ---------------- HISTORY ----------------
+            "state":
+                "WAITING_RESULT",
 
-def setup_signature(symbol, mode, direction, zone_state):
-    return symbol, mode, direction, zone_state
+            "opportunity": 1,
 
-def historical_stats(signature):
-    with LOCK:
-        records = [
-            r for r in HISTORICAL_MEMORY
-            if r.get("type") == "SERIES"
-            and setup_signature(r.get("symbol"), r.get("mode"), r.get("decision"), r.get("zone_state")) == signature
-        ]
-    total = len(records)
-    sw = sum(r.get("status") == "SERIES_WIN" for r in records)
-    fw = sum(r.get("first_opportunity_result") == "WIN" for r in records)
-    if total >= MIN_HISTORY_FOR_RATE:
-        return {"samples": total, "series_win_rate": round(sw / total * 100, 1), "first_win_rate": round(fw / total * 100, 1), "confidence": "USABLE"}
-    return {"samples": total, "series_win_rate": None, "first_win_rate": None, "confidence": "INSUFFICIENT_DATA"}
+            "next_entry_ts":
+                signal["next_open_ts"],
 
-# ---------------- SERIES / COOLDOWN ----------------
+            "next_close_ts":
+                signal["next_close_ts"],
 
-def active_series_count():
-    with LOCK:
-        return len(ACTIVE_SERIES)
+            "wins": 0,
+            "losses": 0,
+            "draws": 0,
 
-def has_active_series(symbol):
-    with LOCK:
-        return any(s["symbol"] == symbol for s in ACTIVE_SERIES)
+            "first_opportunity_result":
+                None,
 
-def cleanup_signal_cache():
-    cutoff = time.time() - SIGNAL_COOLDOWN_SECONDS * 3
-    with LOCK:
-        for key in [k for k, ts in SENT_SIGNALS.items() if ts < cutoff]:
-            SENT_SIGNALS.pop(key, None)
+            "processed_5m": [],
 
-def signal_recently_sent(key):
-    with LOCK:
-        ts = SENT_SIGNALS.get(key)
-    return ts is not None and time.time() - ts < SIGNAL_COOLDOWN_SECONDS
+            "max_mfe": 0.0,
+            "max_mae": 0.0,
+        }
 
-def remember_signal(key):
-    with LOCK:
-        SENT_SIGNALS[key] = time.time()
+        ACTIVE_SERIES.append(tracker)
 
-# ---------------- SIGNAL ----------------
+        STATS["signals"] += 1
+
+    persist_state()
+
+    return tracker
+
+
+# ---------------- V2.2 SCAN CORE ----------------
 
 def scan_symbol(symbol):
-    c15 = closed_only(get_candles(symbol, "15m", "5d", 300), "15m")
+
+    source = get_data_source_mode()
+
+    c15 = closed_only(
+        get_candles(
+            symbol,
+            "15m",
+            "5d",
+            300
+        ),
+        "15m"
+    )
+
     if len(c15) < 80:
         return None
+
     master_candle = c15[-1]
 
-    # Important: first observation is seeded, not emitted as a signal.
-    if not is_new_closed(symbol, "15m", master_candle):
+    if not fresh_candle(
+        master_candle,
+        "15m"
+    ):
+        stale_log(
+            symbol,
+            "15m",
+            master_candle
+        )
         return None
 
-    c5 = closed_only(get_candles(symbol, "5m", "5d", 500), "5m")
+    if not is_new_closed(
+        symbol,
+        "15m",
+        master_candle
+    ):
+        return None
+
+    c5 = closed_only(
+        get_candles(
+            symbol,
+            "5m",
+            "5d",
+            500
+        ),
+        "5m"
+    )
+
     if len(c5) < 70:
         return None
-    latest5 = c5[-1]
 
-    if not fresh_5m(latest5):
-        stale_log(symbol, "5m", latest5)
+    expected_5m_ts = (
+        expected_5m_timestamp_for_15m(
+            master_candle
+        )
+    )
+
+    latest5 = exact_candle_by_timestamp(
+        c5,
+        expected_5m_ts
+    )
+
+    if latest5 is None:
+        log(
+            f"{symbol}: expected 5M candle missing "
+            f"for 15M {master_candle['datetime']}"
+        )
         return None
 
-    if not is_new_closed(symbol, "5m", latest5):
+    if not fresh_candle(
+        latest5,
+        "5m"
+    ):
+        stale_log(
+            symbol,
+            "5m",
+            latest5
+        )
+        return None
+
+    if not validate_master_entry_sync(
+        master_candle,
+        latest5
+    ):
         return None
 
     master = analyze_15m(c15)
+
     if not master:
         return None
 
-    timing = analyze_5m(c5, master["decision"])
+    timing = analyze_5m(
+        c5,
+        master["decision"]
+    )
+
     if not timing:
         return None
 
-    context = "5M_CONFIRM" if timing["decision"] == master["decision"] else "5M_UNKNOWN" if timing["decision"] == "UNKNOWN" else "5M_PULLBACK"
+    context = (
+        "5M_CONFIRM"
+        if timing["decision"] ==
+           master["decision"]
+        else
+        "5M_PULLBACK"
+        if timing["decision"] != "UNKNOWN"
+        else
+        "5M_UNKNOWN"
+    )
+
     if master["setup_strength"] < 62:
         return None
 
     mode = mode_now()
-    hist = historical_stats(setup_signature(symbol, mode, master["decision"], master["zone_state"]))
-    next_open_ts = latest5["timestamp"] + TF5
-    next_close_ts = next_open_ts + TF5
 
-    # Seed only after all checks pass.
-    mark_closed(symbol, "15m", master_candle)
-    mark_closed(symbol, "5m", latest5)
-
-    return {
-        "symbol": symbol, "mode": mode, "decision": master["decision"],
-        "setup_strength": round(master["setup_strength"], 1),
-        "rsi15": master["rsi"], "rsi5": timing["rsi"],
-        "entry_score": timing["score"], "entry_context": context,
-        "zone_state": master["zone_state"], "zone_level": master["zone_level"],
-        "price": master["price"], "atr": master["atr"],
-        "reasons15": master["reasons"], "reasons5": timing["reasons"],
-        "signal_candle15": master["candle_time"], "last_closed_5m": latest5["datetime"],
-        "signal_ts": time.time(), "next_open_ts": next_open_ts, "next_close_ts": next_close_ts,
-        "history": hist, "created_at": thai_text(),
-    }
-
-def create_series(signal):
-    with LOCK:
-        if len(ACTIVE_SERIES) >= MAX_ACTIVE_SERIES or any(s["symbol"] == signal["symbol"] for s in ACTIVE_SERIES):
-            return None
-        tracker = {
-            "type": "ACTIVE_SERIES",
-            "series_id": f"{signal['symbol'].replace('/','')}_{int(signal['signal_ts'])}",
-            "symbol": signal["symbol"], "mode": signal["mode"],
-            "master_direction": signal["decision"], "setup_strength": signal["setup_strength"],
-            "entry_context": signal["entry_context"], "zone_state": signal["zone_state"],
-            "zone_level": signal["zone_level"], "signal_time": signal["created_at"],
-            "signal_ts": signal["signal_ts"], "next_entry_ts": signal["next_open_ts"],
-            "next_close_ts": signal["next_close_ts"], "opportunity": 1,
-            "wins": 0, "losses": 0, "draws": 0, "first_opportunity_result": None,
-            "processed_5m": [], "max_mfe": 0.0, "max_mae": 0.0,
-        }
-        ACTIVE_SERIES.append(tracker)
-        STATS["signals"] += 1
-        return tracker
-
-# ---------------- OPP ENGINE ----------------
-
-def exact_entry_candle(candles, entry_ts):
-    # Exact timestamp only: no >= fallback.
-    for c in candles:
-        if abs(c["timestamp"] - entry_ts) < 1:
-            return c if is_closed(c, "5m") else None
-    return None
-
-def evaluate_opportunity(tracker):
-    candles = closed_only(get_candles(tracker["symbol"], "5m", "2d", 200), "5m")
-    if len(candles) < 20:
-        return None
-    c = exact_entry_candle(candles, tracker["next_entry_ts"])
-    if c is None or c["datetime"] in tracker["processed_5m"]:
-        return None
-
-    entry, close, direction = c["open"], c["close"], tracker["master_direction"]
-    if close > entry:
-        result = "WIN" if direction == "CALL" else "LOSS"
-    elif close < entry:
-        result = "WIN" if direction == "PUT" else "LOSS"
-    else:
-        result = "DRAW"
-
-    if direction == "CALL":
-        mfe, mae = c["high"] - entry, entry - c["low"]
-    else:
-        mfe, mae = entry - c["low"], c["high"] - entry
-
-    return {
-        "result": result, "candle": c, "entry_price": entry, "close_price": close,
-        "mfe": max(0, mfe), "mae": max(0, mae),
-    }
-
-def record_opportunity(tracker, outcome):
-    tracker["processed_5m"].append(outcome["candle"]["datetime"])
-    tracker["max_mfe"] = max(tracker["max_mfe"], outcome["mfe"])
-    tracker["max_mae"] = max(tracker["max_mae"], outcome["mae"])
-    result = outcome["result"]
-    with LOCK:
-        if result == "WIN":
-            tracker["wins"] += 1; STATS["wins"] += 1
-        elif result == "LOSS":
-            tracker["losses"] += 1; STATS["losses"] += 1
-        else:
-            tracker["draws"] += 1; STATS["draws"] += 1
-    if tracker["opportunity"] == 1:
-        tracker["first_opportunity_result"] = result
-    return result
-
-# ---------------- FINALIZE ----------------
-
-def finalize_series(tracker, status):
-    record = {
-        "type": "SERIES", "series_id": tracker["series_id"], "symbol": tracker["symbol"],
-        "mode": tracker["mode"], "decision": tracker["master_direction"],
-        "setup_strength": tracker["setup_strength"], "entry_context": tracker["entry_context"],
-        "zone_state": tracker["zone_state"], "zone_level": tracker["zone_level"],
-        "signal_time": tracker["signal_time"], "status": status,
-        "wins": tracker["wins"], "losses": tracker["losses"], "draws": tracker["draws"],
-        "opportunities_used": tracker["opportunity"],
-        "first_opportunity_result": tracker["first_opportunity_result"],
-        "max_mfe": tracker["max_mfe"], "max_mae": tracker["max_mae"], "recorded_at": thai_text(),
-    }
-    with LOCK:
-        HISTORICAL_MEMORY.append(record)
-        STATS["series_completed"] += 1
-        if status == "SERIES_WIN": STATS["series_wins"] += 1
-        if status == "FULL_LOSS": STATS["series_full_loss"] += 1
-    save_memory()
-    h = historical_stats(setup_signature(tracker["symbol"], tracker["mode"], tracker["master_direction"], tracker["zone_state"]))
-    rate = f"{h['series_win_rate']}%" if h["series_win_rate"] is not None else "INSUFFICIENT_DATA"
-    icon = "🟢" if status == "SERIES_WIN" else "🔴"
-    send_discord(
-        f"{icon} **[TRADEIFY SERIES COMPLETE V2.1]**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 คู่: **{tracker['symbol']}**\n🌐 Mode: **{tracker['mode']}**\n"
-        f"📌 Direction: **{tracker['master_direction']}**\n🏁 Status: **{status}**\n"
-        f"🎯 WIN: **{tracker['wins']}**\n❌ LOSS: **{tracker['losses']}**\n➖ DRAW: **{tracker['draws']}**\n"
-        f"🔢 Opportunities: **{tracker['opportunity']}/3**\n"
-        f"📈 Historical Series Win Rate: **{rate}**\n📚 Samples: **{h['samples']}**\n"
-        f"🧩 Zone: **{tracker['zone_state']}**\n🕐 เวลาไทย: **{thai_text()}**"
+    hist = historical_stats(
+        setup_signature(
+            symbol,
+            mode,
+            master["decision"],
+            master["zone_state"]
+        )
     )
 
-# ---------------- TRACKER ----------------
+    next_open_ts = (
+        latest5["timestamp"] + TF5
+    )
 
-def tracker_loop():
-    while True:
-        try:
-            with LOCK:
-                trackers = list(ACTIVE_SERIES)
-            for tracker in trackers:
-                outcome = evaluate_opportunity(tracker)
-                if outcome is None:
-                    continue
-                result = record_opportunity(tracker, outcome)
-                c = outcome["candle"]
-                icon = "🟢" if result == "WIN" else "🔴" if result == "LOSS" else "🟡"
-                send_discord(
-                    f"{icon} **[TRADEIFY 5M RESULT V2.1]**\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n🪙 **{tracker['symbol']}**\n"
-                    f"🌐 Mode: **{tracker['mode']}**\n📌 Master: **{tracker['master_direction']}**\n"
-                    f"🎯 OPP: **{tracker['opportunity']}/3**\n🏁 Result: **{result}**\n"
-                    f"💰 Entry: **{outcome['entry_price']:.8f}**\n🔚 Close: **{outcome['close_price']:.8f}**\n"
-                    f"🕐 Candle UTC: **{c['datetime']}**\n🇹🇭 เวลาแจ้ง: **{thai_text()}**\n"
-                    f"📈 MFE: **{outcome['mfe']:.8f}**\n📉 MAE: **{outcome['mae']:.8f}**\n"
-                    f"⚠️ ตัดผลหลังแท่ง 5M ปิดแล้วเท่านั้น"
-                )
-                if result == "WIN" or tracker["opportunity"] >= MAX_OPPORTUNITIES:
-                    status = "SERIES_WIN" if result == "WIN" else "FULL_LOSS"
-                    finalize_series(tracker, status)
-                    with LOCK:
-                        if tracker in ACTIVE_SERIES:
-                            ACTIVE_SERIES.remove(tracker)
-                else:
-                    tracker["opportunity"] += 1
-                    tracker["next_entry_ts"] = c["timestamp"] + TF5
-                    tracker["next_close_ts"] = tracker["next_entry_ts"] + TF5
-                    dt1, dt2 = utc_to_thai(tracker["next_entry_ts"]), utc_to_thai(tracker["next_close_ts"])
-                    send_discord(
-                        f"🔄 **[TRADEIFY NEXT OPPORTUNITY V2.1]**\n"
-                        f"🪙 {tracker['symbol']}\n🌐 Mode: {tracker['mode']}\n"
-                        f"📌 Direction เดิม: **{tracker['master_direction']}**\n"
-                        f"🎯 OPP: **{tracker['opportunity']}/3**\n"
-                        f"⏰ เข้า: **{thai_hm(dt1)} น.**\n🔚 ปิด: **{thai_hm(dt2)} น.**\n"
-                        f"⚠️ exact 5M candle เท่านั้น"
-                    )
-        except Exception as e:
-            log(f"Tracker error: {e}")
-        time.sleep(10)
+    next_close_ts = (
+        next_open_ts + TF5
+    )
 
-# ---------------- SCANNER ----------------
+    mark_closed(
+        symbol,
+        "15m",
+        master_candle
+    )
 
-def scanner_loop():
-    while True:
-        try:
-            cleanup_signal_cache()
-            if active_series_count() >= MAX_ACTIVE_SERIES:
-                log(f"Scanner paused: active series {active_series_count()}/{MAX_ACTIVE_SERIES}")
-                time.sleep(SCAN_SECONDS)
-                continue
+    mark_closed(
+        symbol,
+        "5m",
+        latest5
+    )
 
-            best = []
-            for symbol in SYMBOLS:
-                if has_active_series(symbol):
-                    continue
-                try:
-                    s = scan_symbol(symbol)
-                    if s:
-                        best.append(s)
-                except Exception as e:
-                    log(f"Scanner {symbol}: {e}")
+    signal_id = make_signal_id(
+        symbol,
+        mode,
+        master["decision"],
+        master_candle["timestamp"]
+    )
 
-            best.sort(key=lambda x: x["setup_strength"], reverse=True)
-            created = 0
-            for s in best:
-                if active_series_count() >= MAX_ACTIVE_SERIES:
-                    break
-                key = (s["symbol"], s["mode"], s["decision"], s["signal_candle15"])
-                if signal_recently_sent(key) or has_active_series(s["symbol"]):
-                    continue
-                remember_signal(key)
-                tracker = create_series(s)
-                if tracker is None:
-                    continue
+    return {
+        "signal_id": signal_id,
 
-                h = s["history"]
-                sr = f"{h['series_win_rate']}%" if h["series_win_rate"] is not None else "INSUFFICIENT_DATA"
-                fr = f"{h['first_win_rate']}%" if h["first_win_rate"] is not None else "INSUFFICIENT_DATA"
-                d1, d2 = utc_to_thai(s["next_open_ts"]), utc_to_thai(s["next_close_ts"])
-                ai = ai_comment(s)
-                icon = "🟢" if s["decision"] == "CALL" else "🔴"
+        "symbol": symbol,
+        "mode": mode,
+        "data_source": source,
 
-                send_discord(
-                    f"🚨 **[TRADEIFY SIGNAL V2.1]**\n━━━━━━━━━━━━━━━━━━━━\n"
-                    f"⏱️ TF: **5M**\n🪙 คู่: **{s['symbol']}**\n\n"
-                    f"⭐ **เตือนเวลา {thai_hm()} น.** ⭐\n🇹🇭 เวลาไทย\n\n"
-                    f"🌐 Mode: **{s['mode']}**\n📌 Direction: **{s['decision']}** {icon}\n"
-                    f"🟢 **เตรียมซื้อแท่งหน้า**\n\n"
-                    f"📊 SETUP STRENGTH: **{s['setup_strength']}/100**\n"
-                    f"📈 15M RSI: **{s['rsi15']:.1f}**\n📉 5M RSI: **{s['rsi5']:.1f}**\n"
-                    f"⏱️ 5M Context: **{s['entry_context']}**\n🧩 Zone: **{s['zone_state']}**\n\n"
-                    f"📚 HISTORICAL\n• Samples: **{h['samples']}**\n• Series Win Rate: **{sr}**\n• First Entry Win Rate: **{fr}**\n\n"
-                    f"🎯 Opportunity: **1/3**\n⏰ เข้าแท่ง: **{thai_hm(d1)} น.**\n🔚 ปิดแท่ง: **{thai_hm(d2)} น.**\n\n"
-                    f"🔍 15M: {s['reasons15']}\n🔍 5M: {s['reasons5']}\n🤖 {ai}\n\n"
-                    f"⚠️ **ผล WIN/LOSS ตัดสินหลังแท่ง 5M ปิดเท่านั้น**\n"
-                    f"🕐 Signal: **{s['created_at']}**\n🔒 Active Series: **{active_series_count()}/{MAX_ACTIVE_SERIES}**"
-                )
-                log(f"NEW {s['symbol']} {s['decision']} mode={s['mode']} strength={s['setup_strength']} active={active_series_count()}/{MAX_ACTIVE_SERIES}")
-                created += 1
-                if created >= MAX_NEW_SIGNALS_PER_SCAN:
-                    break
-        except Exception as e:
-            log(f"Scanner loop error: {e}")
-        time.sleep(SCAN_SECONDS)
+        "decision":
+            master["decision"],
 
-# ---------------- STATUS / HEALTH ----------------
+        "setup_strength":
+            round(
+                master["setup_strength"],
+                1
+            ),
 
-def calculate_stats():
+        "rsi15": master["rsi"],
+        "rsi5": timing["rsi"],
+
+        "entry_score":
+            timing["score"],
+
+        "entry_context": context,
+
+        "zone_state":
+            master["zone_state"],
+
+        "zone_level":
+            master["zone_level"],
+
+        "price": master["price"],
+        "atr": master["atr"],
+
+        "reasons15":
+            master["reasons"],
+
+        "reasons5":
+            timing["reasons"],
+
+        "signal_candle15":
+            master["candle_time"],
+
+        "master_candle_ts":
+            master_candle["timestamp"],
+
+        "last_closed_5m":
+            latest5["datetime"],
+
+        "last_closed_5m_ts":
+            latest5["timestamp"],
+
+        "signal_ts":
+            time.time(),
+
+        "next_open_ts":
+            next_open_ts,
+
+        "next_close_ts":
+            next_close_ts,
+
+        "history": hist,
+
+        "created_at":
+            thai_text(),
+    }
+
+
+# ---------------- TRACKER RESULT ----------------
+
+def record_opportunity(tracker, outcome):
+
+    tracker["processed_5m"].append(
+        outcome["candle"]["datetime"]
+    )
+
+    tracker["max_mfe"] = max(
+        tracker["max_mfe"],
+        outcome["mfe"]
+    )
+
+    tracker["max_mae"] = max(
+        tracker["max_mae"],
+        outcome["mae"]
+    )
+
+    result = outcome["result"]
+
     with LOCK:
-        total = STATS["wins"] + STATS["losses"] + STATS["draws"]
-        return {
-            **STATS,
-            "total_opportunities": total,
-            "win_rate": round(STATS["wins"] / total * 100, 2) if total else None,
-            "active_series": len(ACTIVE_SERIES),
-            "memory_records": len(HISTORICAL_MEMORY),
-        }
 
-def latest_snapshot():
-    with LOCK:
-        return {
-            symbol: {
-                "5m": LAST_CLOSED["5m"].get(symbol),
-                "15m": LAST_CLOSED["15m"].get(symbol),
-            }
-            for symbol in SYMBOLS
-        }
+        if result == "WIN":
+            tracker["wins"] += 1
+            STATS["wins"] += 1
 
-def reporter_loop():
-    while True:
-        try:
-            s = calculate_stats()
-            wr = f"{s['win_rate']}%" if s["win_rate"] is not None else "NO_DATA"
-            lines = []
-            for symbol, d in latest_snapshot().items():
-                t = datetime.fromtimestamp(d["5m"], timezone.utc).strftime("%H:%M:%S UTC") if d["5m"] else "-"
-                lines.append(f"{symbol}: 5M={t}")
-            send_discord(
-                f"📊 **[TRADEIFY STATUS V2.1]**\n━━━━━━━━━━━━━━━━━━━━\n"
-                f"🇹🇭 เวลาไทย: **{thai_text()}**\n🌐 Mode: **{mode_now()}**\n"
-                f"📢 Signals: **{s['signals']}**\n🟢 WIN: **{s['wins']}**\n🔴 LOSS: **{s['losses']}**\n🟡 DRAW: **{s['draws']}**\n"
-                f"📈 Opportunity Win Rate: **{wr}**\n🏁 Series Complete: **{s['series_completed']}**\n"
-                f"🟢 Series Win: **{s['series_wins']}**\n🔴 Full Loss: **{s['series_full_loss']}**\n"
-                f"🔄 Active Series: **{s['active_series']}/{MAX_ACTIVE_SERIES}**\n💾 Memory: **{s['memory_records']}**\n\n"
-                f"🕐 Latest closed 5M:\n" + "\n".join(lines) +
-                f"\n\n📡 OTC API: **{'CONFIGURED' if OTC_API_URL else 'NOT CONFIGURED'}**"
-            )
-        except Exception as e:
-            log(f"Reporter error: {e}")
-        time.sleep(REPORT_SECONDS)
+        elif result == "LOSS":
+            tracker["losses"] += 1
+            STATS["losses"] += 1
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path not in ("/", "/health", "/status"):
-            self.send_response(404); self.end_headers(); return
-        s = calculate_stats()
-        snap = latest_snapshot()
-        body = {
-            "status": "running", "version": "V2.1", "pid": os.getpid(),
-            "time_thai": thai_text(), "mode": mode_now(), "symbols": SYMBOLS,
-            "active_series": s["active_series"], "max_active_series": MAX_ACTIVE_SERIES,
-            "memory_records": s["memory_records"], "wins": s["wins"], "losses": s["losses"],
-            "draws": s["draws"], "win_rate": s["win_rate"],
-            "otc_api_configured": bool(OTC_API_URL),
-            "latest_closed_5m": {
-                k: datetime.fromtimestamp(v["5m"], timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if v["5m"] else None
-                for k, v in snap.items()
-            },
-        }
-        raw = json.dumps(body, ensure_ascii=False, indent=2).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-    def log_message(self, format, *args):
-        return
+        else:
+            tracker["draws"] += 1
+            STATS["draws"] += 1
 
-def run_health_server():
-    try:
-        HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
-    except Exception as e:
-        log(f"Health server error: {e}")
+        if tracker["opportunity"] == 1:
+            tracker["first_opportunity_result"] = result
+
+    persist_state()
+
+    return result
+
 
 # ---------------- STARTUP ----------------
 
-def startup_message():
-    send_discord(
-        f"🚀 **[TRADEIFY V2.1 STARTED]**\n━━━━━━━━━━━━━━━━━━━━\n"
-        f"🇹🇭 เวลาไทย: **{thai_text()}**\n🌐 Mode: **{mode_now()}**\n"
-        f"⏱️ Master: **15M closed candle**\n🎯 Entry/Result: **5M closed candle**\n"
-        f"🔢 Opportunities: **1–3**\n🔒 Max Active Series: **{MAX_ACTIVE_SERIES}**\n"
-        f"⏳ Cooldown: **{SIGNAL_COOLDOWN_SECONDS}s**\n💾 Memory: **ON**\n"
-        f"📡 Symbols: **{len(SYMBOLS)}**\n🤖 Gemini: **{GEMINI_MODEL if AI_CHAT else 'OFF'}**\n"
-        f"📡 OTC API: **{'ON' if OTC_API_URL else 'OFF'}**\n\n"
-        f"⚠️ OTC API OFF: ใช้ Yahoo public FX proxy เป็นแหล่งข้อมูลสำรอง และห้ามสร้าง signal จากข้อมูลเก่า"
-    )
-
-def main():
-    log("=" * 70)
-    log("TRADEIFY 15M + 5M + 3 OPPORTUNITIES — V2.1")
-    log("=" * 70)
-    log(f"Python process started | PID={os.getpid()}")
-    log(f"Mode: {mode_now()}")
-    log(f"Memory: {MEMORY_FILE}")
-    log(f"Max active series: {MAX_ACTIVE_SERIES}")
-    log(f"Symbols: {', '.join(SYMBOLS)}")
-    log(f"OTC API: {'CONFIGURED' if OTC_API_URL else 'NOT CONFIGURED'}")
-
-    if not acquire_process_lock():
-        sys.exit(1)
+def startup_restore():
 
     load_memory()
-    init_gemini()
 
-    Thread(target=run_health_server, daemon=True).start()
-    Thread(target=tracker_loop, daemon=True).start()
-    Thread(target=scanner_loop, daemon=True).start()
-    Thread(target=reporter_loop, daemon=True).start()
+    rebuild_stats_from_memory()
 
-    startup_message()
-    log("=" * 70)
+    now = time.time()
 
-    while True:
-        try:
-            time.sleep(60)
-        except KeyboardInterrupt:
-            log("Stopping...")
-            break
+    with LOCK:
 
-if __name__ == "__main__":
-    main()
+        valid = []
+
+        for tracker in ACTIVE_SERIES:
+
+            if tracker.get(
+                "type"
+            ) != "ACTIVE_SERIES":
+                continue
+
+            # Never restore a malformed tracker.
+            required = (
+                "series_id",
+                "symbol",
+                "master_direction",
+                "opportunity",
+                "next_entry_ts",
+                "next_close_ts",
+            )
+
+            if not all(
+                key in tracker
+                for key in required
+            ):
+                log(
+                    f"Discard malformed series: "
+                    f"{tracker.get('series_id')}"
+                )
+                continue
+
+            # Do not allow impossible opportunity numbers.
+            if not 1 <= int(
+                tracker["opportunity"]
+            ) <= MAX_OPPORTUNITIES:
+                log(
+                    f"Discard invalid opportunity: "
+                    f"{tracker.get('series_id')}"
+                )
+                continue
+
+            valid.append(tracker)
+
+        ACTIVE_SERIES[:] = valid
+
+    persist_state()
+
+    log(
+        f"Restored active series: "
+        f"{len(ACTIVE_SERIES)}"
+    )
