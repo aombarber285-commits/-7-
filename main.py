@@ -22,7 +22,7 @@ DISCORD_WEBHOOK_URL = RAW_WEBHOOK.strip()
 if DISCORD_WEBHOOK_URL.startswith("Https://"):
     DISCORD_WEBHOOK_URL = "https://" + DISCORD_WEBHOOK_URL[8:]
 
-# ตั้งค่า Client สำหรับ Google GenAI (ใช้รุ่น gemini-2.5-flash ตามมาตรฐาน SDK ล่าสุด)
+# ตั้งค่า Client สำหรับ Google GenAI
 ai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 GEMINI_MODEL = "gemini-2.5-flash"
 
@@ -38,16 +38,12 @@ SYMBOL_MAP = {
 }
 
 SYMBOLS = list(SYMBOL_MAP.keys())
-INTERVAL = "15m"
-MEMORY_FILE = "v13_memory.json"
+MEMORY_FILE = "v13_memory_5m.json"
 
-# ตัวแปรสำหรับระบบที่ 1 และตัวแปรจับเวลาไม่มีออเดอร์
 SENT_SIGNALS = set()
 PENDING_TRADES = []
-TRADE_HISTORY = []
-last_signal_time = time.time()  # บันทึกเวลาเริ่มต้นเช็ก 10 นาที
+last_signal_time = time.time()
 
-# ตัวแปรสำหรับระบบที่ 2 (Sigzy Tracker - ทบไม้ตามทิศทางเดิม เป้าหมายชนะใน 3 ไม้)
 HISTORICAL_MEMORY = []
 ACTIVE_TRACKERS = []
 
@@ -63,7 +59,6 @@ def log(msg):
 
 
 def send_discord(message):
-    """ฟังก์ชันกลางสำหรับส่งข้อความแจ้งเตือนเข้า Discord"""
     if not DISCORD_WEBHOOK_URL:
         return
     try:
@@ -78,37 +73,37 @@ def send_discord(message):
 
 
 # ============================================================
-# [AI Integration] ฟังก์ชันวิเคราะห์ตลาดด้วย Gemini ทุก 5 นาที
+# [AI Chat Integration with AFC Best Practices] รายงานตลาดทุก 5 นาที
 # ============================================================
 
 def ai_market_trend_report(symbol="EUR/USD"):
-    """ให้ AI วิเคราะห์แนวโน้มตลาดปัจจุบัน"""
+    """ใช้ Chat Session ตามคำแนะนำของ SDK เพื่อป้องกัน Error เกี่ยวกับ generate_content ตรงๆ"""
     try:
-        prompt = (
-            f"ช่วยวิเคราะห์แนวโน้มสภาวะตลาด forex คู่เงิน {symbol} ในกรอบเวลาสั้นๆ ตอนนี้ให้หน่อยครับ "
-            f"ขอแบบกระชับสั้นๆ 2-3 บรรทัด ว่าตลาดกำลังอยู่ในเทรนด์ขาขึ้น ขาลง หรือไซด์เวย์ และควรระวังอะไร"
-        )
-        response = ai_client.models.generate_content(
+        chat = ai_client.chats.create(
             model=GEMINI_MODEL,
-            contents=prompt,
+            config={
+                "tools": []  # สามารถใส่ฟังก์ชันเสริมในนี้ได้หากต้องการใช้งาน Tool/Function Calling
+            }
         )
+        prompt = (
+            f"ช่วยวิเคราะห์แนวโน้มสภาวะตลาด forex คู่เงิน {symbol} ในกรอบเวลา 5 นาที ตอนนี้ให้หน่อยครับ "
+            f"ขอแบบกระชับสั้นๆ 2-3 บรรทัด ว่าตลาดกำลังอยู่ในเทรนด์ขาขึ้น ขาลง หรือไซด์เวย์"
+        )
+        response = chat.send_message(prompt)
         return response.text
     except Exception as e:
         return f"AI Analysis Error: {e}"
 
 
 def market_reporter_loop():
-    """ลูปการทำงานที่จะส่งรายงานวิเคราะห์จาก AI ทุก 5 นาที พร้อมแจ้งเตือนสถานะกำลังวิเคราะห์"""
     while True:
         try:
             log("🤖 กำลังให้ AI วิเคราะห์แนวโน้มตลาดรอบ 5 นาที...")
-            send_discord("⏳ **[แจ้งเตือนระบบ]** AI กำลังวิเคราะห์แนวโน้มตลาดรอบ 5 นาที โปรดรอสักครู่... 🔄")
-            
+            send_discord("⏳ **[แจ้งเตือนระบบ]** AI กำลังวิเคราะห์แนวโน้มตลาด 5 นาที โปรดรอสักครู่... 🔄")
             time.sleep(3)
-
             analysis = ai_market_trend_report("EUR/USD")
             message = (
-                f"📊 **[รายงานตลาดรอบ 5 นาที]** 🤖\n"
+                f"📊 **[รายงานตลาด 5M]** 🤖\n"
                 f"----------------------------------\n"
                 f"{analysis}\n"
                 f"----------------------------------"
@@ -116,23 +111,21 @@ def market_reporter_loop():
             send_discord(message)
         except Exception as e:
             print(f"Market Reporter Error: {e}")
-        
         time.sleep(297)
 
 
 # ============================================================
-# [ส่วนที่ 1] สคริปต์: บอกจุดเข้า 15 นาที (15M Signal Scanner)
+# [ส่วนที่ 1] สคริปต์สแกนสัญญาณ: เน้น 5M เป็นหลัก + กรองด้วย 1M
 # ============================================================
 
-def get_market_data_15m(symbol):
+def get_market_data(symbol, interval):
     yf_symbol = SYMBOL_MAP.get(symbol, symbol)
     try:
         ticker = yf.Ticker(yf_symbol)
-        df = ticker.history(period="2d", interval=INTERVAL)
-
-        if df.empty or len(df) < 50:
+        period = "5d" if interval == "1m" else "10d"
+        df = ticker.history(period=period, interval=interval)
+        if df.empty or len(df) < 30:
             return []
-
         candles = []
         for idx, row in df.iterrows():
             candles.append({
@@ -144,11 +137,11 @@ def get_market_data_15m(symbol):
             })
         return candles
     except Exception as e:
-        print(f"[15M {symbol}] yfinance Error: {e}")
+        print(f"[{interval} {symbol}] yfinance Error: {e}")
         return []
 
 
-def atr_15m(candles, period=14):
+def calculate_atr(candles, period=14):
     if len(candles) < period + 1:
         return None
     trs = []
@@ -164,7 +157,7 @@ def atr_15m(candles, period=14):
     return sum(trs[-period:]) / period
 
 
-def calculate_ema_15m(candles, period=50):
+def calculate_ema(candles, period=50):
     if len(candles) < period:
         return None
     closes = [c["close"] for c in candles]
@@ -175,118 +168,73 @@ def calculate_ema_15m(candles, period=50):
     return ema
 
 
-def analyze_15m_opportunity(symbol, candles):
-    if len(candles) < 50:
+def analyze_5m_strategy(symbol):
+    candles_5m = get_market_data(symbol, "5m")
+    candles_1m = get_market_data(symbol, "1m")
+
+    if len(candles_5m) < 30 or len(candles_1m) < 30:
         return {"decision": "WAIT", "score": 0}
 
-    c0 = candles[-1]
-    c1 = candles[-2]
-    price = c0["close"]
-    current_atr = atr_15m(candles, 14)
-    ema50 = calculate_ema_15m(candles, 50)
+    c0_5m = candles_5m[-1]
+    price = c0_5m["close"]
+    atr_5m = calculate_atr(candles_5m, 14)
+    ema_5m = calculate_ema(candles_5m, 50)
+    ema_1m = calculate_ema(candles_1m, 50)
 
-    if not current_atr or not ema50:
+    if not atr_5m or not ema_5m or not ema_1m:
         return {"decision": "WAIT", "score": 0}
 
-    above_ema = price > ema50
-    below_ema = price < ema50
+    is_bullish_5m = c0_5m["close"] > ema_5m and c0_5m["close"] > c0_5m["open"]
+    is_bearish_5m = c0_5m["close"] < ema_5m and c0_5m["close"] < c0_5m["open"]
+    
+    c0_1m = candles_1m[-1]
+    is_bullish_1m = c0_1m["close"] > ema_1m
+    is_bearish_1m = c0_1m["close"] < ema_1m
 
-    reasons = []
-    confirmations_call = 0
-    confirmations_put = 0
-
-    if above_ema:
-        confirmations_call += 1
-        reasons.append("ราคาอยู่เหนือ EMA 50")
-    elif below_ema:
-        confirmations_put += 1
-        reasons.append("ราคาอยู่ใต้ EMA 50")
-
-    b0 = abs(c0["close"] - c0["open"])
-    r0 = max(c0["high"] - c0["low"], 0.00000001)
-    upper0 = c0["high"] - max(c0["open"], c0["close"])
-    lower0 = min(c0["open"], c0["close"]) - c0["low"]
-    ratio0 = b0 / r0
-
-    is_strong_bull = (c0["close"] > c0["open"]) and ratio0 >= 0.70
-    is_strong_bear = (c0["close"] < c0["open"]) and ratio0 >= 0.70
-    is_hammer = lower0 >= b0 * 2.5 and upper0 <= r0 * 0.20 and ratio0 <= 0.40
-    is_shooting_star = upper0 >= b0 * 2.5 and lower0 <= r0 * 0.20 and ratio0 <= 0.40
-
-    is_bull_engulfing = (
-        (c0["close"] > c0["open"]) and 
-        (c1["close"] < c1["open"]) and 
-        c0["open"] <= c1["close"] and 
-        c0["close"] >= c1["open"] and 
-        abs(c0["close"] - c0["open"]) > abs(c1["close"] - c1["open"])
-    )
-
-    is_bear_engulfing = (
-        (c0["close"] < c0["open"]) and 
-        (c1["close"] > c1["open"]) and 
-        c0["open"] >= c1["close"] and 
-        c0["close"] <= c1["open"] and 
-        abs(c0["close"] - c0["open"]) > abs(c1["close"] - c1["open"])
-    )
-
-    if is_strong_bull or is_hammer or is_bull_engulfing:
-        confirmations_call += 1
-        reasons.append("Bullish Pattern")
-
-    if is_strong_bear or is_shooting_star or is_bear_engulfing:
-        confirmations_put += 1
-        reasons.append("Bearish Pattern")
-
-    if confirmations_call > confirmations_put and confirmations_call >= 3 and above_ema:
+    if is_bullish_5m and is_bullish_1m:
         direction = "CALL"
-        score = min(50 + (confirmations_call * 12), 99)
-    elif confirmations_put > confirmations_call and confirmations_put >= 3 and below_ema:
+        score = 85
+        reasons = "5M Trend Bullish + 1M Momentum Confirm"
+    elif is_bearish_5m and is_bearish_1m:
         direction = "PUT"
-        score = min(50 + (confirmations_put * 12), 99)
+        score = 85
+        reasons = "5M Trend Bearish + 1M Momentum Confirm"
     else:
         return {"decision": "WAIT", "score": 0}
 
-    if score < 70:
-        return {"decision": "WATCH", "score": score}
-
-    tp = price + current_atr * 0.50 if direction == "CALL" else price - current_atr * 0.50
-    sl = price - current_atr * 0.50 if direction == "CALL" else price + current_atr * 0.50
+    tp = price + atr_5m * 0.50 if direction == "CALL" else price - atr_5m * 0.50
+    sl = price - atr_5m * 0.50 if direction == "CALL" else price + atr_5m * 0.50
 
     return {
         "decision": direction,
         "score": score,
         "symbol": symbol,
         "price": price,
-        "atr": current_atr,
+        "atr": atr_5m,
         "tp": tp,
         "sl": sl,
-        "reasons": " | ".join(reasons),
-        "candle_time": c0["datetime"],
-        "setup_name": "15M_Strategy"
+        "reasons": reasons,
+        "candle_time": c0_5m["datetime"],
+        "setup_name": "5M_Strategy_1M_Filter"
     }
 
 
 def run_script_1_scanner():
-    """การทำงานส่วนที่ 1: สแกนและส่งสัญญาณจุดเข้า 15 นาที พร้อมเช็กเวลาไม่มีออเดอร์ครบ 10 นาที"""
     global SENT_SIGNALS, PENDING_TRADES, ACTIVE_TRACKERS, last_signal_time
-    print(f"\n[{now_text()}] 🔍 [ระบบ 1] สแกนจุดเข้า 15 นาที...")
+    print(f"\n[{now_text()}] 🔍 [ระบบ 1] สแกนจุดเข้ากรอบเวลา 5M (กรองด้วย 1M)...")
 
     signal_found = False
 
     for symbol in SYMBOLS:
         try:
-            candles = get_market_data_15m(symbol)
-            if not candles:
-                continue
-
-            res = analyze_15m_opportunity(symbol, candles)
+            res = analyze_5m_strategy(symbol)
             if res["decision"] in ["CALL", "PUT"]:
                 signal_key = (res["symbol"], res["candle_time"], res["decision"])
                 if signal_key not in SENT_SIGNALS:
                     SENT_SIGNALS.add(signal_key)
                     PENDING_TRADES.append(res)
                     signal_found = True
-                    last_signal_time = time.time()  # รีเซ็ตเวลาเมื่อเจอออเดอร์ใหม่
+                    last_signal_time = time.time()
                     
                     ACTIVE_TRACKERS.append({
                         "symbol": res["symbol"],
@@ -303,34 +251,33 @@ def run_script_1_scanner():
 
                     icon = "🟢" if res['decision'] == "CALL" else "🔴"
                     msg = (
-                        f"🚨 **[NEW SIGNAL - 15M] สัญญาณเข้าเทรดใหม่** {icon}\n\n"
+                        f"🚨 **[NEW SIGNAL - 5M] สัญญาณเทรด (กรอง 1M)** {icon}\n\n"
                         f"💱 คู่เงิน: **{res['symbol']}**\n"
                         f"📌 ทิศทาง: **{res['decision']}**\n"
                         f"🏆 คะแนน: **{res['score']}/100**\n"
                         f"💰 Entry: **{res['price']:.5f}**\n"
                         f"🎯 TP: **{res['tp']:.5f}** | 🛑 SL: **{res['sl']:.5f}**\n\n"
-                        f"🔎 เหตุผล: {res['reasons']}\n"
+                        f"🔎 เงื่อนไข: {res['reasons']}\n"
                         f"🕐 เวลา: {now_text()}"
                     )
                     send_discord(msg)
-                    print(f"🚨 [ระบบ 1] ส่งสัญญาณ {res['symbol']} สำเร็จ!")
+                    print(f"🚨 [ระบบ 1] ส่งสัญญาณ 5M คู่ {res['symbol']} สำเร็จ!")
         except Exception as e:
             print(f"[ระบบ 1 Error] {symbol}: {e}")
 
-    # เช็กว่าถ้าไม่มีสัญญาณใหม่เลยเกิน 10 นาที (600 วินาที) ให้แจ้งเตือนสถานะตลาดเงียบ
     if not signal_found:
         elapsed_time = time.time() - last_signal_time
         if elapsed_time >= 600:
             send_discord(
-                f"⏱️ **[แจ้งเตือนสถานะตลาด]**\n"
-                f"ไม่มีออเดอร์หรือสัญญาณใหม่เข้ามาเลยเป็นเวลา **10 นาทีแล้ว** 🧊\n"
-                f"ระบบกำลังเฝ้าระวังและรอเงื่อนไขที่เหมาะสมต่อไป..."
+                f"⏱️ **[แจ้งเตือนสถานะตลาด 5M]**\n"
+                f"ไม่มีสัญญาณเทรด 5M เข้ามาเลยเป็นเวลา **10 นาทีแล้ว** 🧊\n"
+                f"ระบบกำลังเฝ้าระวังแท่งเทียนถัดไป..."
             )
             last_signal_time = time.time()
 
 
 # ============================================================
-# [ส่วนที่ 2] สคริปต์: Sigzy Tracker (ตามทิศทางเดิม เป้าหมายชนะใน 3 ไม้)
+# [ส่วนที่ 2] Sigzy Tracker: ติดตามผล 5M ทบ 3 ไม้ (ชนะ 1 ใน 3)
 # ============================================================
 
 def load_memory_from_file():
@@ -339,12 +286,12 @@ def load_memory_from_file():
         try:
             with open(MEMORY_FILE, "r", encoding="utf-8") as f:
                 HISTORICAL_MEMORY = json.load(f)
-            log(f"📂 [ระบบ 2] โหลดประวัติสำเร็จ! ทั้งหมด {len(HISTORICAL_MEMORY)} รายการ")
+            log(f"📂 [ระบบ 2] โหลดประวัติสำเร็จ! {len(HISTORICAL_MEMORY)} รายการ")
         except Exception as e:
             log(f"⚠️ [ระบบ 2] โหลด Memory ล้มเหลว: {e}")
             HISTORICAL_MEMORY = []
     else:
-        log("📄 [ระบบ 2] ไม่พบไฟล์ประวัติ สร้างฐานข้อมูลใหม่...")
+        log("📄 [ระบบ 2] สร้างฐานข้อมูลประวัติใหม่สำหรับ 5M...")
 
 
 def save_memory_to_file():
@@ -355,12 +302,12 @@ def save_memory_to_file():
         log(f"⚠️ [ระบบ 2] บันทึกไฟล์ล้มเหลว: {e}")
 
 
-def get_closed_candles_tracker(symbol):
+def get_closed_candles_5m(symbol):
     yf_symbol = SYMBOL_MAP.get(symbol, symbol)
     try:
         ticker = yf.Ticker(yf_symbol)
-        df = ticker.history(period="3d", interval=INTERVAL)
-        if df.empty or len(df) < 50:
+        df = ticker.history(period="2d", interval="5m")
+        if df.empty or len(df) < 30:
             return []
         closed_df = df.iloc[:-1]
         candles = []
@@ -374,7 +321,7 @@ def get_closed_candles_tracker(symbol):
             })
         return candles
     except Exception as e:
-        log(f"[Tracker {symbol}] Error: {e}")
+        log(f"[Tracker 5M {symbol}] Error: {e}")
         return []
 
 
@@ -397,16 +344,15 @@ def record_history(tracker, win_at_step, status, step_entry):
 
 
 def run_script_2_tracker():
-    """การทำงานส่วนที่ 2: ติดตามผลลัพธ์ทบไม้ตามทิศทางเดิม (ไม้ 1, ไม้ 2, ไม้ 3)"""
     global ACTIVE_TRACKERS
     if not ACTIVE_TRACKERS:
         return
 
-    log("📈 [ระบบ 2] กำลังประเมินผล Active Trackers...")
+    log("📈 [ระบบ 2] ติดตามผล Active Trackers (กรอบเวลา 5M)...")
     remaining_trackers = []
 
     for tracker in ACTIVE_TRACKERS:
-        candles = get_closed_candles_tracker(tracker["symbol"])
+        candles = get_closed_candles_5m(tracker["symbol"])
         if not candles:
             remaining_trackers.append(tracker)
             continue
@@ -420,7 +366,7 @@ def run_script_2_tracker():
 
             atr = tracker["atr"]
             direction = tracker["decision"]
-            tp_dist, sl_dist = atr * 0.6, atr * 0.6
+            tp_dist, sl_dist = atr * 0.5, atr * 0.5
 
             if direction == "CALL":
                 tp_price, sl_price = step_entry + tp_dist, step_entry - sl_dist
@@ -443,11 +389,11 @@ def run_script_2_tracker():
             if is_win:
                 record_history(tracker, win_at_step=current_step, status="WIN", step_entry=step_entry)
                 send_discord(
-                    f"🎯 **[SIGZY TRACKER OUTCOME]**\n"
+                    f"🎯 **[SIGZY TRACKER 5M OUTCOME]**\n"
                     f"💱 คู่เงิน: **{tracker['symbol']}** ({direction})\n"
-                    f"🏁 ผลลัพธ์: **WIN 🟢 (ชนะในไม้ที่ {current_step})**\n"
+                    f"🏁 ผลลัพธ์: **WIN 🟢 (ชนะในไม้ที่ {current_step} ของ 5M)**\n"
                     f"📍 ราคาเข้าไม้ {current_step}: **{step_entry:.5f}**\n"
-                    f"📈 Max MFE: **{tracker['max_mfe']:.5f}** | 📉 Max MAE: **{tracker['max_mae']:.5f}**\n"
+                    f"📈 MFE: **{tracker['max_mfe']:.5f}** | 📉 MAE: **{tracker['max_mae']:.5f}**\n"
                     f"🕐 สัญญาณเมื่อ: {tracker['signal_time']}"
                 )
             else:
@@ -457,10 +403,10 @@ def run_script_2_tracker():
                 else:
                     record_history(tracker, win_at_step=0, status="FULL_LOSS", step_entry=step_entry)
                     send_discord(
-                        f"🛑 **[SIGZY TRACKER OUTCOME]**\n"
+                        f"🛑 **[SIGZY TRACKER 5M OUTCOME]**\n"
                         f"💱 คู่เงิน: **{tracker['symbol']}** ({direction})\n"
-                        f"🏁 ผลลัพธ์: **FULL LOSS 🔴 (แพ้ครบ 3 ไม้)**\n"
-                        f"📈 Max MFE: **{tracker['max_mfe']:.5f}** | 📉 Max MAE: **{tracker['max_mae']:.5f}**\n"
+                        f"🏁 ผลลัพธ์: **FULL LOSS 🔴 (แพ้ครบ 3 ไม้ 5M)**\n"
+                        f"📈 MFE: **{tracker['max_mfe']:.5f}** | 📉 MAE: **{tracker['max_mae']:.5f}**\n"
                         f"🕐 สัญญาณเมื่อ: {tracker['signal_time']}"
                     )
         else:
@@ -474,8 +420,7 @@ def run_script_2_tracker():
 # ============================================================
 
 def main():
-    log("🚀 รวมสคริปต์ทำงานพร้อมกัน: [ระบบ 1: สัญญาณ 15M] + [ระบบ 2: Sigzy Tracker] + [AI 5M Report]")
-    
+    log("🚀 เริ่มระบบใหม่: [สแกน 5M + กรอง 1M] + [Sigzy Tracker 3 ไม้] + [AI 5M Report]")
     load_memory_from_file()
 
     reporter_thread = Thread(target=market_reporter_loop, daemon=True)
@@ -496,7 +441,7 @@ class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is running!")
+        self.wfile.write(b"Bot 5M is running!")
 
 def run_server():
     server = HTTPServer(('0.0.0.0', 8080), DummyHandler)
