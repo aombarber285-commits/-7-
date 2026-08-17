@@ -43,7 +43,7 @@ from datetime import datetime, timezone, timedelta
 
 DISCORD_WEBHOOK_URL = os.getenv(
     "DISCORD_WEBHOOK_URL",
-    ""
+    "https://discord.com/api/webhooks/1537044300305530950/-aDtd7fsi5lzAaLoYA3VwaKAvjPvf-vFMwYIuqctxX8BZ7RHtF89AIebiR78o7CNBOUV"
 )
 
 MEMORY_FILE = "v13_memory_5m.json"
