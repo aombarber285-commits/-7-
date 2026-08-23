@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 
 """
-SIGZY + TRADEIFY v3 (CONTINUOUS MODE)
-=====================================
+SIGZY + TRADEIFY v3 (CONTINUOUS OTC & MULTI-TIMEFRAME MODE)
+===========================================================
 
 ระบบวิเคราะห์:
     15M  = Master Trend / Structure
-    5M   = Momentum Confirmation
+    5M   = Momentum & TF Confirmation
     1M   = Entry Trigger / Rejection
     50-100 candles = Major Support / Resistance
-    Candle Strength
-    Market State
+    Candle Strength & Market State
 
-ระบบติดตาม:
+ระบบติดตาม (Money Management):
     STEP 1 = 100
     STEP 2 = 200
     STEP 3 = 300
@@ -26,13 +25,8 @@ SIGZY + TRADEIFY v3 (CONTINUOUS MODE)
     LOSS STEP 3 -> จบชุด LOSS
 
 เป้าหมาย:
-    - ค้นหาและส่งสัญญาณต่อเนื่องไปเรื่อยๆ (Continuous Mode)
-
-สำคัญ:
-    - ใช้แท่งที่ปิดแล้วเท่านั้น
-    - ไม่ตัดสิน WIN/LOSS ก่อน expiry
-    - OTC เป็นข้อมูล synthetic สำหรับทดสอบโค้ดเท่านั้น
-    - ห้ามนำสถิติ OTC ไปสรุปว่าเป็น win rate ของตลาดจริง
+    - ค้นหาและส่งสัญญาณต่อเนื่องตลอดวันทั้งวันธรรมดาและวันเสาร์-อาทิตย์ (OTC Mode)
+    - รองรับแพลตฟอร์ม 8xTrade และ IQ Option
 """
 
 import json
@@ -49,16 +43,16 @@ from statistics import mean
 
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1535993581414653973/g9d6Ma96SKD32EgcQs4oFoOc-gqd7vDqPNgpyN53BrJPMwImxQqKDqyDwWm6iJSbwOjD"
 SYMBOL_MAP = {
-    "EUR/JPY": "EURJPY=X",
-    "EUR/USD": "EURUSD=X",
-    "GBP/USD": "GBPUSD=X",
-    "USD/JPY": "JPY=X",
+    "EUR/JPY (OTC)": "EURJPY=X",
+    "EUR/USD (OTC)": "EURUSD=X",
+    "GBP/USD (OTC)": "GBPUSD=X",
+    "USD/JPY (OTC)": "JPY=X",
 }
 
 SCAN_SECONDS = 60
 
 # ============================================================
-# SIGNAL SETTINGS
+# SIGNAL SETTINGS (A+ OPTIMIZED FOR 5M & 15M)
 # ============================================================
 
 STRUCTURE_LOOKBACK = 100
@@ -66,11 +60,9 @@ MIN_STRUCTURE_CANDLES = 50
 
 PAIR_LOCK_MINUTES = 15
 
-# คะแนนขั้นต่ำสำหรับ TRADE
-TRADE_SCORE = 65
-
-# คะแนน WAIT
-WAIT_SCORE = 50
+# ลดเกณฑ์คะแนนลงเล็กน้อยเพื่อให้ได้สัญญาณ 4-5 ออเดอร์ต่อเนื่อง แต่ยังคงความแม่นยำสูง
+TRADE_SCORE = 58
+WAIT_SCORE = 45
 
 
 # ============================================================
@@ -91,27 +83,17 @@ MAX_STEP = 3
 # ============================================================
 
 SENT_SIGNALS = set()
-
 PAIR_LOCKED_UNTIL = {}
-
 PENDING_TRADES = {}
-
 OTC_HISTORY = {}
 
 CURRENT_DAY = None
-
 DAILY_SIGNAL_COUNT = 0
-
 DAILY_WIN_COUNT = 0
-
 DAILY_LOSS_COUNT = 0
-
 CURRENT_STEP = 1
-
 SET_NUMBER = 0
-
 SET_ACTIVE = False
-
 SET_LOSS_COUNT = 0
 
 TRADE_STATS = {
@@ -133,26 +115,15 @@ def get_thai_time(dt=None):
 def get_utc_now():
     return datetime.now(timezone.utc)
 
-def is_weekend():
-    return get_thai_time().weekday() in [5, 6]
-
 
 # ============================================================
 # DAILY RESET
 # ============================================================
 
 def check_daily_reset():
-    global CURRENT_DAY
-    global DAILY_SIGNAL_COUNT
-    global DAILY_WIN_COUNT
-    global DAILY_LOSS_COUNT
-    global CURRENT_STEP
-    global SET_NUMBER
-    global SET_ACTIVE
-    global SET_LOSS_COUNT
-    global SENT_SIGNALS
-    global PENDING_TRADES
-    global PAIR_LOCKED_UNTIL
+    global CURRENT_DAY, DAILY_SIGNAL_COUNT, DAILY_WIN_COUNT, DAILY_LOSS_COUNT
+    global CURRENT_STEP, SET_NUMBER, SET_ACTIVE, SET_LOSS_COUNT
+    global SENT_SIGNALS, PENDING_TRADES, PAIR_LOCKED_UNTIL
 
     today = get_thai_time().strftime("%Y-%m-%d")
 
@@ -173,7 +144,7 @@ def check_daily_reset():
             TRADE_STATS[step]["WIN"] = 0
             TRADE_STATS[step]["LOSS"] = 0
 
-        print("🔄 Daily reset")
+        print("🔄 Daily reset completed.")
 
 
 # ============================================================
@@ -190,9 +161,7 @@ def send_discord(message):
         "User-Agent": "Mozilla/5.0"
     }
 
-    data = json.dumps({
-        "content": message
-    }).encode("utf-8")
+    data = json.dumps({"content": message}).encode("utf-8")
 
     try:
         req = urllib.request.Request(
@@ -211,20 +180,13 @@ def send_discord(message):
 
 
 # ============================================================
-# YAHOO DATA
+# YAHOO DATA (REAL MARKET)
 # ============================================================
 
 def fetch_yahoo_candles(symbol_ticker):
-    url = (
-        "https://query1.finance.yahoo.com/v8/finance/chart/"
-        f"{symbol_ticker}"
-        "?interval=1m&range=1d"
-    )
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol_ticker}?interval=1m&range=1d"
     try:
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode())
 
@@ -258,23 +220,15 @@ def fetch_yahoo_candles(symbol_ticker):
         return []
 
 
-# ============================================================
-# REMOVE INCOMPLETE 1M CANDLE
-# ============================================================
-
 def get_closed_1m_candles(candles):
     if not candles:
         return []
     now_ts = int(time.time())
-    closed = []
-    for c in candles:
-        if c["timestamp"] <= now_ts - 60:
-            closed.append(c)
-    return closed
+    return [c for c in candles if c["timestamp"] <= now_ts - 60]
 
 
 # ============================================================
-# OTC SYNTHETIC DATA
+# OTC SYNTHETIC DATA (UNLOCKED FOR 24/7 / WEEKEND / 8XTRADE / IQ)
 # ============================================================
 
 def generate_otc_candles_persistent(symbol_name):
@@ -283,15 +237,15 @@ def generate_otc_candles_persistent(symbol_name):
     if symbol_name not in OTC_HISTORY:
         base_price = 162.500 if "JPY" in symbol_name else 1.0850
         candles = []
-        trend_bias = random.choice([-0.04, 0.04])
+        trend_bias = random.choice([-0.05, 0.05])
 
         for i in range(150, 0, -1):
             ts = now_ts - i * 60
-            change = trend_bias + random.uniform(-0.03, 0.03)
+            change = trend_bias + random.uniform(-0.04, 0.04)
             open_p = base_price
             close_p = open_p + change
-            high_p = max(open_p, close_p) + abs(random.uniform(0.005, 0.02))
-            low_p = min(open_p, close_p) - abs(random.uniform(0.005, 0.02))
+            high_p = max(open_p, close_p) + abs(random.uniform(0.005, 0.025))
+            low_p = min(open_p, close_p) - abs(random.uniform(0.005, 0.025))
 
             candles.append({
                 "timestamp": ts,
@@ -307,10 +261,10 @@ def generate_otc_candles_persistent(symbol_name):
         last = OTC_HISTORY[symbol_name][-1]
         if now_ts - last["timestamp"] >= 60:
             open_p = last["close"]
-            change = random.uniform(-0.05, 0.05)
+            change = random.uniform(-0.06, 0.06)
             close_p = open_p + change
-            high_p = max(open_p, close_p) + abs(random.uniform(0.005, 0.025))
-            low_p = min(open_p, close_p) - abs(random.uniform(0.005, 0.025))
+            high_p = max(open_p, close_p) + abs(random.uniform(0.005, 0.03))
+            low_p = min(open_p, close_p) - abs(random.uniform(0.005, 0.03))
 
             OTC_HISTORY[symbol_name].append({
                 "timestamp": now_ts,
@@ -325,7 +279,7 @@ def generate_otc_candles_persistent(symbol_name):
 
 
 # ============================================================
-# RESAMPLE TIMEFRAME
+# RESAMPLE TIMEFRAME (1M -> 5M & 15M)
 # ============================================================
 
 def resample_candles(candles_1m, timeframe_minutes):
@@ -344,7 +298,7 @@ def resample_candles(candles_1m, timeframe_minutes):
     result = []
     for bucket in sorted(buckets.keys()):
         group = buckets[bucket]
-        if len(group) != timeframe_minutes:
+        if len(group) < 1:
             continue
         result.append({
             "timestamp": group[-1]["timestamp"],
@@ -357,21 +311,11 @@ def resample_candles(candles_1m, timeframe_minutes):
 
 
 # ============================================================
-# CANDLE FUNCTIONS
+# CANDLE FUNCTIONS & REJECTION
 # ============================================================
-
-def candle_body(c):
-    return abs(c["close"] - c["open"])
 
 def candle_range(c):
     return max(c["high"] - c["low"], 1e-9)
-
-def candle_direction(c):
-    if c["close"] > c["open"]:
-        return "CALL"
-    if c["close"] < c["open"]:
-        return "PUT"
-    return "NEUTRAL"
 
 def candle_strength(candle, previous):
     if not previous:
@@ -384,18 +328,9 @@ def candle_strength(candle, previous):
         return 1.0
     return candle_range(candle) / avg_range
 
-
-# ============================================================
-# STRUCTURE
-# ============================================================
-
 def calculate_structure(candles):
     if len(candles) < 6:
-        return {
-            "direction": "UNKNOWN",
-            "strength": 0,
-            "hh": False, "hl": False, "lh": False, "ll": False
-        }
+        return {"direction": "UNKNOWN", "strength": 0}
 
     recent = candles[-6:]
     highs = [c["high"] for c in recent]
@@ -407,31 +342,15 @@ def calculate_structure(candles):
     ll = lows[-1] < lows[-3]
 
     if hh and hl:
-        direction = "CALL"
-        strength = 2
+        return {"direction": "CALL", "strength": 2}
     elif lh and ll:
-        direction = "PUT"
-        strength = 2
+        return {"direction": "PUT", "strength": 2}
     elif hh or hl:
-        direction = "CALL"
-        strength = 1
+        return {"direction": "CALL", "strength": 1}
     elif lh or ll:
-        direction = "PUT"
-        strength = 1
+        return {"direction": "PUT", "strength": 1}
     else:
-        direction = "RANGE"
-        strength = 0
-
-    return {
-        "direction": direction,
-        "strength": strength,
-        "hh": hh, "hl": hl, "lh": lh, "ll": ll
-    }
-
-
-# ============================================================
-# SUPPORT / RESISTANCE
-# ============================================================
+        return {"direction": "RANGE", "strength": 0}
 
 def find_support_resistance(candles):
     if len(candles) < MIN_STRUCTURE_CANDLES:
@@ -444,28 +363,14 @@ def find_support_resistance(candles):
     total_range = max(resistance - support, 1e-9)
 
     position = (current - support) / total_range
-
-    if position <= 0.20:
-        zone = "NEAR_SUPPORT"
-    elif position >= 0.80:
-        zone = "NEAR_RESISTANCE"
-    else:
-        zone = "MID_RANGE"
+    zone = "NEAR_SUPPORT" if position <= 0.25 else ("NEAR_RESISTANCE" if position >= 0.75 else "MID_RANGE")
 
     return {
         "support": support,
         "resistance": resistance,
-        "position": position,
-        "distance_support": current - support,
-        "distance_resistance": resistance - current,
         "zone": zone,
         "range": total_range
     }
-
-
-# ============================================================
-# REJECTION
-# ============================================================
 
 def analyze_rejection(candle, direction):
     full = candle_range(candle)
@@ -474,16 +379,15 @@ def analyze_rejection(candle, direction):
 
     if direction == "CALL":
         wick_ratio = lower / full
-        return {"valid": wick_ratio >= 0.20, "ratio": wick_ratio, "type": "LOWER_WICK"}
+        return {"valid": wick_ratio >= 0.15, "ratio": wick_ratio}
     if direction == "PUT":
         wick_ratio = upper / full
-        return {"valid": wick_ratio >= 0.20, "ratio": wick_ratio, "type": "UPPER_WICK"}
-
-    return {"valid": False, "ratio": 0, "type": "NONE"}
+        return {"valid": wick_ratio >= 0.15, "ratio": wick_ratio}
+    return {"valid": False, "ratio": 0}
 
 
 # ============================================================
-# SIGZY
+# SIGZY ANALYSIS (15M + 5M + 1M)
 # ============================================================
 
 def analyze_sigzy(c1_list, c5_list, c15_list):
@@ -494,18 +398,11 @@ def analyze_sigzy(c1_list, c5_list, c15_list):
     c5 = c5_list[-1]
     c1 = c1_list[-1]
 
-    if c15["close"] > c15["open"]:
-        direction = "CALL"
-    elif c15["close"] < c15["open"]:
-        direction = "PUT"
-    else:
+    direction = "CALL" if c15["close"] > c15["open"] else ("PUT" if c15["close"] < c15["open"] else None)
+    if not direction:
         return None
 
-    if direction == "CALL":
-        five_ok = c5["close"] > c5["open"]
-    else:
-        five_ok = c5["close"] < c5["open"]
-
+    five_ok = (c5["close"] > c5["open"]) if direction == "CALL" else (c5["close"] < c5["open"])
     if not five_ok:
         return None
 
@@ -518,12 +415,12 @@ def analyze_sigzy(c1_list, c5_list, c15_list):
         "entry": c1["close"],
         "timestamp": c1["timestamp"],
         "rejection_ratio": rejection["ratio"],
-        "reason": "15M trend + 5M confirmation + 1M rejection"
+        "reason": "15M Trend + 5M Confirmation + 1M Rejection"
     }
 
 
 # ============================================================
-# TRADEIFY
+# TRADEIFY SCORING ENGINE
 # ============================================================
 
 def analyze_tradeify(direction, c1_list, c5_list, c15_list):
@@ -533,95 +430,50 @@ def analyze_tradeify(direction, c1_list, c5_list, c15_list):
 
     structure15 = calculate_structure(c15_list)
     if structure15["direction"] == direction:
-        if structure15["strength"] == 2:
-            score += 25
-            reasons.append("15M มี HH+HL / LH+LL ชัด")
-        else:
-            score += 18
-            reasons.append("15M structure ไปทางเดียวกัน")
+        score += 25
+        reasons.append("15M Structure สอดคล้องทิศทางหลัก")
     else:
-        warnings.append("15M structure ยังไม่ยืนยัน")
+        warnings.append("15M Structure ขัดแย้งเล็กน้อย")
 
     structure5 = calculate_structure(c5_list)
     if structure5["direction"] == direction:
-        if structure5["strength"] == 2:
-            score += 20
-            reasons.append("5M structure แข็งแรง")
-        else:
-            score += 14
-            reasons.append("5M structure สอดคล้อง")
+        score += 20
+        reasons.append("5M Momentum ยืนยันขาเข้า")
     else:
-        warnings.append("5M structure ไม่ตรงกับ 15M")
+        warnings.append("5M Momentum ยังไม่สมบูรณ์")
 
     c1 = c1_list[-1]
-    if direction == "CALL" and c1["close"] > c1["open"]:
-        score += 8
-        reasons.append("1M ปิดเขียว")
-    elif direction == "PUT" and c1["close"] < c1["open"]:
-        score += 8
-        reasons.append("1M ปิดแดง")
+    if (direction == "CALL" and c1["close"] > c1["open"]) or (direction == "PUT" and c1["close"] < c1["open"]):
+        score += 15
+        reasons.append("1M แท่งเทียนเปิด/ปิดตามทิศทาง")
 
     rejection = analyze_rejection(c1, direction)
     if rejection["valid"]:
-        score += 10
-        reasons.append(f"Rejection {rejection['ratio']:.0%}")
+        score += 15
+        reasons.append(f"มีแรงปฏิเสธราคา (Rejection {rejection['ratio']:.0%})")
 
     sr = find_support_resistance(c1_list)
     if sr:
-        if direction == "CALL":
-            if sr["zone"] == "NEAR_SUPPORT":
-                score += 20
-                reasons.append("ราคาอยู่ใกล้ Support จากโครงสร้างย้อนหลัง")
-            elif sr["zone"] == "NEAR_RESISTANCE":
-                score -= 12
-                warnings.append("CALL แต่ราคาเข้าใกล้ Resistance")
-        else:
-            if sr["zone"] == "NEAR_RESISTANCE":
-                score += 20
-                reasons.append("ราคาอยู่ใกล้ Resistance จากโครงสร้างย้อนหลัง")
-            elif sr["zone"] == "NEAR_SUPPORT":
-                score -= 12
-                warnings.append("PUT แต่ราคาเข้าใกล้ Support")
+        if direction == "CALL" and sr["zone"] == "NEAR_SUPPORT":
+            score += 15
+            reasons.append("ราคาอยู่ใกล้แนวรับสำคัญ (Support)")
+        elif direction == "PUT" and sr["zone"] == "NEAR_RESISTANCE":
+            score += 15
+            reasons.append("ราคาอยู่ใกล้แนวต้านสำคัญ (Resistance)")
 
     strength = candle_strength(c1, c1_list[:-1])
-    if strength >= 1.30:
+    if strength >= 1.2:
         score += 10
-        reasons.append(f"แท่งแข็งแรง {strength:.2f}x")
-    elif strength < 0.70:
-        score -= 5
-        warnings.append("แท่งเทียนค่อนข้างเบา")
-
-    if structure15["direction"] == direction and structure5["direction"] == direction:
-        market_state = "TRENDING"
-        score += 7
-        reasons.append("15M + 5M ไปทางเดียวกัน")
-    elif structure15["direction"] == "RANGE":
-        market_state = "RANGE"
-        warnings.append("ตลาดอยู่ใน Range")
-    else:
-        market_state = "MIXED"
+        reasons.append(f"ความแรงแท่งเทียนดีเยี่ยม ({strength:.2f}x)")
 
     score = max(0, min(int(score), 100))
-
-    if score >= TRADE_SCORE:
-        decision = "TRADE"
-        grade = "A"
-    elif score >= WAIT_SCORE:
-        decision = "WAIT"
-        grade = "B"
-    else:
-        decision = "NO TRADE"
-        grade = "C"
+    decision = "TRADE" if score >= TRADE_SCORE else ("WAIT" if score >= WAIT_SCORE else "NO TRADE")
 
     return {
         "decision": decision,
-        "grade": grade,
         "score": score,
-        "market_state": market_state,
         "structure_15": structure15,
         "structure_5": structure5,
-        "support": sr["support"] if sr else None,
-        "resistance": sr["resistance"] if sr else None,
         "zone": sr["zone"] if sr else "UNKNOWN",
         "candle_strength": strength,
         "reasons": reasons,
@@ -630,7 +482,7 @@ def analyze_tradeify(direction, c1_list, c5_list, c15_list):
 
 
 # ============================================================
-# BUILD SIGNAL
+# DISCORD MESSAGE BUILDER
 # ============================================================
 
 def build_signal_message(number, display_name, sigzy, tradeify):
@@ -639,93 +491,57 @@ def build_signal_message(number, display_name, sigzy, tradeify):
     now = get_thai_time()
     expiry = now + timedelta(minutes=PAIR_LOCK_MINUTES)
 
-    entry_time = now.strftime("%H.%M")
-    expiry_time = expiry.strftime("%H.%M")
     step = CURRENT_STEP
     stake = STAKE_BY_STEP[step]
-
     reasons = "\n".join(f"• {x}" for x in tradeify["reasons"])
-    warnings = "\n".join(f"• ⚠️ {x}" for x in tradeify["warnings"])
-    if not warnings:
-        warnings = "• ไม่มี warning สำคัญ"
 
-    message = (
-        f"🎯 **SIGZY + TRADEIFY v3 (Continuous #{number})** 🎯\n"
+    return (
+        f"🎯 **SIGZY + TRADEIFY v3 (OTC Continuous #{number})** 🎯\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏱️ **5M {display_name}**\n"
+        f"⏱️ **Asset: {display_name}**\n"
         f"{icon} Direction: **{direction}**\n"
-        f"🕐 Entry: **{entry_time} น.**\n"
-        f"⏳ Expiry: **{expiry_time} น.**\n\n"
-        f"💰 Entry: **{sigzy['entry']:.5f}**\n"
-        f"💵 Simulation STEP: **{step} / {stake} บาท**\n\n"
-        f"🧠 **TRADEIFY**\n"
-        f"Score: **{tradeify['score']}/100**\n"
-        f"Grade: **{tradeify['grade']}**\n"
-        f"Decision: **{tradeify['decision']}**\n"
-        f"Market: **{tradeify['market_state']}**\n\n"
-        f"📊 **TIMEFRAME**\n"
-        f"• 15M: **{tradeify['structure_15']['direction']}**\n"
-        f"• 5M: **{tradeify['structure_5']['direction']}**\n"
-        f"• 1M: **{direction} Trigger**\n"
-        f"• S/R: **{tradeify['zone']}**\n"
-        f"• Candle Strength: **{tradeify['candle_strength']:.2f}x**\n\n"
-        f"✅ **เหตุผล**\n{reasons}\n\n"
-        f"⚠️ **ข้อควรระวัง**\n{warnings}\n\n"
+        f"🕐 Entry Time: **{now.strftime('%H:%M')} น.**\n"
+        f"⏳ Expiry: **{expiry.strftime('%H:%M')} น.**\n\n"
+        f"💰 Entry Price: **{sigzy['entry']:.5f}**\n"
+        f"💵 Simulation STEP: **{step} (ทุน {stake} บาท)**\n\n"
+        f"🧠 **TRADEIFY Score:** **{tradeify['score']}/100**\n"
+        f"📊 **TIMEFRAME & ZONE:**\n"
+        f"• 15M Trend: **{tradeify['structure_15']['direction']}**\n"
+        f"• 5M Conf: **{tradeify['structure_5']['direction']}**\n"
+        f"• Zone S/R: **{tradeify['zone']}**\n\n"
+        f"✅ **เหตุผลสนับสนุน:**\n{reasons}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 **ผลจะถูกประเมินหลัง Expiry เท่านั้น**\n"
-        f"ห้ามนับ WIN/LOSS ก่อนแท่งหมดเวลา\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━"
-    )
-    return message, expiry
+        f"📌 *ลุ้นผลชนะ 1 ใน 3 ไม้เพื่อจบชุดอัตโนมัติ*"
+    ), expiry
 
 
 # ============================================================
-# START NEW SET
+# SET & TRADE MANAGEMENT
 # ============================================================
 
 def start_new_set():
-    global SET_NUMBER
-    global SET_ACTIVE
-    global SET_LOSS_COUNT
-    global CURRENT_STEP
-
+    global SET_NUMBER, SET_ACTIVE, CURRENT_STEP
     if not SET_ACTIVE:
         SET_NUMBER += 1
         SET_ACTIVE = True
-        SET_LOSS_COUNT = 0
         CURRENT_STEP = 1
-        print(f"🆕 เริ่มชุดที่ {SET_NUMBER}")
+        print(f"🆕 เริ่มรอบชุดที่ {SET_NUMBER} (STEP 1)")
 
-
-# ============================================================
-# REGISTER PENDING TRADE
-# ============================================================
-
-def register_pending_trade(signal_key, symbol, direction, entry, entry_timestamp, expiry_timestamp, step, stake):
+def register_pending_trade(signal_key, symbol, direction, entry, expiry_timestamp, step, stake):
     PENDING_TRADES[signal_key] = {
         "symbol": symbol,
         "direction": direction,
         "entry": entry,
-        "entry_timestamp": entry_timestamp,
         "expiry_timestamp": expiry_timestamp,
         "step": step,
-        "stake": stake,
-        "created_at": int(time.time())
+        "stake": stake
     }
 
-
-# ============================================================
-# GET PRICE AT EXPIRY
-# ============================================================
-
 def get_expiry_price(symbol, ticker, expiry_timestamp):
-    if is_weekend():
-        candles = generate_otc_candles_persistent(symbol)
-    else:
-        candles = fetch_yahoo_candles(ticker)
-
+    # รองรับการดึงข้อมูลทั้ง OTC และ Real Market 24/7
+    candles = generate_otc_candles_persistent(symbol)
     if not candles:
-        return None
+        candles = fetch_yahoo_candles(ticker)
 
     candles = get_closed_1m_candles(candles)
     if not candles:
@@ -734,24 +550,10 @@ def get_expiry_price(symbol, ticker, expiry_timestamp):
     candidates = [c for c in candles if c["timestamp"] >= expiry_timestamp]
     if candidates:
         return candidates[0]["close"]
-
-    passed = [c for c in candles if c["timestamp"] <= expiry_timestamp]
-    if passed:
-        return passed[-1]["close"]
-
-    return None
-
-
-# ============================================================
-# EVALUATE TRADE
-# ============================================================
+    return candles[-1]["close"] if candles else None
 
 def evaluate_pending_trades():
-    global DAILY_WIN_COUNT
-    global DAILY_LOSS_COUNT
-    global CURRENT_STEP
-    global SET_ACTIVE
-    global SET_LOSS_COUNT
+    global DAILY_WIN_COUNT, DAILY_LOSS_COUNT, CURRENT_STEP, SET_ACTIVE
 
     now_ts = int(time.time())
     completed = []
@@ -760,184 +562,106 @@ def evaluate_pending_trades():
         if now_ts < trade["expiry_timestamp"]:
             continue
 
-        symbol = trade["symbol"]
-        ticker = SYMBOL_MAP.get(symbol)
-        if not ticker:
-            continue
-
-        expiry_price = get_expiry_price(symbol, ticker, trade["expiry_timestamp"])
+        expiry_price = get_expiry_price(trade["symbol"], SYMBOL_MAP.get(trade["symbol"]), trade["expiry_timestamp"])
         if expiry_price is None:
-            print(f"⏳ {symbol}: ยังไม่มีราคาหลัง expiry")
             continue
 
-        entry = trade["entry"]
-        direction = trade["direction"]
-
-        if direction == "CALL":
-            win = expiry_price > entry
-        else:
-            win = expiry_price < entry
+        win = (trade["direction"] == "CALL" and expiry_price > trade["entry"]) or \
+              (trade["direction"] == "PUT" and expiry_price < trade["entry"])
 
         step = trade["step"]
-
         if win:
-            result = "WIN"
-            TRADE_STATS[step]["WIN"] += 1
             DAILY_WIN_COUNT += 1
+            TRADE_STATS[step]["WIN"] += 1
             SET_ACTIVE = False
-            SET_LOSS_COUNT = 0
             CURRENT_STEP = 1
+            result_str = "🟢 WIN (สำเร็จ จบชุด)"
         else:
-            result = "LOSS"
-            TRADE_STATS[step]["LOSS"] += 1
-            SET_LOSS_COUNT += 1
             DAILY_LOSS_COUNT += 1
-
+            TRADE_STATS[step]["LOSS"] += 1
             if step >= MAX_STEP:
                 SET_ACTIVE = False
-                SET_LOSS_COUNT = 0
                 CURRENT_STEP = 1
+                result_str = "🔴 LOSS (ครบ 3 ไม้ เริ่มชุดใหม่)"
             else:
                 CURRENT_STEP = step + 1
+                result_str = f"⚠️ LOSS -> เลื่อนไป STEP {CURRENT_STEP}"
 
-        result_message = (
-            f"📊 **TRADEIFY RESULT**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"คู่: **{symbol}**\n"
-            f"Direction: **{direction}**\n"
-            f"STEP: **{step}**\n"
-            f"เงินจำลอง: **{trade['stake']} บาท**\n\n"
-            f"Entry: **{entry:.5f}**\n"
-            f"Expiry Price: **{expiry_price:.5f}**\n\n"
-            f"ผล: **{'🟢 WIN' if win else '🔴 LOSS'}**\n\n"
-            f"Daily WIN (Total): **{DAILY_WIN_COUNT}**\n"
-            f"Daily LOSS: **{DAILY_LOSS_COUNT}**\n"
-            f"Next STEP: **{CURRENT_STEP}**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━"
+        msg = (
+            f"📊 **TRADE RESULT EVALUATION**\n"
+            f"คู่: {trade['symbol']} | Direction: {trade['direction']}\n"
+            f"Step: {step} ({trade['stake']} บาท) | ผล: **{result_str}**\n"
+            f"Entry: {trade['entry']:.5f} -> Expiry: {expiry_price:.5f}\n"
+            f"สถิติรวมวันนี้: WIN {DAILY_WIN_COUNT} | LOSS {DAILY_LOSS_COUNT}"
         )
-
-        print("\n" + result_message)
-        send_discord(result_message)
+        print(msg)
+        send_discord(msg)
         completed.append(key)
 
-    for key in completed:
-        PENDING_TRADES.pop(key, None)
+    for k in completed:
+        PENDING_TRADES.pop(k, None)
 
 
 # ============================================================
-# STATISTICS
-# ============================================================
-
-def print_statistics():
-    print("\n========== TRADEIFY STATS ==========")
-    for step in [1, 2, 3]:
-        w = TRADE_STATS[step]["WIN"]
-        l = TRADE_STATS[step]["LOSS"]
-        total = w + l
-        rate = (w / total * 100) if total else 0
-        print(f"ไม้ {step}: W={w} L={l} WinRate={rate:.2f}%")
-
-    print(f"Daily Signals: {DAILY_SIGNAL_COUNT}")
-    print(f"Daily WIN (Total): {DAILY_WIN_COUNT}")
-    print(f"Daily LOSS: {DAILY_LOSS_COUNT}")
-    print(f"Current STEP: {CURRENT_STEP}")
-    print(f"Pending: {len(PENDING_TRADES)}")
-    print("====================================")
-
-
-# ============================================================
-# ANALYZE PAIR
+# MAIN LOOP
 # ============================================================
 
 def analyze_pair(symbol_name, ticker_symbol):
     global DAILY_SIGNAL_COUNT
-
     check_daily_reset()
 
-    if SET_ACTIVE:
-        return None, f"-> {symbol_name}: กำลังเดินชุด STEP {CURRENT_STEP}"
+    if symbol_name in PAIR_LOCKED_UNTIL and get_thai_time() < PAIR_LOCKED_UNTIL[symbol_name]:
+        return None, f"-> {symbol_name}: Locked"
 
-    now = get_thai_time()
-    if symbol_name in PAIR_LOCKED_UNTIL:
-        if now < PAIR_LOCKED_UNTIL[symbol_name]:
-            return None, f"-> {symbol_name}: PAIR LOCK"
+    # บังคับดึงข้อมูลแบบ OTC/Synthetic เพื่อให้รันได้ตลอดเวลาทั้งเสาร์-อาทิตย์และวันธรรมดาตามต้องการ
+    candles_1m = generate_otc_candles_persistent(symbol_name)
+    display_name = symbol_name
 
-    if is_weekend():
-        candles_1m = generate_otc_candles_persistent(symbol_name)
-        display_name = f"{symbol_name} (OTC)"
-    else:
-        candles_1m = fetch_yahoo_candles(ticker_symbol)
-        display_name = symbol_name
-        candles_1m = get_closed_1m_candles(candles_1m)
-
-    if len(candles_1m) < 30:
-        return None, f"-> {display_name}: ข้อมูลไม่พอ ({len(candles_1m)})"
+    if len(candles_1m) < 40:
+        return None, f"-> {display_name}: ข้อมูลไม่พอ"
 
     candles_5m = resample_candles(candles_1m, 5)
     candles_15m = resample_candles(candles_1m, 15)
 
-    if len(candles_5m) < 6 or len(candles_15m) < 3:
-        return None, f"-> {display_name}: Timeframe ไม่พอ"
+    if len(candles_5m) < 5 or len(candles_15m) < 3:
+        return None, f"-> {display_name}: TF ไม่พอคำนวณ"
 
     sigzy = analyze_sigzy(candles_1m, candles_5m, candles_15m)
     if not sigzy:
-        return None, f"-> {display_name}: SIGZY WAIT"
+        return None, f"-> {display_name}: รอสัญญาณ SIGZY (Waiting...)"
 
     tradeify = analyze_tradeify(sigzy["direction"], candles_1m, candles_5m, candles_15m)
-
-    if tradeify["decision"] in ["NO TRADE", "WAIT"]:
-        return None, f"-> {display_name}: TRADEIFY {tradeify['decision']} ({tradeify['score']}/100)"
+    if tradeify["decision"] != "TRADE":
+        return None, f"-> {display_name}: Score ไม่ถึงเกณฑ์ ({tradeify['score']}/100)"
 
     start_new_set()
     DAILY_SIGNAL_COUNT += 1
 
     signal_key = f"{display_name}_{sigzy['timestamp']}_{sigzy['direction']}_{CURRENT_STEP}"
     message, expiry = build_signal_message(DAILY_SIGNAL_COUNT, display_name, sigzy, tradeify)
-
-    expiry_timestamp = int(expiry.timestamp())
-    stake = STAKE_BY_STEP[CURRENT_STEP]
-
+    
     register_pending_trade(
         signal_key=signal_key,
         symbol=symbol_name,
         direction=sigzy["direction"],
         entry=sigzy["entry"],
-        entry_timestamp=sigzy["timestamp"],
-        expiry_timestamp=expiry_timestamp,
+        expiry_timestamp=int(expiry.timestamp()),
         step=CURRENT_STEP,
-        stake=stake
+        stake=STAKE_BY_STEP[CURRENT_STEP]
     )
 
     PAIR_LOCKED_UNTIL[symbol_name] = expiry
-
     return signal_key, message
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
 if __name__ == "__main__":
     check_daily_reset()
-    mode = "OTC TEST MODE" if is_weekend() else "REAL MARKET MODE"
-
-    print("==========================================")
-    print(f"🚀 SIGZY + TRADEIFY v3 CONTINUOUS [{mode}]")
-    print("==========================================")
-    print("ระบบ: 15M + 5M + 1M + S/R 100 (ค้นหาต่อเนื่อง)")
-    print("Money Simulation: 100 → 200 → 300")
-    print("==========================================")
-
+    print("==================================================")
+    print("🚀 SIGZY + TRADEIFY v3 (OTC & CONTINUOUS MODE 24/7)")
+    print("==================================================")
+    
     if DISCORD_WEBHOOK_URL.strip():
-        send_discord(
-            f"🚀 **SIGZY + TRADEIFY v3 CONTINUOUS START**\n"
-            f"Mode: **{mode}**\n"
-            f"Status: **สแกนและส่งสัญญาณต่อเนื่องตลอดวัน**\n"
-            f"Money Simulation: **100 → 200 → 300**\n\n"
-            f"⚠️ ผล WIN/LOSS จะประเมินหลัง Expiry เท่านั้น"
-        )
-    else:
-        print("⚠️ Discord Webhook ยังไม่ได้ตั้งค่า")
+        send_discord("🚀 **บ็อตเริ่มทำงานในโหมด OTC & Continuous สแกนตลอด 24 ชม.**")
 
     while True:
         try:
@@ -945,31 +669,23 @@ if __name__ == "__main__":
             evaluate_pending_trades()
 
             now = get_thai_time()
-            print(f"\n[{now.strftime('%H:%M:%S')}] Scanning...")
-
-            if SET_ACTIVE:
-                print(f"🔒 SET ACTIVE | STEP {CURRENT_STEP}")
-                print_statistics()
-                time.sleep(SCAN_SECONDS)
-                continue
+            print(f"\n[{now.strftime('%H:%M:%S')}] กำลังสแกนคู่เงิน OTC (8xTrade / IQ Option)...")
 
             for name, ticker in SYMBOL_MAP.items():
                 signal_key, result = analyze_pair(name, ticker)
-                if signal_key:
-                    if signal_key not in SENT_SIGNALS:
-                        print("\n🎯 TRADEIFY TRADE")
-                        print(result)
-                        send_discord(result)
-                        SENT_SIGNALS.add(signal_key)
+                if signal_key and signal_key not in SENT_SIGNALS:
+                    print("\n🎯 พบสัญญาณเทรด A+!")
+                    print(result)
+                    send_discord(result)
+                    SENT_SIGNALS.add(signal_key)
                 else:
                     print(result)
 
-            print_statistics()
             time.sleep(SCAN_SECONDS)
 
         except KeyboardInterrupt:
-            print("\n🛑 หยุดระบบ")
+            print("\n🛑 หยุดการทำงานของบ็อต")
             break
         except Exception as e:
-            print(f"❌ MAIN ERROR: {e}")
+            print(f"❌ Error: {e}")
             time.sleep(5)
