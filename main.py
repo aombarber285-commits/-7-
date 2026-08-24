@@ -1,691 +1,325 @@
-# -*- coding: utf-8 -*-
+from pathlib import Path
 
-"""
-SIGZY + TRADEIFY v3 (CONTINUOUS OTC & MULTI-TIMEFRAME MODE)
-===========================================================
+code = '''# SIGZY + TRADEIFY v4 A++ MTF SNIPER
+# 15M Master | 5M Confirmation | 1M Entry
+# IMPORTANT: No fake/random OTC data. Real OTC requires OTC_API_URL.
+# Tracking only: this bot does NOT place orders and cannot guarantee wins.
 
-ระบบวิเคราะห์:
-    15M  = Master Trend / Structure
-    5M   = Momentum & TF Confirmation
-    1M   = Entry Trigger / Rejection
-    50-100 candles = Major Support / Resistance
-    Candle Strength & Market State
-
-ระบบติดตาม (Money Management):
-    STEP 1 = 100
-    STEP 2 = 200
-    STEP 3 = 300
-
-กติกาชุด:
-    WIN STEP 1 -> จบชุด
-    LOSS STEP 1 -> STEP 2
-    WIN STEP 2 -> จบชุด
-    LOSS STEP 2 -> STEP 3
-    WIN STEP 3 -> จบชุด
-    LOSS STEP 3 -> จบชุด LOSS
-
-เป้าหมาย:
-    - ค้นหาและส่งสัญญาณต่อเนื่องตลอดวันทั้งวันธรรมดาและวันเสาร์-อาทิตย์ (OTC Mode)
-    - รองรับแพลตฟอร์ม 8xTrade และ IQ Option
-"""
-
-import json
-import time
-import random
-import urllib.request
+import os, json, time, urllib.request, urllib.parse
 from datetime import datetime, timedelta, timezone
 from statistics import mean
 
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+MARKET_MODE = os.getenv("MARKET_MODE", "AUTO").upper()
+OTC_API_URL = os.getenv("OTC_API_URL", "").strip()
+SCAN_SECONDS = max(5, int(os.getenv("SCAN_SECONDS", "10")))
+SYMBOLS = [x.strip() for x in os.getenv(
+    "SYMBOLS", "EUR/USD,GBP/USD,USD/JPY,EUR/JPY"
+).split(",") if x.strip()]
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1535993581414653973/g9d6Ma96SKD32EgcQs4oFoOc-gqd7vDqPNgpyN53BrJPMwImxQqKDqyDwWm6iJSbwOjD"
-SYMBOL_MAP = {
-    "EUR/JPY (OTC)": "EURJPY=X",
-    "EUR/USD (OTC)": "EURUSD=X",
-    "GBP/USD (OTC)": "GBPUSD=X",
-    "USD/JPY (OTC)": "JPY=X",
+YAHOO_MAP = {
+    "EUR/USD":"EURUSD=X", "GBP/USD":"GBPUSD=X", "USD/JPY":"JPY=X",
+    "EUR/JPY":"EURJPY=X", "AUD/USD":"AUDUSD=X", "USD/CHF":"CHF=X",
+    "USD/CAD":"CAD=X", "GBP/JPY":"GBPJPY=X"
 }
 
-SCAN_SECONDS = 60
+MIN_SCORE = 78
+MIN_EDGE = 12
+SR_LOOKBACK = 120
+MIN_CANDLES = 120
+EXPIRY_MINUTES = 1
+STAKE_BY_STEP = {1:100, 2:200, 3:300}
 
-# ============================================================
-# SIGNAL SETTINGS (A+ OPTIMIZED FOR 5M & 15M)
-# ============================================================
-
-STRUCTURE_LOOKBACK = 100
-MIN_STRUCTURE_CANDLES = 50
-
-PAIR_LOCK_MINUTES = 15
-
-# ลดเกณฑ์คะแนนลงเล็กน้อยเพื่อให้ได้สัญญาณ 4-5 ออเดอร์ต่อเนื่อง แต่ยังคงความแม่นยำสูง
-TRADE_SCORE = 58
-WAIT_SCORE = 45
-
-
-# ============================================================
-# MONEY MANAGEMENT - SIMULATION ONLY
-# ============================================================
-
-STAKE_BY_STEP = {
-    1: 100,
-    2: 200,
-    3: 300,
-}
-
-MAX_STEP = 3
-
-
-# ============================================================
-# STATE
-# ============================================================
-
-SENT_SIGNALS = set()
-PAIR_LOCKED_UNTIL = {}
-PENDING_TRADES = {}
-OTC_HISTORY = {}
-
+TZ = timezone(timedelta(hours=7))
 CURRENT_DAY = None
-DAILY_SIGNAL_COUNT = 0
-DAILY_WIN_COUNT = 0
-DAILY_LOSS_COUNT = 0
 CURRENT_STEP = 1
-SET_NUMBER = 0
 SET_ACTIVE = False
-SET_LOSS_COUNT = 0
+SET_NUMBER = 0
+PENDING = {}
+LAST_CANDLE = {}
+LAST_SIGNAL = {}
+DAILY = {"signals":0, "wins":0, "losses":0, "void":0}
+STATS = {1:{"WIN":0,"LOSS":0,"VOID":0},2:{"WIN":0,"LOSS":0,"VOID":0},3:{"WIN":0,"LOSS":0,"VOID":0}}
 
-TRADE_STATS = {
-    1: {"WIN": 0, "LOSS": 0},
-    2: {"WIN": 0, "LOSS": 0},
-    3: {"WIN": 0, "LOSS": 0},
-}
+def now(): return datetime.now(timezone.utc).astimezone(TZ)
+def ts(): return int(time.time())
 
+def http_json(url, timeout=10):
+    req = urllib.request.Request(url, headers={"User-Agent":"TRADEIFY-v4","Accept":"application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
 
-# ============================================================
-# TIME
-# ============================================================
-
-def get_thai_time(dt=None):
-    if dt is None:
-        dt = datetime.now(timezone.utc)
-    return dt.astimezone(timezone(timedelta(hours=7)))
-
-def get_utc_now():
-    return datetime.now(timezone.utc)
-
-
-# ============================================================
-# DAILY RESET
-# ============================================================
-
-def check_daily_reset():
-    global CURRENT_DAY, DAILY_SIGNAL_COUNT, DAILY_WIN_COUNT, DAILY_LOSS_COUNT
-    global CURRENT_STEP, SET_NUMBER, SET_ACTIVE, SET_LOSS_COUNT
-    global SENT_SIGNALS, PENDING_TRADES, PAIR_LOCKED_UNTIL
-
-    today = get_thai_time().strftime("%Y-%m-%d")
-
-    if CURRENT_DAY != today:
-        CURRENT_DAY = today
-        DAILY_SIGNAL_COUNT = 0
-        DAILY_WIN_COUNT = 0
-        DAILY_LOSS_COUNT = 0
-        CURRENT_STEP = 1
-        SET_NUMBER = 0
-        SET_ACTIVE = False
-        SET_LOSS_COUNT = 0
-        SENT_SIGNALS.clear()
-        PENDING_TRADES.clear()
-        PAIR_LOCKED_UNTIL.clear()
-
-        for step in TRADE_STATS:
-            TRADE_STATS[step]["WIN"] = 0
-            TRADE_STATS[step]["LOSS"] = 0
-
-        print("🔄 Daily reset completed.")
-
-
-# ============================================================
-# DISCORD
-# ============================================================
-
-def send_discord(message):
-    if not DISCORD_WEBHOOK_URL.strip():
-        print("⚠️ Discord Webhook ยังไม่ได้ตั้งค่า")
-        return False
-
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0"
-    }
-
-    data = json.dumps({"content": message}).encode("utf-8")
-
+def discord(msg):
+    if not DISCORD_WEBHOOK_URL:
+        print(msg); return
     try:
-        req = urllib.request.Request(
-            url=DISCORD_WEBHOOK_URL,
-            data=data,
-            headers=headers,
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=10) as response:
-            if response.status in (200, 204):
-                print("✅ Discord ส่งสำเร็จ")
-                return True
+        data=json.dumps({"content":msg}).encode()
+        req=urllib.request.Request(DISCORD_WEBHOOK_URL,data=data,
+            headers={"Content-Type":"application/json"},method="POST")
+        urllib.request.urlopen(req,timeout=10).close()
     except Exception as e:
-        print(f"❌ Discord error: {e}")
-    return False
+        print("[DISCORD]",e)
 
-
-# ============================================================
-# YAHOO DATA (REAL MARKET)
-# ============================================================
-
-def fetch_yahoo_candles(symbol_ticker):
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol_ticker}?interval=1m&range=1d"
+def normalize(x):
+    if isinstance(x,dict):
+        t=x.get("timestamp",x.get("time",x.get("t")))
+        o=x.get("open",x.get("o")); h=x.get("high",x.get("h"))
+        l=x.get("low",x.get("l")); c=x.get("close",x.get("c"))
+    elif isinstance(x,(list,tuple)) and len(x)>=5:
+        t,o,h,l,c=x[:5]
+    else: return None
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as response:
-            data = json.loads(response.read().decode())
+        t=float(t); t=t/1000 if t>10_000_000_000 else t
+        return {"timestamp":int(t),"open":float(o),"high":float(h),
+                "low":float(l),"close":float(c)}
+    except: return None
 
-        result = data["chart"]["result"][0]
-        timestamps = result.get("timestamp", [])
-        quote = result["indicators"]["quote"][0]
-        candles = []
-
-        for i in range(len(timestamps)):
+def fetch_yahoo(symbol):
+    ticker=YAHOO_MAP.get(symbol,symbol)
+    url=("https://query1.finance.yahoo.com/v8/finance/chart/"
+         +urllib.parse.quote(ticker,safe="")+"?interval=1m&range=1d")
+    try:
+        r=http_json(url)["chart"]["result"][0]
+        q=r["indicators"]["quote"][0]
+        out=[]
+        for i,t in enumerate(r.get("timestamp",[])):
             try:
-                o = quote["open"][i]
-                h = quote["high"][i]
-                l = quote["low"][i]
-                c = quote["close"][i]
-            except Exception:
-                continue
-
-            if None in (o, h, l, c):
-                continue
-
-            candles.append({
-                "timestamp": int(timestamps[i]),
-                "open": float(o),
-                "high": float(h),
-                "low": float(l),
-                "close": float(c)
-            })
-        return candles
+                c={"timestamp":int(t),"open":float(q["open"][i]),
+                   "high":float(q["high"][i]),"low":float(q["low"][i]),
+                   "close":float(q["close"][i])}
+                out.append(c)
+            except: pass
+        cutoff=ts()-60
+        return [c for c in out if c["timestamp"]<=cutoff]
     except Exception as e:
-        print(f"Yahoo error: {e}")
-        return []
-
-
-def get_closed_1m_candles(candles):
-    if not candles:
-        return []
-    now_ts = int(time.time())
-    return [c for c in candles if c["timestamp"] <= now_ts - 60]
-
-
-# ============================================================
-# OTC SYNTHETIC DATA (UNLOCKED FOR 24/7 / WEEKEND / 8XTRADE / IQ)
-# ============================================================
-
-def generate_otc_candles_persistent(symbol_name):
-    now_ts = int(time.time())
-
-    if symbol_name not in OTC_HISTORY:
-        base_price = 162.500 if "JPY" in symbol_name else 1.0850
-        candles = []
-        trend_bias = random.choice([-0.05, 0.05])
-
-        for i in range(150, 0, -1):
-            ts = now_ts - i * 60
-            change = trend_bias + random.uniform(-0.04, 0.04)
-            open_p = base_price
-            close_p = open_p + change
-            high_p = max(open_p, close_p) + abs(random.uniform(0.005, 0.025))
-            low_p = min(open_p, close_p) - abs(random.uniform(0.005, 0.025))
-
-            candles.append({
-                "timestamp": ts,
-                "open": round(open_p, 5),
-                "high": round(high_p, 5),
-                "low": round(low_p, 5),
-                "close": round(close_p, 5)
-            })
-            base_price = close_p
-
-        OTC_HISTORY[symbol_name] = candles
-    else:
-        last = OTC_HISTORY[symbol_name][-1]
-        if now_ts - last["timestamp"] >= 60:
-            open_p = last["close"]
-            change = random.uniform(-0.06, 0.06)
-            close_p = open_p + change
-            high_p = max(open_p, close_p) + abs(random.uniform(0.005, 0.03))
-            low_p = min(open_p, close_p) - abs(random.uniform(0.005, 0.03))
-
-            OTC_HISTORY[symbol_name].append({
-                "timestamp": now_ts,
-                "open": round(open_p, 5),
-                "high": round(high_p, 5),
-                "low": round(low_p, 5),
-                "close": round(close_p, 5)
-            })
-            OTC_HISTORY[symbol_name] = OTC_HISTORY[symbol_name][-150:]
-
-    return OTC_HISTORY[symbol_name]
-
-
-# ============================================================
-# RESAMPLE TIMEFRAME (1M -> 5M & 15M)
-# ============================================================
-
-def resample_candles(candles_1m, timeframe_minutes):
-    if len(candles_1m) < timeframe_minutes:
-        return []
-
-    timeframe_seconds = timeframe_minutes * 60
-    buckets = {}
-
-    for candle in candles_1m:
-        bucket = candle["timestamp"] // timeframe_seconds
-        if bucket not in buckets:
-            buckets[bucket] = []
-        buckets[bucket].append(candle)
-
-    result = []
-    for bucket in sorted(buckets.keys()):
-        group = buckets[bucket]
-        if len(group) < 1:
-            continue
-        result.append({
-            "timestamp": group[-1]["timestamp"],
-            "open": group[0]["open"],
-            "high": max(x["high"] for x in group),
-            "low": min(x["low"] for x in group),
-            "close": group[-1]["close"]
-        })
-    return result
-
-
-# ============================================================
-# CANDLE FUNCTIONS & REJECTION
-# ============================================================
-
-def candle_range(c):
-    return max(c["high"] - c["low"], 1e-9)
-
-def candle_strength(candle, previous):
-    if not previous:
-        return 1.0
-    recent = previous[-20:]
-    if not recent:
-        return 1.0
-    avg_range = mean(candle_range(x) for x in recent)
-    if avg_range <= 0:
-        return 1.0
-    return candle_range(candle) / avg_range
-
-def calculate_structure(candles):
-    if len(candles) < 6:
-        return {"direction": "UNKNOWN", "strength": 0}
-
-    recent = candles[-6:]
-    highs = [c["high"] for c in recent]
-    lows = [c["low"] for c in recent]
-
-    hh = highs[-1] > highs[-3]
-    hl = lows[-1] > lows[-3]
-    lh = highs[-1] < highs[-3]
-    ll = lows[-1] < lows[-3]
-
-    if hh and hl:
-        return {"direction": "CALL", "strength": 2}
-    elif lh and ll:
-        return {"direction": "PUT", "strength": 2}
-    elif hh or hl:
-        return {"direction": "CALL", "strength": 1}
-    elif lh or ll:
-        return {"direction": "PUT", "strength": 1}
-    else:
-        return {"direction": "RANGE", "strength": 0}
-
-def find_support_resistance(candles):
-    if len(candles) < MIN_STRUCTURE_CANDLES:
-        return None
-
-    lookback = candles[-STRUCTURE_LOOKBACK:]
-    support = min(c["low"] for c in lookback)
-    resistance = max(c["high"] for c in lookback)
-    current = candles[-1]["close"]
-    total_range = max(resistance - support, 1e-9)
-
-    position = (current - support) / total_range
-    zone = "NEAR_SUPPORT" if position <= 0.25 else ("NEAR_RESISTANCE" if position >= 0.75 else "MID_RANGE")
-
-    return {
-        "support": support,
-        "resistance": resistance,
-        "zone": zone,
-        "range": total_range
-    }
-
-def analyze_rejection(candle, direction):
-    full = candle_range(candle)
-    upper = candle["high"] - max(candle["open"], candle["close"])
-    lower = min(candle["open"], candle["close"]) - candle["low"]
-
-    if direction == "CALL":
-        wick_ratio = lower / full
-        return {"valid": wick_ratio >= 0.15, "ratio": wick_ratio}
-    if direction == "PUT":
-        wick_ratio = upper / full
-        return {"valid": wick_ratio >= 0.15, "ratio": wick_ratio}
-    return {"valid": False, "ratio": 0}
-
-
-# ============================================================
-# SIGZY ANALYSIS (15M + 5M + 1M)
-# ============================================================
-
-def analyze_sigzy(c1_list, c5_list, c15_list):
-    if not c1_list or not c5_list or not c15_list:
-        return None
-
-    c15 = c15_list[-1]
-    c5 = c5_list[-1]
-    c1 = c1_list[-1]
-
-    direction = "CALL" if c15["close"] > c15["open"] else ("PUT" if c15["close"] < c15["open"] else None)
-    if not direction:
-        return None
-
-    five_ok = (c5["close"] > c5["open"]) if direction == "CALL" else (c5["close"] < c5["open"])
-    if not five_ok:
-        return None
-
-    rejection = analyze_rejection(c1, direction)
-    if not rejection["valid"]:
-        return None
-
-    return {
-        "direction": direction,
-        "entry": c1["close"],
-        "timestamp": c1["timestamp"],
-        "rejection_ratio": rejection["ratio"],
-        "reason": "15M Trend + 5M Confirmation + 1M Rejection"
-    }
-
-
-# ============================================================
-# TRADEIFY SCORING ENGINE
-# ============================================================
-
-def analyze_tradeify(direction, c1_list, c5_list, c15_list):
-    score = 0
-    reasons = []
-    warnings = []
-
-    structure15 = calculate_structure(c15_list)
-    if structure15["direction"] == direction:
-        score += 25
-        reasons.append("15M Structure สอดคล้องทิศทางหลัก")
-    else:
-        warnings.append("15M Structure ขัดแย้งเล็กน้อย")
-
-    structure5 = calculate_structure(c5_list)
-    if structure5["direction"] == direction:
-        score += 20
-        reasons.append("5M Momentum ยืนยันขาเข้า")
-    else:
-        warnings.append("5M Momentum ยังไม่สมบูรณ์")
-
-    c1 = c1_list[-1]
-    if (direction == "CALL" and c1["close"] > c1["open"]) or (direction == "PUT" and c1["close"] < c1["open"]):
-        score += 15
-        reasons.append("1M แท่งเทียนเปิด/ปิดตามทิศทาง")
-
-    rejection = analyze_rejection(c1, direction)
-    if rejection["valid"]:
-        score += 15
-        reasons.append(f"มีแรงปฏิเสธราคา (Rejection {rejection['ratio']:.0%})")
-
-    sr = find_support_resistance(c1_list)
-    if sr:
-        if direction == "CALL" and sr["zone"] == "NEAR_SUPPORT":
-            score += 15
-            reasons.append("ราคาอยู่ใกล้แนวรับสำคัญ (Support)")
-        elif direction == "PUT" and sr["zone"] == "NEAR_RESISTANCE":
-            score += 15
-            reasons.append("ราคาอยู่ใกล้แนวต้านสำคัญ (Resistance)")
-
-    strength = candle_strength(c1, c1_list[:-1])
-    if strength >= 1.2:
-        score += 10
-        reasons.append(f"ความแรงแท่งเทียนดีเยี่ยม ({strength:.2f}x)")
-
-    score = max(0, min(int(score), 100))
-    decision = "TRADE" if score >= TRADE_SCORE else ("WAIT" if score >= WAIT_SCORE else "NO TRADE")
-
-    return {
-        "decision": decision,
-        "score": score,
-        "structure_15": structure15,
-        "structure_5": structure5,
-        "zone": sr["zone"] if sr else "UNKNOWN",
-        "candle_strength": strength,
-        "reasons": reasons,
-        "warnings": warnings
-    }
-
-
-# ============================================================
-# DISCORD MESSAGE BUILDER
-# ============================================================
-
-def build_signal_message(number, display_name, sigzy, tradeify):
-    direction = sigzy["direction"]
-    icon = "🟢" if direction == "CALL" else "🔴"
-    now = get_thai_time()
-    expiry = now + timedelta(minutes=PAIR_LOCK_MINUTES)
-
-    step = CURRENT_STEP
-    stake = STAKE_BY_STEP[step]
-    reasons = "\n".join(f"• {x}" for x in tradeify["reasons"])
-
-    return (
-        f"🎯 **SIGZY + TRADEIFY v3 (OTC Continuous #{number})** 🎯\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏱️ **Asset: {display_name}**\n"
-        f"{icon} Direction: **{direction}**\n"
-        f"🕐 Entry Time: **{now.strftime('%H:%M')} น.**\n"
-        f"⏳ Expiry: **{expiry.strftime('%H:%M')} น.**\n\n"
-        f"💰 Entry Price: **{sigzy['entry']:.5f}**\n"
-        f"💵 Simulation STEP: **{step} (ทุน {stake} บาท)**\n\n"
-        f"🧠 **TRADEIFY Score:** **{tradeify['score']}/100**\n"
-        f"📊 **TIMEFRAME & ZONE:**\n"
-        f"• 15M Trend: **{tradeify['structure_15']['direction']}**\n"
-        f"• 5M Conf: **{tradeify['structure_5']['direction']}**\n"
-        f"• Zone S/R: **{tradeify['zone']}**\n\n"
-        f"✅ **เหตุผลสนับสนุน:**\n{reasons}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 *ลุ้นผลชนะ 1 ใน 3 ไม้เพื่อจบชุดอัตโนมัติ*"
-    ), expiry
-
-
-# ============================================================
-# SET & TRADE MANAGEMENT
-# ============================================================
-
-def start_new_set():
-    global SET_NUMBER, SET_ACTIVE, CURRENT_STEP
-    if not SET_ACTIVE:
-        SET_NUMBER += 1
-        SET_ACTIVE = True
-        CURRENT_STEP = 1
-        print(f"🆕 เริ่มรอบชุดที่ {SET_NUMBER} (STEP 1)")
-
-def register_pending_trade(signal_key, symbol, direction, entry, expiry_timestamp, step, stake):
-    PENDING_TRADES[signal_key] = {
-        "symbol": symbol,
-        "direction": direction,
-        "entry": entry,
-        "expiry_timestamp": expiry_timestamp,
-        "step": step,
-        "stake": stake
-    }
-
-def get_expiry_price(symbol, ticker, expiry_timestamp):
-    # รองรับการดึงข้อมูลทั้ง OTC และ Real Market 24/7
-    candles = generate_otc_candles_persistent(symbol)
-    if not candles:
-        candles = fetch_yahoo_candles(ticker)
-
-    candles = get_closed_1m_candles(candles)
-    if not candles:
-        return None
-
-    candidates = [c for c in candles if c["timestamp"] >= expiry_timestamp]
-    if candidates:
-        return candidates[0]["close"]
-    return candles[-1]["close"] if candles else None
-
-def evaluate_pending_trades():
-    global DAILY_WIN_COUNT, DAILY_LOSS_COUNT, CURRENT_STEP, SET_ACTIVE
-
-    now_ts = int(time.time())
-    completed = []
-
-    for key, trade in list(PENDING_TRADES.items()):
-        if now_ts < trade["expiry_timestamp"]:
-            continue
-
-        expiry_price = get_expiry_price(trade["symbol"], SYMBOL_MAP.get(trade["symbol"]), trade["expiry_timestamp"])
-        if expiry_price is None:
-            continue
-
-        win = (trade["direction"] == "CALL" and expiry_price > trade["entry"]) or \
-              (trade["direction"] == "PUT" and expiry_price < trade["entry"])
-
-        step = trade["step"]
-        if win:
-            DAILY_WIN_COUNT += 1
-            TRADE_STATS[step]["WIN"] += 1
-            SET_ACTIVE = False
-            CURRENT_STEP = 1
-            result_str = "🟢 WIN (สำเร็จ จบชุด)"
-        else:
-            DAILY_LOSS_COUNT += 1
-            TRADE_STATS[step]["LOSS"] += 1
-            if step >= MAX_STEP:
-                SET_ACTIVE = False
-                CURRENT_STEP = 1
-                result_str = "🔴 LOSS (ครบ 3 ไม้ เริ่มชุดใหม่)"
-            else:
-                CURRENT_STEP = step + 1
-                result_str = f"⚠️ LOSS -> เลื่อนไป STEP {CURRENT_STEP}"
-
-        msg = (
-            f"📊 **TRADE RESULT EVALUATION**\n"
-            f"คู่: {trade['symbol']} | Direction: {trade['direction']}\n"
-            f"Step: {step} ({trade['stake']} บาท) | ผล: **{result_str}**\n"
-            f"Entry: {trade['entry']:.5f} -> Expiry: {expiry_price:.5f}\n"
-            f"สถิติรวมวันนี้: WIN {DAILY_WIN_COUNT} | LOSS {DAILY_LOSS_COUNT}"
-        )
-        print(msg)
-        send_discord(msg)
-        completed.append(key)
-
-    for k in completed:
-        PENDING_TRADES.pop(k, None)
-
-
-# ============================================================
-# MAIN LOOP
-# ============================================================
-
-def analyze_pair(symbol_name, ticker_symbol):
-    global DAILY_SIGNAL_COUNT
-    check_daily_reset()
-
-    if symbol_name in PAIR_LOCKED_UNTIL and get_thai_time() < PAIR_LOCKED_UNTIL[symbol_name]:
-        return None, f"-> {symbol_name}: Locked"
-
-    # บังคับดึงข้อมูลแบบ OTC/Synthetic เพื่อให้รันได้ตลอดเวลาทั้งเสาร์-อาทิตย์และวันธรรมดาตามต้องการ
-    candles_1m = generate_otc_candles_persistent(symbol_name)
-    display_name = symbol_name
-
-    if len(candles_1m) < 40:
-        return None, f"-> {display_name}: ข้อมูลไม่พอ"
-
-    candles_5m = resample_candles(candles_1m, 5)
-    candles_15m = resample_candles(candles_1m, 15)
-
-    if len(candles_5m) < 5 or len(candles_15m) < 3:
-        return None, f"-> {display_name}: TF ไม่พอคำนวณ"
-
-    sigzy = analyze_sigzy(candles_1m, candles_5m, candles_15m)
-    if not sigzy:
-        return None, f"-> {display_name}: รอสัญญาณ SIGZY (Waiting...)"
-
-    tradeify = analyze_tradeify(sigzy["direction"], candles_1m, candles_5m, candles_15m)
-    if tradeify["decision"] != "TRADE":
-        return None, f"-> {display_name}: Score ไม่ถึงเกณฑ์ ({tradeify['score']}/100)"
-
-    start_new_set()
-    DAILY_SIGNAL_COUNT += 1
-
-    signal_key = f"{display_name}_{sigzy['timestamp']}_{sigzy['direction']}_{CURRENT_STEP}"
-    message, expiry = build_signal_message(DAILY_SIGNAL_COUNT, display_name, sigzy, tradeify)
-    
-    register_pending_trade(
-        signal_key=signal_key,
-        symbol=symbol_name,
-        direction=sigzy["direction"],
-        entry=sigzy["entry"],
-        expiry_timestamp=int(expiry.timestamp()),
-        step=CURRENT_STEP,
-        stake=STAKE_BY_STEP[CURRENT_STEP]
-    )
-
-    PAIR_LOCKED_UNTIL[symbol_name] = expiry
-    return signal_key, message
-
-
-if __name__ == "__main__":
-    check_daily_reset()
-    print("==================================================")
-    print("🚀 SIGZY + TRADEIFY v3 (OTC & CONTINUOUS MODE 24/7)")
-    print("==================================================")
-    
-    if DISCORD_WEBHOOK_URL.strip():
-        send_discord("🚀 **บ็อตเริ่มทำงานในโหมด OTC & Continuous สแกนตลอด 24 ชม.**")
-
+        print("[YAHOO]",symbol,e); return []
+
+def fetch_otc(symbol):
+    if not OTC_API_URL:
+        print("[OTC] OTC_API_URL is not configured"); return []
+    try:
+        sep="&" if "?" in OTC_API_URL else "?"
+        url=OTC_API_URL+sep+urllib.parse.urlencode(
+            {"symbol":symbol,"interval":"1m","limit":"500"})
+        p=http_json(url)
+        raw=p.get("candles",p.get("data",p if isinstance(p,list) else []))
+        out=[normalize(x) for x in raw]
+        out=[x for x in out if x]
+        out.sort(key=lambda x:x["timestamp"])
+        return [c for c in out if c["timestamp"]<=ts()-60]
+    except Exception as e:
+        print("[OTC]",symbol,e); return []
+
+def fetch(symbol):
+    if MARKET_MODE=="OTC": return fetch_otc(symbol)
+    if MARKET_MODE=="LIVE": return fetch_yahoo(symbol)
+    if OTC_API_URL:
+        x=fetch_otc(symbol)
+        if x: return x
+    return fetch_yahoo(symbol)
+
+def resample(candles,minutes):
+    sec=minutes*60; b={}
+    for c in candles: b.setdefault(c["timestamp"]//sec,[]).append(c)
+    out=[]
+    for g in b.values():
+        g=sorted(g,key=lambda x:x["timestamp"])
+        if len(g)<minutes: continue
+        out.append({"timestamp":g[-1]["timestamp"],"open":g[0]["open"],
+                    "high":max(x["high"] for x in g),
+                    "low":min(x["low"] for x in g),"close":g[-1]["close"]})
+    return sorted(out,key=lambda x:x["timestamp"])
+
+def ema(v,n):
+    if len(v)<n:return None
+    e=mean(v[:n]); k=2/(n+1)
+    for x in v[n:]: e=x*k+e*(1-k)
+    return e
+
+def rsi(v,n=14):
+    if len(v)<n+1:return None
+    g=[]; l=[]
+    for i in range(1,len(v)):
+        d=v[i]-v[i-1]; g.append(max(d,0)); l.append(max(-d,0))
+    ag=mean(g[:n]); al=mean(l[:n])
+    for i in range(n,len(g)):
+        ag=((n-1)*ag+g[i])/n; al=((n-1)*al+l[i])/n
+    return 100 if al==0 else 100-100/(1+ag/al)
+
+def atr(c,n=14):
+    if len(c)<n+1:return None
+    x=[]
+    for i in range(1,len(c)):
+        a=c[i];p=c[i-1]
+        x.append(max(a["high"]-a["low"],abs(a["high"]-p["close"]),
+                     abs(a["low"]-p["close"])))
+    return mean(x[-n:])
+
+def structure(c,n=20):
+    if len(c)<n:return ("RANGE",0)
+    x=c[-n:]; h=len(x)//2
+    a=x[:h];b=x[h:]
+    ah=mean(z["high"] for z in a); bh=mean(z["high"] for z in b)
+    al=mean(z["low"] for z in a); bl=mean(z["low"] for z in b)
+    ac=mean(z["close"] for z in a); bc=mean(z["close"] for z in b)
+    rng=mean(z["high"]-z["low"] for z in x)
+    if bh>ah and bl>al and bc>ac:return ("CALL",min(1,abs(bc-ac)/max(rng,1e-12)))
+    if bh<ah and bl<al and bc<ac:return ("PUT",min(1,abs(bc-ac)/max(rng,1e-12)))
+    return ("RANGE",0)
+
+def candle(c):
+    r=max(c["high"]-c["low"],1e-12)
+    return {"bull":c["close"]>c["open"],"bear":c["close"]<c["open"],
+            "body":abs(c["close"]-c["open"])/r,
+            "upper":(c["high"]-max(c["open"],c["close"]))/r,
+            "lower":(min(c["open"],c["close"])-c["low"])/r}
+
+def analyze(symbol,c1):
+    if len(c1)<MIN_CANDLES:return None
+    c5=resample(c1,5); c15=resample(c1,15)
+    if len(c5)<30 or len(c15)<20:return None
+    p1=[x["close"] for x in c1];p5=[x["close"] for x in c5];p15=[x["close"] for x in c15]
+    e9,e21,e50=ema(p1,9),ema(p1,21),ema(p1,50)
+    e59,e521=ema(p5,9),ema(p5,21);e159,e1521=ema(p15,9),ema(p15,21)
+    r1,r5,r15=rsi(p1),rsi(p5),rsi(p15)
+    a=atr(c1)
+    if None in (e9,e21,e50,e59,e521,e159,e1521,r1,r5,r15,a):return None
+    s15,_=structure(c15);s5,_=structure(c5)
+    last=c1[-1]; ci=candle(last)
+    look=c1[-SR_LOOKBACK:]; sup=min(x["low"] for x in look);res=max(x["high"] for x in look)
+    pos=(last["close"]-sup)/max(res-sup,1e-12)
+    zone="SUPPORT" if pos<=.20 else "RESISTANCE" if pos>=.80 else "MID"
+    f=sum(1 for x in c1[-4:] if x["close"]>x["open"])
+    g=sum(1 for x in c1[-4:] if x["close"]<x["open"])
+    flow="CALL" if f>=3 else "PUT" if g>=3 else "RANGE"
+    sc={"CALL":0,"PUT":0};why={"CALL":[],"PUT":[]}
+    def add(d,n,t): sc[d]+=n;why[d].append(t)
+    if s15=="CALL":add("CALL",28,"15M structure up")
+    if s15=="PUT":add("PUT",28,"15M structure down")
+    if e159>e1521:add("CALL",12,"15M EMA alignment")
+    if e159<e1521:add("PUT",12,"15M EMA alignment")
+    if 52<=r15<=68:add("CALL",8,"15M RSI regime")
+    if 32<=r15<=48:add("PUT",8,"15M RSI regime")
+    if s5=="CALL":add("CALL",20,"5M confirmation")
+    if s5=="PUT":add("PUT",20,"5M confirmation")
+    if e59>e521:add("CALL",10,"5M EMA alignment")
+    if e59<e521:add("PUT",10,"5M EMA alignment")
+    if flow=="CALL":add("CALL",8,"1M flow")
+    if flow=="PUT":add("PUT",8,"1M flow")
+    if ci["bull"] and ci["body"]>=.45:add("CALL",7,"1M bullish candle")
+    if ci["bear"] and ci["body"]>=.45:add("PUT",7,"1M bearish candle")
+    if ci["lower"]>=.25:add("CALL",8,"lower rejection")
+    if ci["upper"]>=.25:add("PUT",8,"upper rejection")
+    if zone=="SUPPORT":add("CALL",10,"major support")
+    if zone=="RESISTANCE":add("PUT",10,"major resistance")
+    if r1>72:sc["CALL"]-=10
+    if r1<28:sc["PUT"]-=10
+    sc["CALL"]=max(0,min(100,int(sc["CALL"])));sc["PUT"]=max(0,min(100,int(sc["PUT"])))
+    d="CALL" if sc["CALL"]>sc["PUT"] else "PUT"; edge=sc[d]-sc["PUT" if d=="CALL" else "CALL"]
+    ema_ok=(e9>e21>e50 and d=="CALL") or (e9<e21<e50 and d=="PUT")
+    ok=(sc[d]>=MIN_SCORE and edge>=MIN_EDGE and s15==d and s5==d and ema_ok)
+    if d=="CALL" and not(ci["bull"] or ci["lower"]>=.30):ok=False
+    if d=="PUT" and not(ci["bear"] or ci["upper"]>=.30):ok=False
+    return {"symbol":symbol,"decision":d if ok else None,"early":d if
+            sc[d]>=MIN_SCORE-6 and edge>=MIN_EDGE-2 and s15==d and s5==d and ema_ok else None,
+            "score":sc[d],"edge":edge,"entry":last["close"],"candle_ts":last["timestamp"],
+            "s15":s15,"s5":s5,"zone":zone,"r1":r1,"r5":r5,"r15":r15,
+            "why":why[d]}
+
+def reset():
+    global CURRENT_DAY,CURRENT_STEP,SET_ACTIVE,SET_NUMBER
+    d=now().strftime("%Y-%m-%d")
+    if d==CURRENT_DAY:return
+    CURRENT_DAY=d;CURRENT_STEP=1;SET_ACTIVE=False;SET_NUMBER=0;PENDING.clear()
+    LAST_CANDLE.clear();LAST_SIGNAL.clear()
+    for x in DAILY:DAILY[x]=0
+    for s in STATS.values():
+        for x in s:s[x]=0
+
+def result_check():
+    global CURRENT_STEP,SET_ACTIVE
+    for k,t in list(PENDING.items()):
+        if ts()<t["expiry"]+5:continue
+        c=fetch(t["symbol"]); q=[x for x in c if x["timestamp"]>=t["expiry"]]
+        if not q:continue
+        price=q[0]["close"]; step=t["step"]
+        result="VOID" if price==t["entry"] else (
+            "WIN" if (t["direction"]=="CALL" and price>t["entry"]) or
+            (t["direction"]=="PUT" and price<t["entry"]) else "LOSS")
+        STATS[step][result]+=1
+        if result=="WIN":DAILY["wins"]+=1;SET_ACTIVE=False;CURRENT_STEP=1
+        elif result=="LOSS":
+            DAILY["losses"]+=1
+            if step<3:CURRENT_STEP=step+1
+            else:SET_ACTIVE=False;CURRENT_STEP=1
+        else:DAILY["void"]+=1
+        discord(f"📊 RESULT {t['symbol']} {t['direction']} | "
+                f"STEP {step} {t['stake']}฿ | {result} | "
+                f"{t['entry']:.6f} → {price:.6f} | "
+                f"วันนี้ W{DAILY['wins']} L{DAILY['losses']} V{DAILY['void']}")
+        del PENDING[k]
+
+def scan(symbol):
+    c=fetch(symbol)
+    if len(c)<MIN_CANDLES:return
+    lt=c[-1]["timestamp"]
+    if LAST_CANDLE.get(symbol)==lt:return
+    LAST_CANDLE[symbol]=lt
+    a=analyze(symbol,c)
+    if not a:return
+    if a["early"]:
+        ek=f"E:{symbol}:{lt}:{a['early']}"
+        if LAST_SIGNAL.get(symbol)!=ek:
+            discord(f"🟡 EARLY {symbol} → **{a['early']}** | "
+                    f"Score {a['score']} Edge +{a['edge']} | "
+                    f"15M {a['s15']} / 5M {a['s5']} / {a['zone']} | "
+                    f"รอ 1M confirmation")
+            LAST_SIGNAL[symbol]=ek
+    if not a["decision"]:return
+    if any(x["symbol"]==symbol for x in PENDING.values()):return
+    global CURRENT_STEP,SET_ACTIVE,SET_NUMBER
+    if not SET_ACTIVE:SET_ACTIVE=True;SET_NUMBER+=1;CURRENT_STEP=1
+    k=f"{symbol}:{lt}:{a['decision']}"
+    PENDING[k]={"symbol":symbol,"direction":a["decision"],"entry":a["entry"],
+                "expiry":a["candle_ts"]+60,"step":CURRENT_STEP,
+                "stake":STAKE_BY_STEP[CURRENT_STEP]}
+    DAILY["signals"]+=1
+    entry=datetime.fromtimestamp(a["candle_ts"],timezone.utc).astimezone(TZ)
+    why="; ".join(a["why"][:6])
+    discord(f"🎯 **TRADEIFY v4 A++ CONFIRMED**\\n"
+            f"{'🟢' if a['decision']=='CALL' else '🔴'} {symbol} → **{a['decision']}**\\n"
+            f"Entry {entry:%H:%M:%S} | Expiry +1M\\n"
+            f"Score **{a['score']}/100** | Edge **+{a['edge']}**\\n"
+            f"15M={a['s15']} | 5M={a['s5']} | Zone={a['zone']}\\n"
+            f"RSI 15/5/1 = {a['r15']:.1f}/{a['r5']:.1f}/{a['r1']:.1f}\\n"
+            f"STEP {CURRENT_STEP} = {STAKE_BY_STEP[CURRENT_STEP]} บาท\\n"
+            f"เหตุผล: {why}\\n"
+            f"⚠️ A++ คือการคัดสัญญาณ ไม่ใช่การรับประกันกำไร")
+
+def main():
+    reset()
+    print("TRADEIFY v4 A++ started:",MARKET_MODE,SYMBOLS)
+    if MARKET_MODE=="OTC" and not OTC_API_URL:
+        print("WARNING: OTC_API_URL missing. No fake OTC data will be generated.")
     while True:
         try:
-            check_daily_reset()
-            evaluate_pending_trades()
-
-            now = get_thai_time()
-            print(f"\n[{now.strftime('%H:%M:%S')}] กำลังสแกนคู่เงิน OTC (8xTrade / IQ Option)...")
-
-            for name, ticker in SYMBOL_MAP.items():
-                signal_key, result = analyze_pair(name, ticker)
-                if signal_key and signal_key not in SENT_SIGNALS:
-                    print("\n🎯 พบสัญญาณเทรด A+!")
-                    print(result)
-                    send_discord(result)
-                    SENT_SIGNALS.add(signal_key)
-                else:
-                    print(result)
-
+            reset();result_check()
+            for s in SYMBOLS:scan(s)
+            print(f"[{now():%H:%M:%S}] signals={DAILY['signals']} "
+                  f"W={DAILY['wins']} L={DAILY['losses']} V={DAILY['void']} "
+                  f"step={CURRENT_STEP} pending={len(PENDING)}")
             time.sleep(SCAN_SECONDS)
-
-        except KeyboardInterrupt:
-            print("\n🛑 หยุดการทำงานของบ็อต")
-            break
+        except KeyboardInterrupt:break
         except Exception as e:
-            print(f"❌ Error: {e}")
-            time.sleep(5)
+            print("ERROR",e);time.sleep(5)
+
+if __name__=="__main__":main()
+'''
+
+p = Path("/mnt/data/SIGZY_TRADEIFY_v4_A_PLUS_PLUS.py")
+t = Path("/mnt/data/SIGZY_TRADEIFY_v4_A_PLUS_PLUS.txt")
+p.write_text(code, encoding="utf-8")
+t.write_text(code, encoding="utf-8")
+print("พร้อมดาวน์โหลด:")
+print(p)
+print(t)
