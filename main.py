@@ -49,7 +49,7 @@ from statistics import mean
 
 DISCORD_WEBHOOK_URL = os.getenv(
     "DISCORD_WEBHOOK_URL",
-    ""
+    "https://discord.com/api/webhooks/1539153931194605662/R7ajA_x3iX6dFyOg97st9U9O4ZmAgD1I6BKgJhmfKO3pvtLAkFdWtvq5aZpWVFPMiYoa"
 ).strip()
 
 MARKET_MODE = os.getenv(
