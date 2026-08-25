@@ -3,12 +3,6 @@
 TRADEIFY v6.2 — OTC SNIPER & MULTI-ORDER 5M TRACKER
 ===================================================
 1H MASTER / 15M CONFIRM / 5M ENTRY
-
-เงื่อนไขพิเศษ:
-- ออกออเดอร์เฉลี่ย 3-5 ไม้ต่อชั่วโมง (ความถี่และคุณภาพสมดุล)
-- อิงตามเทรนด์ใหญ่ + แนวรับแนวต้าน (S/R) วิ่งยาวเกิน 2 แท่ง
-- บังคับติดตามผลและล็อกคู่ห้ามยิงซ้ำจนกว่าจะรู้ผล
-- ใช้ราคาตลาดจริงของ OTC 100% (ห้ามเดา/ห้ามสุ่ม)
 """
 
 import os
@@ -20,21 +14,18 @@ from datetime import datetime, timezone, timedelta
 from statistics import mean
 
 # ============================================================
-# CONFIG
+# CONFIG (FIXED VALUES - NO ENV NEEDED)
 # ============================================================
 
-DISCORD_WEBHOOK_URL = os.getenv(
-    "DISCORD_WEBHOOK_URL", 
-    "https://discord.com/api/webhooks/1535993581414653973/g9d6Ma96SKD32EgcQs4oFoOc-gqd7vDqPNgpyN53BrJPMwImxQqKDqyDwWm6iJSbwOjD"
-).strip()
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1535993581414653973/g9d6Ma96SKD32EgcQs4oFoOc-gqd7vDqPNgpyN53BrJPMwImxQqKDqyDwWm6iJSbwOjD"
 
-MARKET_MODE = os.getenv("MARKET_MODE", "OTC").upper()
+MARKET_MODE = "OTC"
 
-# ใส่ API Key ตรงๆ แบบเดิมที่คุณเคยรันได้ปกติ
-OTC_API_URL = "AQ.Ab8RN6Kf0n8HxT1rM-vHdvooYqfBItwnLyNtCLiqYslQImle5Q"
+# ล็อกค่า URL และ API Key ไว้ตรงนี้แบบถาวร ไม่ต้องพึ่งระบบภายนอก
+OTC_API_URL = "https://api.iqoption.com/api/v2/candles?key=AQ.Ab8RN6Kf0n8HxT1rM-vHdvooYqfBItwnLyNtCLiqYslQImle5Q"
 
-SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "10"))
-EXPIRY_SECONDS = int(os.getenv("EXPIRY_SECONDS", "300")) # 5 นาที
+SCAN_SECONDS = 10
+EXPIRY_SECONDS = 300  # 5 นาที
 
 MIN_SCORE = 75
 MIN_EDGE = 12
@@ -44,12 +35,7 @@ MIN_1M_CANDLES = 300
 
 STAKE_BY_STEP = {1: 100, 2: 200, 3: 300}
 
-SYMBOLS = [
-    x.strip() for x in os.getenv(
-        "SYMBOLS",
-        "EUR/USD,GBP/USD,USD/JPY,EUR/JPY,AUD/USD,USD/CHF"
-    ).split(",") if x.strip()
-]
+SYMBOLS = ["EUR/USD", "GBP/USD", "USD/JPY", "EUR/JPY", "AUD/USD", "USD/CHF"]
 
 THAI_TZ = timezone(timedelta(hours=7))
 
@@ -155,10 +141,6 @@ def normalize_candle(x):
         return None
 
 def fetch_otc(symbol):
-    if not OTC_API_URL:
-        print("[OTC ERROR] ยังไม่ได้ตั้งค่า OTC_API_URL")
-        return []
-
     try:
         separator = "&" if "?" in OTC_API_URL else "?"
         url = OTC_API_URL + separator + urllib.parse.urlencode({
@@ -276,7 +258,7 @@ def support_resistance(candles):
     return "MID"
 
 # ============================================================
-# ANALYSIS (TREND + S/R + 3-5 ORDERS TARGET)
+# ANALYSIS
 # ============================================================
 
 def analyze(symbol, candles_1m):
@@ -316,9 +298,9 @@ def analyze(symbol, candles_1m):
         reasons[d].append(r)
 
     if structure1h == "CALL":
-        add("CALL", 35, "1H Master Trend UP (Strong Trend)")
+        add("CALL", 35, "1H Master Trend UP")
     elif structure1h == "PUT":
-        add("PUT", 35, "1H Master Trend DOWN (Strong Trend)")
+        add("PUT", 35, "1H Master Trend DOWN")
 
     if structure15 == "CALL":
         add("CALL", 25, "15M Confirm UP")
@@ -326,19 +308,14 @@ def analyze(symbol, candles_1m):
         add("PUT", 25, "15M Confirm DOWN")
 
     if ema1h_9 > ema1h_21:
-        add("CALL", 15, "1H EMA Bullish Alignment")
+        add("CALL", 15, "1H EMA Bullish")
     elif ema1h_9 < ema1h_21:
-        add("PUT", 15, "1H EMA Bearish Alignment")
-
-    if ema5_9 > ema5_21:
-        add("CALL", 10, "5M Momentum UP")
-    elif ema5_9 < ema5_21:
-        add("PUT", 10, "5M Momentum DOWN")
+        add("PUT", 15, "1H EMA Bearish")
 
     if zone == "SUPPORT":
-        add("CALL", 15, "Price at Major Support Zone (Bounce Setup)")
+        add("CALL", 15, "Price at Support")
     elif zone == "RESISTANCE":
-        add("PUT", 15, "Price at Major Resistance Zone (Reject Setup)")
+        add("PUT", 15, "Price at Resistance")
 
     score["CALL"] = max(0, min(100, int(score["CALL"])))
     score["PUT"] = max(0, min(100, int(score["PUT"])))
@@ -382,7 +359,7 @@ def analyze(symbol, candles_1m):
     }
 
 # ============================================================
-# SET MANAGEMENT & LOCKING
+# SET MANAGEMENT
 # ============================================================
 
 def start_set():
@@ -421,8 +398,6 @@ def daily_reset():
     LAST_EARLY.clear()
     LAST_CONFIRMED.clear()
     for k in DAILY: DAILY[k] = 0
-    for s in STATS:
-        for r in STATS[s]: STATS[s][r] = 0
 
 # ============================================================
 # DISCORD NOTIFICATIONS
@@ -435,20 +410,14 @@ def send_early(data):
     LAST_EARLY[data["symbol"]] = key
 
     icon = "🟡 CALL" if data["direction"] == "CALL" else "🟠 PUT"
-    next_time = datetime.fromtimestamp(data["timestamp"] + 300, timezone.utc).astimezone(THAI_TZ)
-
     send_discord(
-        f"{icon} **OTC EARLY WARNING (เตรียมตัวล่วงหน้า 1 นาที)**\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"คู่ OTC: `{data['symbol']}` | ทิศทาง: **{data['direction']}**\n"
-        f"Score: `{data['score']}/100` | Edge: `+{data['edge']}`\n"
-        f"1H Trend: `{data['structure1h']}` | Zone: `{data['zone']}`\n\n"
-        f"⏰ เตรียมเปิดหน้าจอโบรกเกอร์รอเข้าไม้แท่ง 5M ใหม่ เวลา `{next_time:%H:%M:%S}`"
+        f"{icon} **OTC EARLY WARNING**\n"
+        f"คู่: `{data['symbol']}` | ทิศทาง: **{data['direction']}**\n"
+        f"Score: `{data['score']}/100`"
     )
 
 def send_confirmed(data):
     global CURRENT_STEP
-
     key = (data["symbol"], data["timestamp"], data["direction"])
     if LAST_CONFIRMED.get(data["symbol"]) == key:
         return
@@ -477,28 +446,19 @@ def send_confirmed(data):
     DAILY["signals"] += 1
 
     icon = "🟢" if data["direction"] == "CALL" else "🔴"
-    entry_time = datetime.fromtimestamp(data["timestamp"], timezone.utc).astimezone(THAI_TZ)
-    reasons = "\n".join("• " + x for x in data["reasons"][:5])
-
     send_discord(
         f"🎯 **OTC TRADEIFY CONFIRMED — SET #{SET_NUMBER}**\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
         f"{icon} `{data['symbol']}` → **{data['direction']}**\n"
-        f"🕐 Entry: `{entry_time:%H:%M:%S}` (แท่ง 5M ใหม่)\n"
-        f"🎯 **ไม้ที่ {step}/3** | Stake: **{stake} บาท**\n"
-        f"🧠 Score: `{data['score']}/100` | Edge: `+{data['edge']}`\n\n"
-        f"1H Master: `{data['structure1h']}` | S/R: `{data['zone']}`\n\n"
-        f"📌 เหตุผลตามเทรนด์/แนวรับแนวต้าน:\n{reasons}\n\n"
-        f"🔒 **ล็อกคู่จนกว่าจะรู้ผล (ห้ามยิงซ้ำ)**"
+        f"🎯 ไม้ที่ `{step}/3` | Stake: `{stake} บาท`\n"
+        f"Score: `{data['score']}/100`"
     )
 
 # ============================================================
-# EVALUATE RESULT
+# EVALUATE
 # ============================================================
 
 def evaluate_trades():
     current_time = unix_now()
-
     for key, trade in list(PENDING_TRADES.items()):
         if current_time < trade["expiry"] + 5:
             continue
@@ -525,38 +485,22 @@ def evaluate_trades():
             result = "LOSS"
 
         step = trade["step"]
-        STATS[step][result] += 1
         DAILY[result.lower() + "s" if result != "VOID" else "void"] += 1
 
         if result == "WIN":
             status = "🟢 WIN"
-            set_status = "จบชุด → กลับ STEP 1"
             reset_set_win()
         elif result == "LOSS":
             status = "🔴 LOSS"
-            set_status = advance_loss(step)
+            advance_loss(step)
         else:
             status = "⚪ VOID"
-            set_status = "ไม่เลื่อน Step"
 
-        total = DAILY["wins"] + DAILY["losses"]
-        winrate = (DAILY["wins"] / total * 100) if total else 0
-        expiry_dt = datetime.fromtimestamp(expiry_candle["timestamp"], timezone.utc).astimezone(THAI_TZ)
-
-        send_discord(
-            f"📊 **OTC RESULT — SET #{SET_NUMBER}**\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"คู่: `{trade['symbol']}` | ทิศทาง: `{trade['direction']}` | ไม้: `{step}/3`\n"
-            f"Entry: `{entry:.5f}` → Expiry: `{expiry_price:.5f}`\n"
-            f"เวลาตัดสิน: `{expiry_dt:%H:%M:%S}`\n\n"
-            f"ผลลัพธ์: **{status}** | สถานะชุด: **{set_status}**\n\n"
-            f"📈 สถิติวันนี้ WIN: `{DAILY['wins']}` | LOSS: `{DAILY['losses']}` | Win Rate: `{winrate:.2f}%`"
-        )
-
+        send_discord(f"📊 **OTC RESULT**: `{trade['symbol']}` → **{status}**")
         del PENDING_TRADES[key]
 
 # ============================================================
-# MAIN SCAN LOOP
+# MAIN LOOP
 # ============================================================
 
 def scan_symbol(symbol):
@@ -583,36 +527,16 @@ def scan_symbol(symbol):
 
 def main():
     daily_reset()
-
-    print("==========================================")
-    print("🚀 TRADEIFY v6.2 — OTC SNIPER 3-5 ORDERS/HR")
-    print("MARKET:", MARKET_MODE)
-    print("SYMBOLS:", SYMBOLS)
-    print("==========================================")
-
-    send_discord(
-        "🚀 **TRADEIFY v6.2 OTC SNIPER STARTED**\n"
-        "📈 เป้าหมาย 3-5 ออเดอร์/ชม. (ตามเทรนด์ & S/R)\n"
-        "⏳ แจ้งเตือนล่วงหน้า 1 นาทีก่อนเข้าออเดอร์ 5M\n"
-        "🔒 ล็อกคู่ห้ามยิงซ้ำจนกว่าจะติดตามผลเสร็จ"
-    )
+    print("🚀 TRADEIFY v6.2 — STARTED")
+    send_discord("🚀 **TRADEIFY v6.2 STARTED SUCCESSFULLY**")
 
     while True:
         try:
             daily_reset()
             evaluate_trades()
-
             for symbol in SYMBOLS:
-                try:
-                    scan_symbol(symbol)
-                except Exception as e:
-                    print("[SCAN ERROR]", symbol, e)
-
+                scan_symbol(symbol)
             time.sleep(SCAN_SECONDS)
-
-        except KeyboardInterrupt:
-            print("🛑 BOT STOPPED")
-            break
         except Exception as e:
             print("[MAIN ERROR]", e)
             time.sleep(5)
