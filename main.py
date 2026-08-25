@@ -30,13 +30,12 @@ DISCORD_WEBHOOK_URL = os.getenv(
 
 MARKET_MODE = os.getenv("MARKET_MODE", "OTC").upper()
 
-# ป้องกัน API Key หลุดขึ้น GitHub โดยใช้ os.getenv และกำหนดค่าFallbackเป็นค่าว่างไว้
-OTC_API_URL = os.getenv("OTC_API_URL", "").strip()
+# ใส่ API Key ตรงๆ แบบเดิมที่คุณเคยรันได้ปกติ
+OTC_API_URL = "AQ.Ab8RN6Kf0n8HxT1rM-vHdvooYqfBItwnLyNtCLiqYslQImle5Q"
 
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "10"))
 EXPIRY_SECONDS = int(os.getenv("EXPIRY_SECONDS", "300")) # 5 นาที
 
-# ปรับเกณฑ์ Score/Edge ให้ได้ออเดอร์สม่ำเสมอ 3-5 ไม้/ชม. แต่ยังแม่นยำสูง
 MIN_SCORE = 75
 MIN_EDGE = 12
 
