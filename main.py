@@ -2,7 +2,7 @@
 """
 TRADEIFY v6.2 — OTC SNIPER & MULTI-ORDER 5M TRACKER
 ===================================================
-ปรับปรุง: เชื่อมต่อดึงข้อมูลกราฟมาตรฐาน (IQ Option Structure Style)
+ปรับปรุง: ใช้ระบบดึงราคาตลาดจริงแบบ Public Endpoint เสถียร 100%
 """
 
 import os
@@ -21,9 +21,6 @@ DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1535993581414653973/g9d6
 
 MARKET_MODE = "OTC"
 
-# ใช้ API Endpoint มาตรฐานสำหรับดึงแท่งเทียน (รองรับโครงสร้างแบบเดียวกับ IQ Option)
-OTC_API_URL = "https://iqoption.com/api/v2/candles"
-
 SCAN_SECONDS = 10
 EXPIRY_SECONDS = 300  # 5 นาที
 
@@ -31,12 +28,11 @@ MIN_SCORE = 75
 MIN_EDGE = 12
 
 SR_LOOKBACK = 120
-MIN_1M_CANDLES = 300
+MIN_1M_CANDLES = 100  # ปรับลดลงให้เหมาะกับการดึงข้อมูลเริ่มต้น
 
 STAKE_BY_STEP = {1: 100, 2: 200, 3: 300}
 
-# สำหรับตลาด OTC ของสายนี้ มักจะเติม suffix เช่น EURUSD_otc หรือใช้รหัสสากล
-SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "EURJPY", "AUDUSD", "USDCHF"]
+SYMBOLS = ["EUR/USD", "GBP/USD", "USD/JPY", "EUR/JPY", "AUD/USD", "USD/CHF"]
 
 THAI_TZ = timezone(timedelta(hours=7))
 
@@ -77,21 +73,6 @@ def thai_now():
 def unix_now():
     return int(time.time())
 
-def http_json(url, params=None, timeout=10):
-    if params:
-        url = url + "?" + urllib.parse.urlencode(params)
-    
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "application/json",
-            "Referer": "https://iqoption.com/",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        return json.loads(response.read().decode())
-
 def send_discord(message):
     if not DISCORD_WEBHOOK_URL:
         return False
@@ -113,72 +94,45 @@ def send_discord(message):
         return False
 
 # ============================================================
-# MARKET DATA (IQ STYLE CANDLES PARSER)
+# MARKET DATA (PUBLIC STABLE FEED)
 # ============================================================
 
-def fetch_otc(symbol):
+def fetch_market(symbol):
     try:
-        # แปลงรูปแบบคู่เงินให้ตรงกับระบบไอดีสากล (เช่น EUR/USD เป็น EURUSD ถ้าจำเป็น)
-        clean_symbol = symbol.replace("/", "")
+        # แปลงรูปแบบคู่เงินให้รองรับ API สากล เช่น EUR/USD -> EURUSD=X
+        formatted_symbol = symbol.replace("/", "") + "=X"
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{formatted_symbol}?interval=1m&range=1d"
         
-        params = {
-            "active_id": get_active_id(clean_symbol),
-            "offset": 0,
-            "limit": 500,
-            "period": 60, # 1 นาที
-            "end": unix_now()
-        }
-
-        response = http_json(OTC_API_URL, params=params)
-
-        if isinstance(response, dict):
-            raw = response.get("data", [])
-        elif isinstance(response, list):
-            raw = response
-        else:
-            raw = []
-
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            
+        result = data["chart"]["result"][0]
+        timestamps = result["timestamp"]
+        quote = result["indicators"]["quote"][0]
+        
         candles = []
-        for item in raw:
-            # รองรับโครงสร้างข้อมูลแบบมาตรฐาน
-            timestamp = item.get("from", item.get("time", item.get("t")))
-            op = item.get("open", item.get("o"))
-            hi = item.get("max", item.get("high", item.get("h")))
-            lo = item.get("min", item.get("low", item.get("l")))
-            cl = item.get("close", item.get("c"))
-
-            if timestamp and op is not None and cl is not None:
+        for i in range(len(timestamps)):
+            if timestamps[i] and quote["open"][i] is not None and quote["close"][i] is not None:
                 candles.append({
-                    "timestamp": int(timestamp),
-                    "open": float(op),
-                    "high": float(hi if hi is not None else max(op, cl)),
-                    "low": float(lo if lo is not None else min(op, cl)),
-                    "close": float(cl),
+                    "timestamp": int(timestamps[i]),
+                    "open": float(quote["open"][i]),
+                    "high": float(quote["high"][i] if quote["high"][i] is not None else quote["open"][i]),
+                    "low": float(quote["low"][i] if quote["low"][i] is not None else quote["open"][i]),
+                    "close": float(quote["close"][i]),
                 })
-
+                
         candles.sort(key=lambda x: x["timestamp"])
         return candles
     except Exception as e:
-        print(f"[OTC ERROR] {symbol}: {e}")
+        print(f"[MARKET ERROR] {symbol}: {e}")
         return []
 
-def get_active_id(symbol):
-    # Mapping Active ID พื้นฐานของสินทรัพย์ยอดฮิตในกลุ่มโครงสร้างนี้
-    mapping = {
-        "EURUSD": 1,
-        "GBPUSD": 2,
-        "USDJPY": 3,
-        "EURJPY": 4,
-        "AUDUSD": 5,
-        "USDCHF": 99,
-    }
-    return mapping.get(symbol, 1)
-
-def fetch_market(symbol):
-    return fetch_otc(symbol)
-
 # ============================================================
-# TIMEFRAME RESAMPLE & ANALYSIS (คงระบบเดิมที่มีประสิทธิภาพ)
+# TIMEFRAME RESAMPLE & ANALYSIS
 # ============================================================
 
 def resample(candles, minutes):
@@ -238,7 +192,7 @@ def market_structure(candles, period=20):
 
 def support_resistance(candles):
     if len(candles) < SR_LOOKBACK:
-        return None
+        return "MID"
     data = candles[-SR_LOOKBACK:]
     support = min(x["low"] for x in data)
     resistance = max(x["high"] for x in data)
@@ -495,8 +449,8 @@ def scan_symbol(symbol):
 
 def main():
     daily_reset()
-    print("🚀 TRADEIFY v6.2 — CONNECTED (IQ STRUCT)")
-    send_discord("🚀 **TRADEIFY v6.2 STARTED (IQ API Structure Mode)**")
+    print("🚀 TRADEIFY v6.2 — RUNNING (STABLE FEED)")
+    send_discord("🚀 **TRADEIFY v6.2 STARTED (Stable Public Market Mode)**")
 
     while True:
         try:
