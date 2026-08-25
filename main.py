@@ -209,7 +209,6 @@ def analyze(symbol, candles_1m):
 def bot_loop():
     global CURRENT_DAY, CURRENT_STEP, SET_ACTIVE, SET_NUMBER
     print("🚀 TRADEIFY v6.2 — BACKGROUND WORKER STARTED")
-    send_discord("🚀 **TRADEIFY v6.2 STARTED (Web Service Mode)**")
     while True:
         try:
             today = thai_now().strftime("%Y-%m-%d")
@@ -275,4 +274,4 @@ if __name__ == "__main__":
     t.daemon = True
     t.start()
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
