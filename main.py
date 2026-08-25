@@ -29,6 +29,8 @@ DISCORD_WEBHOOK_URL = os.getenv(
 ).strip()
 
 MARKET_MODE = os.getenv("MARKET_MODE", "OTC").upper()
+
+# ป้องกัน API Key หลุดขึ้น GitHub โดยใช้ os.getenv และกำหนดค่าFallbackเป็นค่าว่างไว้
 OTC_API_URL = os.getenv("OTC_API_URL", "").strip()
 
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "10"))
@@ -236,23 +238,6 @@ def calculate_ema(values, period):
         result = value * multiplier + result * (1 - multiplier)
     return result
 
-def calculate_rsi(values, period=14):
-    if len(values) < period + 1:
-        return None
-    gains, losses = [], []
-    for i in range(1, len(values)):
-        diff = values[i] - values[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    avg_gain = mean(gains[:period])
-    avg_loss = mean(losses[:period])
-    for i in range(period, len(gains)):
-        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
-        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
-    if avg_loss == 0:
-        return 100
-    return 100 - 100 / (1 + avg_gain / avg_loss)
-
 def market_structure(candles, period=20):
     if len(candles) < period:
         return "RANGE", 0
@@ -331,7 +316,6 @@ def analyze(symbol, candles_1m):
         score[d] += pts
         reasons[d].append(r)
 
-    # 1. เทรนด์ใหญ่ 1H + 15M (ดันให้วิ่งยาวเกิน 2 แท่ง)
     if structure1h == "CALL":
         add("CALL", 35, "1H Master Trend UP (Strong Trend)")
     elif structure1h == "PUT":
@@ -342,7 +326,6 @@ def analyze(symbol, candles_1m):
     elif structure15 == "PUT":
         add("PUT", 25, "15M Confirm DOWN")
 
-    # 2. โมเมนตัม EMA
     if ema1h_9 > ema1h_21:
         add("CALL", 15, "1H EMA Bullish Alignment")
     elif ema1h_9 < ema1h_21:
@@ -353,7 +336,6 @@ def analyze(symbol, candles_1m):
     elif ema5_9 < ema5_21:
         add("PUT", 10, "5M Momentum DOWN")
 
-    # 3. แนวรับแนวต้าน (S/R)
     if zone == "SUPPORT":
         add("CALL", 15, "Price at Major Support Zone (Bounce Setup)")
     elif zone == "RESISTANCE":
@@ -372,7 +354,6 @@ def analyze(symbol, candles_1m):
     opposite = "PUT" if direction == "CALL" else "CALL"
     edge = score[direction] - score[opposite]
 
-    # เงื่อนไขคัดกรองให้ได้จำนวนออเดอร์เหมาะสมและแม่นยำสูง
     early = (
         structure1h == direction
         and score[direction] >= MIN_SCORE - 6
@@ -445,7 +426,7 @@ def daily_reset():
         for r in STATS[s]: STATS[s][r] = 0
 
 # ============================================================
-# DISCORD NOTIFICATIONS (EARLY & CONFIRMED)
+# DISCORD NOTIFICATIONS
 # ============================================================
 
 def send_early(data):
@@ -473,7 +454,6 @@ def send_confirmed(data):
     if LAST_CONFIRMED.get(data["symbol"]) == key:
         return
 
-    # เช็กห้ามยิงซ้ำถ้ามีคู่นี้ค้างอยู่ใน Pending
     for trade in PENDING_TRADES.values():
         if trade["symbol"] == data["symbol"]:
             return
@@ -514,7 +494,7 @@ def send_confirmed(data):
     )
 
 # ============================================================
-# EVALUATE RESULT (ตลาด OTC จริง)
+# EVALUATE RESULT
 # ============================================================
 
 def evaluate_trades():
