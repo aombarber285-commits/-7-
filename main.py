@@ -1,62 +1,634 @@
+# -*- coding: utf-8 -*-
+
+import os
+import time
+import logging
+import threading
+from datetime import datetime, timezone, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import numpy as np
+import pandas as pd
+import requests
+
+
 # =========================================================
-# TRADEIFY V8
+# TRADEIFY V8 REAL FOREX
+# 20 PAIRS
 # 15M MASTER + 5M ENTRY
-# SEPARATE SCORE / GAP
+# TWELVE DATA + DISCORD + RAILWAY
 # =========================================================
+
+
+APP_NAME = "TRADEIFY V8 REAL FOREX"
+
+
 # =========================================================
-# GENERIC CANDLE DATA
+# RAILWAY VARIABLES
 # =========================================================
-def get_signal_candle(df):
-    if len(df) < 4:
-        raise ValueError(
-            "ข้อมูลแท่งไม่เพียงพอ"
+
+TWELVE_DATA_API_KEY = os.getenv(
+    "TWELVE_DATA_API_KEY",
+    ""
+).strip()
+
+DISCORD_WEBHOOK_URL = os.getenv(
+    "DISCORD_WEBHOOK_URL",
+    ""
+).strip()
+
+PORT = int(
+    os.getenv(
+        "PORT",
+        "8080"
+    )
+)
+
+SCAN_SECONDS = int(
+    os.getenv(
+        "SCAN_SECONDS",
+        "15"
+    )
+)
+
+
+# =========================================================
+# 20 REAL FOREX PAIRS
+# =========================================================
+
+SYMBOLS = [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "USDCHF",
+    "AUDUSD",
+    "USDCAD",
+    "NZDUSD",
+    "EURGBP",
+    "EURJPY",
+    "EURCHF",
+    "EURAUD",
+    "EURCAD",
+    "EURNZD",
+    "GBPJPY",
+    "GBPCHF",
+    "GBPAUD",
+    "AUDJPY",
+    "AUDCAD",
+    "AUDNZD",
+    "CADJPY"
+]
+
+
+# =========================================================
+# V8 SETTINGS
+# =========================================================
+
+MIN_SCORE = 68
+MIN_GAP = 8
+
+PRE_SCORE = MIN_SCORE - 10
+
+EMA_FAST_LEN = 9
+EMA_SLOW_LEN = 21
+EMA_TREND_LEN = 50
+
+RSI_PERIOD = 14
+RSI_MID = 50
+
+SR_PERIOD = 80
+
+STRICT_MODE = False
+
+
+# =========================================================
+# TWELVE DATA
+# =========================================================
+
+TWELVE_DATA_URL = (
+    "https://api.twelvedata.com/time_series"
+)
+
+
+# =========================================================
+# TIMEZONE
+# =========================================================
+
+THAI_TZ = timezone(
+    timedelta(hours=7)
+)
+
+
+def thai_now():
+    return datetime.now(
+        THAI_TZ
+    )
+
+
+# =========================================================
+# LOGGING
+# =========================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(message)s"
+    )
+)
+
+logger = logging.getLogger(
+    APP_NAME
+)
+
+
+# =========================================================
+# CACHE
+# =========================================================
+
+MARKET_CACHE = {}
+
+LAST_CLOSED_CANDLE = {}
+
+LAST_SIGNAL = {}
+
+LAST_CHECK = {}
+
+LAST_HEARTBEAT = 0
+
+
+# =========================================================
+# SYMBOL CONVERTER
+# =========================================================
+
+def normalize_symbol(
+    symbol
+):
+
+    symbol = str(
+        symbol
+    ).strip().upper()
+
+    if symbol.endswith(
+        "_OTC"
+    ):
+
+        symbol = symbol[:-4]
+
+    if (
+        "/" not in symbol
+        and
+        len(symbol) == 6
+    ):
+
+        return (
+            symbol[:3]
+            + "/"
+            + symbol[3:]
         )
+
+    return symbol
+
+
+# =========================================================
+# INTERVAL CONVERTER
+# =========================================================
+
+def normalize_interval(
+    timeframe
+):
+
+    mapping = {
+
+        "1m": "1min",
+
+        "5m": "5min",
+
+        "15m": "15min",
+
+        "30m": "30min",
+
+        "1h": "1h",
+
+        "4h": "4h",
+
+        "1d": "1day"
+
+    }
+
+    return mapping.get(
+        str(
+            timeframe
+        ).lower().strip(),
+        timeframe
+    )
+
+
+# =========================================================
+# GET MARKET DATA
+# =========================================================
+
+def get_market_data(
+    symbol,
+    timeframe,
+    limit=200
+):
+
+    if not TWELVE_DATA_API_KEY:
+
+        raise RuntimeError(
+            "ไม่พบ TWELVE_DATA_API_KEY "
+            "ใน Railway Variables"
+        )
+
+    td_symbol = normalize_symbol(
+        symbol
+    )
+
+    interval = normalize_interval(
+        timeframe
+    )
+
+    params = {
+
+        "symbol":
+            td_symbol,
+
+        "interval":
+            interval,
+
+        "outputsize":
+            int(limit),
+
+        "timezone":
+            "Asia/Bangkok",
+
+        "apikey":
+            TWELVE_DATA_API_KEY
+    }
+
+    try:
+
+        response = requests.get(
+            TWELVE_DATA_URL,
+            params=params,
+            timeout=20
+        )
+
+    except requests.RequestException as e:
+
+        raise RuntimeError(
+            f"Twelve Data connection error: {e}"
+        )
+
+    if response.status_code != 200:
+
+        raise RuntimeError(
+            f"Twelve Data HTTP "
+            f"{response.status_code}"
+        )
+
+    try:
+
+        data = response.json()
+
+    except Exception:
+
+        raise RuntimeError(
+            "Twelve Data JSON ERROR"
+        )
+
+    if data.get(
+        "status"
+    ) == "error":
+
+        raise RuntimeError(
+            "Twelve Data ERROR: "
+            +
+            str(
+                data.get(
+                    "message",
+                    "Unknown error"
+                )
+            )
+        )
+
+    values = data.get(
+        "values"
+    )
+
+    if not values:
+
+        raise RuntimeError(
+            f"ไม่มีข้อมูล {td_symbol}"
+        )
+
+    df = pd.DataFrame(
+        values
+    )
+
+    required = [
+        "datetime",
+        "open",
+        "high",
+        "low",
+        "close"
+    ]
+
+    for column in required:
+
+        if column not in df.columns:
+
+            raise RuntimeError(
+                f"ขาด column {column}"
+            )
+
+    df["datetime"] = pd.to_datetime(
+        df["datetime"],
+        errors="coerce"
+    )
+
+    for column in [
+        "open",
+        "high",
+        "low",
+        "close"
+    ]:
+
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce"
+        )
+
+    df = df.dropna(
+        subset=required
+    )
+
+    df = df.sort_values(
+        "datetime"
+    )
+
+    df = df.reset_index(
+        drop=True
+    )
+
+    if len(df) < 85:
+
+        raise RuntimeError(
+            f"{td_symbol} {interval} "
+            f"ข้อมูลไม่พอ: {len(df)}"
+        )
+
+    return df[
+        required
+    ]
+
+
+# =========================================================
+# CLOSED CANDLE
+# =========================================================
+
+def get_closed_candle(
+    df
+):
+
+    if len(df) < 2:
+
+        return None
+
+    return df[
+        "datetime"
+    ].iloc[-2]
+
+
+# =========================================================
+# FETCH / CACHE
+# =========================================================
+
+def refresh_market(
+    symbol,
+    timeframe
+):
+
+    key = (
+        symbol,
+        timeframe
+    )
+
+    old_df = MARKET_CACHE.get(
+        key
+    )
+
+    df = get_market_data(
+        symbol,
+        timeframe,
+        200
+    )
+
+    MARKET_CACHE[key] = (
+        df.copy()
+    )
+
+    old_candle = None
+
+    if old_df is not None:
+
+        old_candle = (
+            get_closed_candle(
+                old_df
+            )
+        )
+
+    new_candle = (
+        get_closed_candle(
+            df
+        )
+    )
+
+    changed = (
+        old_candle !=
+        new_candle
+    )
+
+    LAST_CLOSED_CANDLE[key] = (
+        new_candle
+    )
+
+    return df, changed
+
+
+# =========================================================
+# EMA
+# =========================================================
+
+def calculate_ema(
+    series,
+    period
+):
+
+    return series.ewm(
+        span=period,
+        adjust=False
+    ).mean()
+
+
+# =========================================================
+# RSI
+# =========================================================
+
+def calculate_rsi(
+    series,
+    period=14
+):
+
+    delta = series.diff()
+
+    gain = delta.clip(
+        lower=0
+    )
+
+    loss = -delta.clip(
+        upper=0
+    )
+
+    avg_gain = gain.ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
+
+    rs = (
+        avg_gain /
+        avg_loss.replace(
+            0,
+            np.nan
+        )
+    )
+
+    result = (
+        100 -
+        (
+            100 /
+            (1 + rs)
+        )
+    )
+
+    return result.fillna(
+        50
+    )
+
+
+# =========================================================
+# INDICATORS
+# =========================================================
+
+def add_indicators(
+    df
+):
+
+    df = df.copy()
+
+    df["ema_fast"] = (
+        calculate_ema(
+            df["close"],
+            EMA_FAST_LEN
+        )
+    )
+
+    df["ema_slow"] = (
+        calculate_ema(
+            df["close"],
+            EMA_SLOW_LEN
+        )
+    )
+
+    df["ema_trend"] = (
+        calculate_ema(
+            df["close"],
+            EMA_TREND_LEN
+        )
+    )
+
+    df["rsi"] = (
+        calculate_rsi(
+            df["close"],
+            RSI_PERIOD
+        )
+    )
+
+    return df
+
+
+# =========================================================
+# V8 SCORE ENGINE
+# =========================================================
+
+def calculate_tf_score(
+    df
+):
+
+    if len(df) < 85:
+
+        raise ValueError(
+            "V8 DATA NOT ENOUGH"
+        )
+
     i = -2
     p = -3
-    return {
-        "open": float(df["open"].iloc[i]),
-        "high": float(df["high"].iloc[i]),
-        "low": float(df["low"].iloc[i]),
-        "close": float(df["close"].iloc[i]),
-        "prev_open": float(df["open"].iloc[p]),
-        "prev_high": float(df["high"].iloc[p]),
-        "prev_low": float(df["low"].iloc[p]),
-        "prev_close": float(df["close"].iloc[p])
-    }
-# =========================================================
-# TIMEFRAME SCORE
-# =========================================================
-def calculate_tf_score(df):
-    if len(df) < 85:
-        raise ValueError(
-            "ข้อมูลไม่พอสำหรับ TF Score"
-        )
-    candle = get_signal_candle(df)
-    o = candle["open"]
-    h = candle["high"]
-    l = candle["low"]
-    c = candle["close"]
-    ph = candle["prev_high"]
-    pl = candle["prev_low"]
-    pc = candle["prev_close"]
-    # -----------------------------------------------------
-    # BULL / BEAR
-    # -----------------------------------------------------
-    bull = c > o
-    bear = c < o
-    # -----------------------------------------------------
+
+    o = float(
+        df["open"].iloc[i]
+    )
+
+    h = float(
+        df["high"].iloc[i]
+    )
+
+    l = float(
+        df["low"].iloc[i]
+    )
+
+    c = float(
+        df["close"].iloc[i]
+    )
+
+    ph = float(
+        df["high"].iloc[p]
+    )
+
+    pl = float(
+        df["low"].iloc[p]
+    )
+
+    pc = float(
+        df["close"].iloc[p]
+    )
+
+    # =====================================================
     # STRUCTURE
-    # -----------------------------------------------------
+    # =====================================================
+
+    bull = c > o
+
+    bear = c < o
+
     structure_up = (
         h >= ph
         or
         l >= pl
     )
+
     structure_down = (
         h <= ph
         or
         l <= pl
     )
+
     trend_call = (
         bull
         and
@@ -64,6 +636,7 @@ def calculate_tf_score(df):
         and
         c >= pc
     )
+
     trend_put = (
         bear
         and
@@ -71,345 +644,453 @@ def calculate_tf_score(df):
         and
         c <= pc
     )
-    # -----------------------------------------------------
+
+    # =====================================================
     # EMA
-    # -----------------------------------------------------
-    ema_fast = float(
-        df["ema_fast"].iloc[-2]
+    # =====================================================
+
+    ef = float(
+        df["ema_fast"].iloc[i]
     )
-    ema_slow = float(
-        df["ema_slow"].iloc[-2]
+
+    es = float(
+        df["ema_slow"].iloc[i]
     )
-    ema_trend = float(
-        df["ema_trend"].iloc[-2]
+
+    et = float(
+        df["ema_trend"].iloc[i]
     )
+
     ema_call = (
-        ema_fast > ema_slow
+        ef > es
         and
-        ema_slow > ema_trend
+        es > et
     )
+
     ema_put = (
-        ema_fast < ema_slow
+        ef < es
         and
-        ema_slow < ema_trend
+        es < et
     )
-    # -----------------------------------------------------
+
+    # =====================================================
     # RSI
-    # -----------------------------------------------------
+    # =====================================================
+
     rsi_value = float(
-        df["rsi"].iloc[-2]
+        df["rsi"].iloc[i]
     )
-    # -----------------------------------------------------
-    # CANDLE ANATOMY
-    # -----------------------------------------------------
-    body = abs(
-        c - o
-    )
+
+    # =====================================================
+    # CANDLE
+    # =====================================================
+
     candle_range = max(
         h - l,
         0.00000001
     )
+
+    body = abs(
+        c - o
+    )
+
     upper_wick = (
-        h - max(o, c)
+        h -
+        max(
+            o,
+            c
+        )
     )
+
     lower_wick = (
-        min(o, c) - l
+        min(
+            o,
+            c
+        ) -
+        l
     )
+
     upper_ratio = (
         upper_wick /
         candle_range
     )
+
     lower_ratio = (
         lower_wick /
         candle_range
     )
+
     bull_rejection = (
         bull
         and
         lower_ratio >= 0.18
     )
+
     bear_rejection = (
         bear
         and
         upper_ratio >= 0.18
     )
-    # -----------------------------------------------------
+
+    # =====================================================
     # FLOW
-    # -----------------------------------------------------
+    # =====================================================
+
     c1 = float(
         df["close"].iloc[-2]
     )
+
     c2 = float(
         df["close"].iloc[-3]
     )
+
     c3 = float(
         df["close"].iloc[-4]
     )
+
     flow_up = (
         c1 >= c2
         and
         c2 >= c3
     )
+
     flow_down = (
         c1 <= c2
         and
         c2 <= c3
     )
-    # -----------------------------------------------------
-    # SUPPORT / RESISTANCE
-    # -----------------------------------------------------
-    closed_df = df.iloc[:-1]
+
+    # =====================================================
+    # SUPPORT RESISTANCE
+    # =====================================================
+
+    history = df.iloc[:-1]
+
     support = float(
-        closed_df["low"]
-        .tail(SR_PERIOD)
+        history[
+            "low"
+        ]
+        .tail(
+            SR_PERIOD
+        )
         .min()
     )
+
     resistance = float(
-        closed_df["high"]
-        .tail(SR_PERIOD)
+        history[
+            "high"
+        ]
+        .tail(
+            SR_PERIOD
+        )
         .max()
     )
+
     sr_range = max(
-        resistance - support,
+        resistance -
+        support,
         0.00000001
     )
+
     near_support = (
         c <=
         support +
         sr_range * 0.22
     )
+
     near_resistance = (
         c >=
         resistance -
         sr_range * 0.22
     )
+
     room_call = (
-        resistance - c
+        resistance -
+        c
     ) / sr_range
+
     room_put = (
-        c - support
+        c -
+        support
     ) / sr_range
+
     enough_room_call = (
         room_call >= 0.15
     )
+
     enough_room_put = (
         room_put >= 0.15
     )
-    # -----------------------------------------------------
+
+    # =====================================================
     # PULLBACK
-    # -----------------------------------------------------
+    # =====================================================
+
     pullback_call = (
         (
-            l <= ema_fast
+            l <= ef
             or
-            l <= ema_slow
+            l <= es
             or
             near_support
         )
         and
-        c >= ema_fast
+        c >= ef
     )
+
     pullback_put = (
         (
-            h >= ema_fast
+            h >= ef
             or
-            h >= ema_slow
+            h >= es
             or
             near_resistance
         )
         and
-        c <= ema_fast
+        c <= ef
     )
+
     # =====================================================
     # SCORE
     # =====================================================
+
     call_score = 0
     put_score = 0
-    # MASTER STRUCTURE
+
     if trend_call:
         call_score += 30
+
     if trend_put:
         put_score += 30
-    # EMA
+
     if ema_call:
         call_score += 12
+
     if ema_put:
         put_score += 12
-    # FLOW
+
     if flow_up:
         call_score += 8
+
     if flow_down:
         put_score += 8
-    # REJECTION
+
     if bull_rejection:
         call_score += 12
+
     if bear_rejection:
         put_score += 12
-    # RSI
+
     if rsi_value > RSI_MID:
         call_score += 5
+
     if rsi_value < RSI_MID:
         put_score += 5
-    # PULLBACK
+
     if pullback_call:
         call_score += 8
+
     if pullback_put:
         put_score += 8
-    # ROOM
+
     if enough_room_call:
         call_score += 5
+
     if enough_room_put:
         put_score += 5
-    # SUPPORT
+
     if near_support:
         call_score += 5
-    # RESISTANCE
+
     if near_resistance:
         put_score += 5
+
+    # =====================================================
     # PENALTY
+    # =====================================================
+
     if near_resistance:
+
         call_score -= 8
+
     if near_support:
+
         put_score -= 8
+
+    # =====================================================
     # LIMIT
-    call_score = max(
-        0,
-        min(
-            call_score,
-            100
+    # =====================================================
+
+    call_score = int(
+        max(
+            0,
+            min(
+                call_score,
+                100
+            )
         )
     )
-    put_score = max(
-        0,
-        min(
-            put_score,
-            100
+
+    put_score = int(
+        max(
+            0,
+            min(
+                put_score,
+                100
+            )
         )
     )
+
     # =====================================================
     # GAP
     # =====================================================
+
     gap = (
         call_score -
         put_score
     )
+
     # =====================================================
     # DIRECTION
     # =====================================================
+
     if (
         call_score >= MIN_SCORE
         and
         gap >= MIN_GAP
     ):
+
         direction = "CALL"
+
     elif (
         put_score >= MIN_SCORE
         and
         -gap >= MIN_GAP
     ):
+
         direction = "PUT"
+
     elif (
         call_score >= PRE_SCORE
         and
         gap >= MIN_GAP
     ):
+
         direction = "PRE CALL"
+
     elif (
         put_score >= PRE_SCORE
         and
         -gap >= MIN_GAP
     ):
+
         direction = "PRE PUT"
+
     else:
+
         direction = "WAIT"
-    # =====================================================
-    # RETURN
-    # =====================================================
+
     return {
-        "direction": direction,
-        "call_score": call_score,
-        "put_score": put_score,
-        "gap": gap,
-        "trend_call": trend_call,
-        "trend_put": trend_put,
-        "ema_call": ema_call,
-        "ema_put": ema_put,
-        "flow_up": flow_up,
-        "flow_down": flow_down,
+
+        "direction":
+            direction,
+
+        "call_score":
+            call_score,
+
+        "put_score":
+            put_score,
+
+        "gap":
+            gap,
+
+        "trend_call":
+            trend_call,
+
+        "trend_put":
+            trend_put,
+
+        "ema_call":
+            ema_call,
+
+        "ema_put":
+            ema_put,
+
+        "flow_up":
+            flow_up,
+
+        "flow_down":
+            flow_down,
+
         "bull_rejection":
             bull_rejection,
+
         "bear_rejection":
             bear_rejection,
+
         "pullback_call":
             pullback_call,
+
         "pullback_put":
             pullback_put,
+
         "near_support":
             near_support,
+
         "near_resistance":
             near_resistance,
+
         "room_call":
             room_call,
+
         "room_put":
             room_put,
+
         "rsi":
             rsi_value,
+
         "price":
             c,
+
         "support":
             support,
+
         "resistance":
             resistance
     }
+
+
 # =========================================================
-# V8 MASTER + ENTRY
+# MASTER + ENTRY
 # =========================================================
+
 def calculate_v8_score(
     df15,
-    df5,
-    strict_mode=False
+    df5
 ):
-    # -----------------------------------------------------
-    # 15M MASTER SCORE
-    # -----------------------------------------------------
+
     master = calculate_tf_score(
         df15
     )
-    # -----------------------------------------------------
-    # 5M ENTRY SCORE
-    # -----------------------------------------------------
+
     entry = calculate_tf_score(
         df5
     )
-    # =====================================================
-    # 15M MASTER DIRECTION
-    # =====================================================
+
     master_call = (
         master["direction"] == "CALL"
     )
+
     master_put = (
         master["direction"] == "PUT"
     )
-    # -----------------------------------------------------
-    # PRE MASTER
-    # -----------------------------------------------------
-    pre_master_call = (
-        master["call_score"] >= PRE_SCORE
-        and
-        master["gap"] >= MIN_GAP
-    )
-    pre_master_put = (
-        master["put_score"] >= PRE_SCORE
-        and
-        -master["gap"] >= MIN_GAP
-    )
-    # =====================================================
-    # 5M ENTRY
-    # =====================================================
+
     entry_call = (
-        entry["call_score"] >= MIN_SCORE
+        entry["call_score"]
+        >= MIN_SCORE
         and
-        entry["gap"] >= MIN_GAP
+        entry["gap"]
+        >= MIN_GAP
         and
         entry["ema_call"]
         and
@@ -417,10 +1098,13 @@ def calculate_v8_score(
         and
         entry["pullback_call"]
     )
+
     entry_put = (
-        entry["put_score"] >= MIN_SCORE
+        entry["put_score"]
+        >= MIN_SCORE
         and
-        -entry["gap"] >= MIN_GAP
+        -entry["gap"]
+        >= MIN_GAP
         and
         entry["ema_put"]
         and
@@ -428,254 +1112,769 @@ def calculate_v8_score(
         and
         entry["pullback_put"]
     )
-    # -----------------------------------------------------
-    # STRICT
-    # -----------------------------------------------------
-    if strict_mode:
+
+    if STRICT_MODE:
+
         entry_call = (
             entry_call
             and
             entry["flow_up"]
         )
+
         entry_put = (
             entry_put
             and
             entry["flow_down"]
         )
+
     # =====================================================
     # FINAL
     # =====================================================
-    final_direction = "WAIT"
-    final_reason = (
+
+    final = "WAIT"
+
+    reason = (
         "ยังไม่ครบเงื่อนไข"
     )
-    # -----------------------------------------------------
-    # MASTER CALL + ENTRY CALL
-    # -----------------------------------------------------
+
     if (
         master_call
         and
         entry_call
     ):
-        final_direction = "CALL"
-        final_reason = (
+
+        final = "CALL"
+
+        reason = (
             "15M MASTER CALL + "
             "5M ENTRY CALL"
         )
-    # -----------------------------------------------------
-    # MASTER PUT + ENTRY PUT
-    # -----------------------------------------------------
+
     elif (
         master_put
         and
         entry_put
     ):
-        final_direction = "PUT"
-        final_reason = (
+
+        final = "PUT"
+
+        reason = (
             "15M MASTER PUT + "
             "5M ENTRY PUT"
         )
-    # -----------------------------------------------------
-    # PRE CALL
-    # -----------------------------------------------------
+
     elif (
-        (
-            master_call
-            or
-            pre_master_call
-        )
+        master_call
         and
-        entry["direction"] in (
+        entry["direction"]
+        in (
             "PRE CALL",
             "CALL"
         )
     ):
-        final_direction = "PRE CALL"
-        final_reason = (
-            "15M เริ่มเป็น CALL "
-            "+ 5M กำลังยืนยัน"
+
+        final = "PRE CALL"
+
+        reason = (
+            "15M CALL + "
+            "5M กำลังยืนยัน"
         )
-    # -----------------------------------------------------
-    # PRE PUT
-    # -----------------------------------------------------
+
     elif (
-        (
-            master_put
-            or
-            pre_master_put
-        )
+        master_put
         and
-        entry["direction"] in (
+        entry["direction"]
+        in (
             "PRE PUT",
             "PUT"
         )
     ):
-        final_direction = "PRE PUT"
-        final_reason = (
-            "15M เริ่มเป็น PUT "
-            "+ 5M กำลังยืนยัน"
+
+        final = "PRE PUT"
+
+        reason = (
+            "15M PUT + "
+            "5M กำลังยืนยัน"
         )
-    # -----------------------------------------------------
-    # CONFLICT
-    # -----------------------------------------------------
+
     elif (
         master_call
         and
         entry["direction"] == "PUT"
     ):
-        final_direction = "WAIT"
-        final_reason = (
-            "15M CALL แต่ 5M PUT "
-            "→ BLOCK"
+
+        final = "WAIT"
+
+        reason = (
+            "15M CALL / "
+            "5M PUT BLOCK"
         )
+
     elif (
         master_put
         and
         entry["direction"] == "CALL"
     ):
-        final_direction = "WAIT"
-        final_reason = (
-            "15M PUT แต่ 5M CALL "
-            "→ BLOCK"
+
+        final = "WAIT"
+
+        reason = (
+            "15M PUT / "
+            "5M CALL BLOCK"
         )
-    # =====================================================
-    # RETURN
-    # =====================================================
+
     return {
+
         "direction":
-            final_direction,
+            final,
+
         "reason":
-            final_reason,
-        # 15M
+            reason,
+
         "master":
             master,
-        "master_direction":
-            master["direction"],
-        "master_call":
-            master_call,
-        "master_put":
-            master_put,
-        # 5M
+
         "entry":
-            entry,
-        "entry_direction":
-            entry["direction"],
-        "entry_call":
-            entry_call,
-        "entry_put":
-            entry_put
+            entry
     }
+
+
+# =========================================================
+# DISCORD
+# =========================================================
+
+def send_discord(
+    message
+):
+
+    if not DISCORD_WEBHOOK_URL:
+
+        logger.error(
+            "DISCORD_WEBHOOK_URL NOT SET"
+        )
+
+        return False
+
+    try:
+
+        response = requests.post(
+            DISCORD_WEBHOOK_URL,
+            json={
+                "content": message
+            },
+            timeout=15
+        )
+
+        if response.status_code in (
+            200,
+            204
+        ):
+
+            logger.info(
+                "DISCORD SENT"
+            )
+
+            return True
+
+        logger.error(
+            "DISCORD ERROR %s | %s",
+            response.status_code,
+            response.text[:300]
+        )
+
+    except Exception as e:
+
+        logger.error(
+            "DISCORD ERROR: %s",
+            e
+        )
+
+    return False
+
+
 # =========================================================
 # DISCORD FORMAT
 # =========================================================
+
 def format_signal(
     symbol,
-    result
+    result,
+    candle_time
 ):
-    master = result["master"]
-    entry = result["entry"]
-    now = thai_now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+
+    master = result[
+        "master"
+    ]
+
+    entry = result[
+        "entry"
+    ]
+
     final = result[
         "direction"
     ]
-    # -----------------------------------------------------
-    # FINAL ICON
-    # -----------------------------------------------------
-    if final == "CALL":
-        final_text = "🟢 CALL"
-    elif final == "PUT":
-        final_text = "🔴 PUT"
-    elif final == "PRE CALL":
-        final_text = "🟡 PRE CALL"
-    elif final == "PRE PUT":
-        final_text = "🟡 PRE PUT"
-    else:
-        final_text = "⚪ WAIT"
-    # -----------------------------------------------------
-    # MASTER
-    # -----------------------------------------------------
-    if master["direction"] == "CALL":
-        master_text = "🟢 CALL"
-    elif master["direction"] == "PUT":
-        master_text = "🔴 PUT"
-    elif master["direction"] == "PRE CALL":
-        master_text = "🟡 PRE CALL"
-    elif master["direction"] == "PRE PUT":
-        master_text = "🟡 PRE PUT"
-    else:
-        master_text = "⚪ WAIT"
-    # -----------------------------------------------------
-    # ENTRY
-    # -----------------------------------------------------
-    if entry["direction"] == "CALL":
-        entry_text = "🟢 CALL"
-    elif entry["direction"] == "PUT":
-        entry_text = "🔴 PUT"
-    elif entry["direction"] == "PRE CALL":
-        entry_text = "🟡 PRE CALL"
-    elif entry["direction"] == "PRE PUT":
-        entry_text = "🟡 PRE PUT"
-    else:
-        entry_text = "⚪ WAIT"
-    # -----------------------------------------------------
-    # GAP TEXT
-    # -----------------------------------------------------
-    master_gap = master["gap"]
-    entry_gap = entry["gap"]
-    master_gap_text = (
-        f"+{master_gap}"
-        if master_gap >= 0
-        else str(master_gap)
-    )
-    entry_gap_text = (
-        f"+{entry_gap}"
-        if entry_gap >= 0
-        else str(entry_gap)
-    )
-    # -----------------------------------------------------
-    # MESSAGE
-    # -----------------------------------------------------
-    message = (
-        f"**🔥 TRADEIFY V8 SYNC**\n"
-        f"`{symbol}`\n"
-        f"เวลา: `{now}`\n"
-        f"ราคา: `{entry['price']}`\n\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📊 **15M MASTER**\n"
-        f"ทิศทาง: **{master_text}**\n"
+
+    gap15 = master[
+        "gap"
+    ]
+
+    gap5 = entry[
+        "gap"
+    ]
+
+    return (
+        "🔥 **TRADEIFY V8 REAL FOREX**\n"
+        f"💱 `{symbol}`\n"
+        f"🕐 `{candle_time}`\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+
+        "📊 **15M MASTER**\n"
+        f"Direction: **{master['direction']}**\n"
         f"CALL Score: `{master['call_score']}`\n"
         f"PUT Score: `{master['put_score']}`\n"
-        f"Gap: `{master_gap_text}`\n"
-        f"EMA CALL: `{master['ema_call']}`\n"
-        f"EMA PUT: `{master['ema_put']}`\n"
-        f"Rejection CALL: "
-        f"`{master['bull_rejection']}`\n"
-        f"Rejection PUT: "
-        f"`{master['bear_rejection']}`\n\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 **5M ENTRY**\n"
-        f"ทิศทาง: **{entry_text}**\n"
+        f"GAP: `{gap15:+d}`\n"
+        f"RSI: `{master['rsi']:.2f}`\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+
+        "🎯 **5M ENTRY**\n"
+        f"Direction: **{entry['direction']}**\n"
         f"CALL Score: `{entry['call_score']}`\n"
         f"PUT Score: `{entry['put_score']}`\n"
-        f"Gap: `{entry_gap_text}`\n"
+        f"GAP: `{gap5:+d}`\n"
+        f"RSI: `{entry['rsi']:.2f}`\n"
         f"EMA CALL: `{entry['ema_call']}`\n"
         f"EMA PUT: `{entry['ema_put']}`\n"
         f"Rejection CALL: "
         f"`{entry['bull_rejection']}`\n"
         f"Rejection PUT: "
-        f"`{entry['bear_rejection']}`\n"
-        f"Pullback CALL: "
-        f"`{entry['pullback_call']}`\n"
-        f"Pullback PUT: "
-        f"`{entry['pullback_put']}`\n"
-        f"RSI: `{entry['rsi']:.2f}`\n\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🔥 **FINAL**\n"
-        f"**{final_text}**\n"
-        f"เหตุผล: `{result['reason']}`\n\n"
-        f"Score ขั้นต่ำ: `{MIN_SCORE}`\n"
-        f"Gap ขั้นต่ำ: `{MIN_GAP}`"
+        f"`{entry['bear_rejection']}`\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+
+        f"🚀 **FINAL: {final}**\n"
+        f"📝 `{result['reason']}`\n\n"
+
+        f"Minimum Score: `{MIN_SCORE}`\n"
+        f"Minimum GAP: `{MIN_GAP}`"
     )
-    return message
+
+
+# =========================================================
+# STARTUP
+# =========================================================
+
+def send_startup():
+
+    message = (
+        "🟢 **TRADEIFY V8 ONLINE**\n\n"
+        "ตลาด: **REAL FOREX**\n"
+        "Pairs: **20**\n"
+        "15M: MASTER\n"
+        "5M: ENTRY\n"
+        "Score/GAP: ON\n"
+        "Twelve Data: ON\n"
+        "Discord: ON\n"
+        "Railway: ONLINE"
+    )
+
+    send_discord(
+        message
+    )
+
+
+# =========================================================
+# HEARTBEAT
+# =========================================================
+
+def heartbeat():
+
+    global LAST_HEARTBEAT
+
+    now = time.time()
+
+    if (
+        now -
+        LAST_HEARTBEAT
+        < 900
+    ):
+
+        return
+
+    message = (
+        "💓 **TRADEIFY V8 HEARTBEAT**\n"
+        f"เวลา `{thai_now().strftime('%H:%M:%S')}`\n"
+        "20 REAL FOREX PAIRS\n"
+        "15M MASTER + 5M ENTRY\n"
+        "ระบบกำลังทำงาน"
+    )
+
+    if send_discord(
+        message
+    ):
+
+        LAST_HEARTBEAT = now
+
+
+# =========================================================
+# PROCESS SYMBOL
+# =========================================================
+
+def process_symbol(
+    symbol
+):
+
+    try:
+
+        now = thai_now()
+
+        # =================================================
+        # 5M REFRESH
+        # =================================================
+
+        df5, new5 = refresh_market(
+            symbol,
+            "5m"
+        )
+
+        # =================================================
+        # 15M REFRESH
+        #
+        # refresh ทุก 15 นาที
+        # =================================================
+
+        df15_cache = MARKET_CACHE.get(
+            (
+                symbol,
+                "15m"
+            )
+        )
+
+        new15 = False
+
+        if df15_cache is None:
+
+            df15, new15 = refresh_market(
+                symbol,
+                "15m"
+            )
+
+        else:
+
+            if (
+                now.minute % 15 == 0
+                and
+                now.second >= 5
+            ):
+
+                df15, new15 = refresh_market(
+                    symbol,
+                    "15m"
+                )
+
+            else:
+
+                df15 = df15_cache
+
+        # =================================================
+        # ONLY NEW 5M CANDLE
+        # =================================================
+
+        if not new5:
+
+            return
+
+        logger.info(
+            "NEW 5M CANDLE | %s",
+            symbol
+        )
+
+        # =================================================
+        # INDICATORS
+        # =================================================
+
+        df5 = add_indicators(
+            df5
+        )
+
+        df15 = add_indicators(
+            df15
+        )
+
+        # =================================================
+        # V8
+        # =================================================
+
+        result = calculate_v8_score(
+            df15,
+            df5
+        )
+
+        candle_time = (
+            get_closed_candle(
+                df5
+            )
+        )
+
+        # =================================================
+        # LOG
+        # =================================================
+
+        logger.info(
+            "V8 | %s | "
+            "15M=%s "
+            "CALL=%d "
+            "PUT=%d "
+            "GAP=%d | "
+            "5M=%s "
+            "CALL=%d "
+            "PUT=%d "
+            "GAP=%d | "
+            "FINAL=%s",
+
+            symbol,
+
+            result[
+                "master"
+            ][
+                "direction"
+            ],
+
+            result[
+                "master"
+            ][
+                "call_score"
+            ],
+
+            result[
+                "master"
+            ][
+                "put_score"
+            ],
+
+            result[
+                "master"
+            ][
+                "gap"
+            ],
+
+            result[
+                "entry"
+            ][
+                "direction"
+            ],
+
+            result[
+                "entry"
+            ][
+                "call_score"
+            ],
+
+            result[
+                "entry"
+            ][
+                "put_score"
+            ],
+
+            result[
+                "entry"
+            ][
+                "gap"
+            ],
+
+            result[
+                "direction"
+            ]
+        )
+
+        # =================================================
+        # DISCORD
+        #
+        # ส่งเฉพาะ PRE/CALL/PUT
+        # =================================================
+
+        final = result[
+            "direction"
+        ]
+
+        if final in (
+            "PRE CALL",
+            "PRE PUT",
+            "CALL",
+            "PUT"
+        ):
+
+            signal_key = (
+                symbol,
+                str(
+                    candle_time
+                ),
+                final
+            )
+
+            if signal_key not in LAST_SIGNAL:
+
+                message = format_signal(
+                    symbol,
+                    result,
+                    candle_time
+                )
+
+                if send_discord(
+                    message
+                ):
+
+                    LAST_SIGNAL[
+                        signal_key
+                    ] = time.time()
+
+        # =================================================
+        # CHECK LOG
+        # =================================================
+
+        LAST_CHECK[
+            symbol
+        ] = time.time()
+
+    except Exception as e:
+
+        logger.exception(
+            "SYMBOL ERROR | %s",
+            symbol
+        )
+
+        send_discord(
+            "⚠️ **TRADEIFY ERROR**\n"
+            f"Pair: `{symbol}`\n"
+            f"`{str(e)[:500]}`"
+        )
+
+
+# =========================================================
+# SCANNER
+# =========================================================
+
+def scanner_loop():
+
+    logger.info(
+        "========================================"
+    )
+
+    logger.info(
+        "TRADEIFY V8 REAL FOREX START"
+    )
+
+    logger.info(
+        "20 PAIRS"
+    )
+
+    logger.info(
+        "15M MASTER + 5M ENTRY"
+    )
+
+    logger.info(
+        "========================================"
+    )
+
+    send_startup()
+
+    while True:
+
+        start = time.time()
+
+        try:
+
+            for symbol in SYMBOLS:
+
+                process_symbol(
+                    symbol
+                )
+
+                # เว้นเล็กน้อย
+                # ลดการยิง API รวดเดียว
+                time.sleep(
+                    0.5
+                )
+
+            heartbeat()
+
+        except Exception as e:
+
+            logger.exception(
+                "SCANNER ERROR: %s",
+                e
+            )
+
+        elapsed = (
+            time.time()
+            -
+            start
+        )
+
+        sleep_time = max(
+            1,
+            SCAN_SECONDS -
+            elapsed
+        )
+
+        time.sleep(
+            sleep_time
+        )
+
+
+# =========================================================
+# RAILWAY HEALTH
+# =========================================================
+
+class HealthHandler(
+    BaseHTTPRequestHandler
+):
+
+    def do_GET(
+        self
+    ):
+
+        body = (
+            "TRADEIFY V8 ONLINE"
+        ).encode(
+            "utf-8"
+        )
+
+        self.send_response(
+            200
+        )
+
+        self.send_header(
+            "Content-Type",
+            "text/plain; charset=utf-8"
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(
+                len(body)
+            )
+        )
+
+        self.end_headers()
+
+        self.wfile.write(
+            body
+        )
+
+    def log_message(
+        self,
+        format,
+        *args
+    ):
+
+        return
+
+
+def health_server():
+
+    server = HTTPServer(
+        (
+            "0.0.0.0",
+            PORT
+        ),
+        HealthHandler
+    )
+
+    logger.info(
+        "RAILWAY PORT %s",
+        PORT
+    )
+
+    server.serve_forever()
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+
+    logger.info(
+        "========================================"
+    )
+
+    logger.info(
+        "TRADEIFY V8 START"
+    )
+
+    logger.info(
+        "MARKET: REAL FOREX"
+    )
+
+    logger.info(
+        "PAIRS: %d",
+        len(SYMBOLS)
+    )
+
+    logger.info(
+        "TWELVE DATA API: %s",
+        "SET"
+        if TWELVE_DATA_API_KEY
+        else "NOT SET"
+    )
+
+    logger.info(
+        "DISCORD: %s",
+        "SET"
+        if DISCORD_WEBHOOK_URL
+        else "NOT SET"
+    )
+
+    logger.info(
+        "PORT: %d",
+        PORT
+    )
+
+    logger.info(
+        "SCAN: %d seconds",
+        SCAN_SECONDS
+    )
+
+    logger.info(
+        "========================================"
+    )
+
+    if not TWELVE_DATA_API_KEY:
+
+        logger.error(
+            "TWELVE_DATA_API_KEY NOT SET"
+        )
+
+    if not DISCORD_WEBHOOK_URL:
+
+        logger.error(
+            "DISCORD_WEBHOOK_URL NOT SET"
+        )
+
+    # =====================================================
+    # HEALTH
+    # =====================================================
+
+    thread = threading.Thread(
+        target=health_server,
+        daemon=True
+    )
+
+    thread.start()
+
+    # =====================================================
+    # SCANNER
+    # =====================================================
+
+    scanner_loop()
+
+
+# =========================================================
+# RUN
+# =========================================================
+
+if __name__ == "__main__":
+
+    main()
