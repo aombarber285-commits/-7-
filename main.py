@@ -13,18 +13,19 @@ import requests
 
 
 # =========================================================
-# TRADEIFY V8 REAL FOREX
+# TRADEIFY V8.1 REAL FOREX
 # 20 PAIRS
-# 15M MASTER + 5M ENTRY
-# TWELVE DATA + DISCORD + RAILWAY
+# 5M DATA -> BUILD 15M
+# DISCORD RATE LIMIT PROTECTION
+# RAILWAY READY
 # =========================================================
 
 
-APP_NAME = "TRADEIFY V8 REAL FOREX"
+APP_NAME = "TRADEIFY V8.1"
 
 
 # =========================================================
-# RAILWAY VARIABLES
+# ENV
 # =========================================================
 
 TWELVE_DATA_API_KEY = os.getenv(
@@ -47,9 +48,15 @@ PORT = int(
 SCAN_SECONDS = int(
     os.getenv(
         "SCAN_SECONDS",
-        "15"
+        "30"
     )
 )
+
+# ส่งเฉพาะสัญญาณใหม่
+SEND_PRE = os.getenv(
+    "SEND_PRE",
+    "true"
+).lower() == "true"
 
 
 # =========================================================
@@ -76,7 +83,7 @@ SYMBOLS = [
     "AUDJPY",
     "AUDCAD",
     "AUDNZD",
-    "CADJPY"
+    "CADJPY",
 ]
 
 
@@ -111,7 +118,7 @@ TWELVE_DATA_URL = (
 
 
 # =========================================================
-# TIMEZONE
+# TIME
 # =========================================================
 
 THAI_TZ = timezone(
@@ -120,6 +127,7 @@ THAI_TZ = timezone(
 
 
 def thai_now():
+
     return datetime.now(
         THAI_TZ
     )
@@ -144,22 +152,26 @@ logger = logging.getLogger(
 
 
 # =========================================================
-# CACHE
+# MEMORY
 # =========================================================
 
 MARKET_CACHE = {}
 
-LAST_CLOSED_CANDLE = {}
-
 LAST_SIGNAL = {}
 
-LAST_CHECK = {}
+LAST_5M_CANDLE = None
+
+LAST_API_CALL = 0
 
 LAST_HEARTBEAT = 0
 
+DISCORD_LOCK = threading.Lock()
+
+API_LOCK = threading.Lock()
+
 
 # =========================================================
-# SYMBOL CONVERTER
+# SYMBOL
 # =========================================================
 
 def normalize_symbol(
@@ -192,7 +204,7 @@ def normalize_symbol(
 
 
 # =========================================================
-# INTERVAL CONVERTER
+# INTERVAL
 # =========================================================
 
 def normalize_interval(
@@ -213,95 +225,174 @@ def normalize_interval(
 
         "4h": "4h",
 
-        "1d": "1day"
+        "1d": "1day",
 
     }
 
     return mapping.get(
         str(
             timeframe
-        ).lower().strip(),
+        ).lower(),
         timeframe
     )
 
 
 # =========================================================
-# GET MARKET DATA
+# API RETRY
 # =========================================================
 
-def get_market_data(
-    symbol,
-    timeframe,
-    limit=200
+def api_get(
+    params,
+    retries=4
 ):
+
+    global LAST_API_CALL
+
+    with API_LOCK:
+
+        # กันยิงติดกันเกินไป
+        now = time.time()
+
+        wait = (
+            2.0 -
+            (
+                now -
+                LAST_API_CALL
+            )
+        )
+
+        if wait > 0:
+
+            time.sleep(
+                wait
+            )
+
+        for attempt in range(
+            retries
+        ):
+
+            try:
+
+                response = requests.get(
+                    TWELVE_DATA_URL,
+                    params=params,
+                    timeout=30
+                )
+
+                LAST_API_CALL = (
+                    time.time()
+                )
+
+                if response.status_code == 429:
+
+                    retry_after = (
+                        5 *
+                        (
+                            attempt + 1
+                        )
+                    )
+
+                    logger.warning(
+                        "Twelve Data 429 "
+                        "retry in %ss",
+                        retry_after
+                    )
+
+                    time.sleep(
+                        retry_after
+                    )
+
+                    continue
+
+                if response.status_code != 200:
+
+                    raise RuntimeError(
+                        "HTTP "
+                        +
+                        str(
+                            response.status_code
+                        )
+                        +
+                        " "
+                        +
+                        response.text[
+                            :300
+                        ]
+                    )
+
+                return response.json()
+
+            except requests.RequestException as e:
+
+                logger.warning(
+                    "API connection error: %s",
+                    e
+                )
+
+                time.sleep(
+                    2 *
+                    (
+                        attempt + 1
+                    )
+                )
+
+        raise RuntimeError(
+            "Twelve Data request failed"
+        )
+
+
+# =========================================================
+# FETCH BATCH 5M
+# =========================================================
+
+def get_market_data_batch():
 
     if not TWELVE_DATA_API_KEY:
 
         raise RuntimeError(
             "ไม่พบ TWELVE_DATA_API_KEY "
-            "ใน Railway Variables"
+            "กรุณาเพิ่มใน Railway Variables"
         )
 
-    td_symbol = normalize_symbol(
-        symbol
-    )
-
-    interval = normalize_interval(
-        timeframe
+    symbols = ",".join(
+        normalize_symbol(
+            s
+        )
+        for s in SYMBOLS
     )
 
     params = {
 
         "symbol":
-            td_symbol,
+            symbols,
 
         "interval":
-            interval,
+            "5min",
 
         "outputsize":
-            int(limit),
+            220,
 
         "timezone":
             "Asia/Bangkok",
 
         "apikey":
-            TWELVE_DATA_API_KEY
+            TWELVE_DATA_API_KEY,
     }
 
-    try:
+    data = api_get(
+        params
+    )
 
-        response = requests.get(
-            TWELVE_DATA_URL,
-            params=params,
-            timeout=20
+    if (
+        isinstance(
+            data,
+            dict
         )
-
-    except requests.RequestException as e:
-
-        raise RuntimeError(
-            f"Twelve Data connection error: {e}"
-        )
-
-    if response.status_code != 200:
-
-        raise RuntimeError(
-            f"Twelve Data HTTP "
-            f"{response.status_code}"
-        )
-
-    try:
-
-        data = response.json()
-
-    except Exception:
-
-        raise RuntimeError(
-            "Twelve Data JSON ERROR"
-        )
-
-    if data.get(
-        "status"
-    ) == "error":
+        and
+        data.get(
+            "status"
+        ) == "error"
+    ):
 
         raise RuntimeError(
             "Twelve Data ERROR: "
@@ -314,50 +405,128 @@ def get_market_data(
             )
         )
 
-    values = data.get(
+    result = {}
+
+    # =====================================================
+    # Batch response
+    # =====================================================
+
+    if all(
+        isinstance(
+            v,
+            dict
+        )
+        for v in data.values()
+    ):
+
+        for symbol_key, payload in data.items():
+
+            if not isinstance(
+                payload,
+                dict
+            ):
+
+                continue
+
+            values = payload.get(
+                "values"
+            )
+
+            if not values:
+
+                continue
+
+            df = build_dataframe(
+                values
+            )
+
+            if df is not None:
+
+                clean_name = (
+                    symbol_key
+                    .replace(
+                        "/",
+                        ""
+                    )
+                    .upper()
+                )
+
+                result[
+                    clean_name
+                ] = df
+
+    # =====================================================
+    # Single response fallback
+    # =====================================================
+
+    elif data.get(
         "values"
-    )
+    ):
 
-    if not values:
-
-        raise RuntimeError(
-            f"ไม่มีข้อมูล {td_symbol}"
+        df = build_dataframe(
+            data[
+                "values"
+            ]
         )
 
-    df = pd.DataFrame(
-        values
-    )
+        if df is not None:
+
+            for symbol in SYMBOLS:
+
+                result[
+                    symbol
+                ] = df
+
+    if not result:
+
+        raise RuntimeError(
+            "Twelve Data ไม่ส่งข้อมูล "
+            "20 คู่กลับมา"
+        )
+
+    return result
+
+
+# =========================================================
+# DATAFRAME
+# =========================================================
+
+def build_dataframe(
+    values
+):
 
     required = [
         "datetime",
         "open",
         "high",
         "low",
-        "close"
+        "close",
     ]
 
-    for column in required:
+    df = pd.DataFrame(
+        values
+    )
 
-        if column not in df.columns:
+    for col in required:
 
-            raise RuntimeError(
-                f"ขาด column {column}"
-            )
+        if col not in df.columns:
+
+            return None
 
     df["datetime"] = pd.to_datetime(
         df["datetime"],
         errors="coerce"
     )
 
-    for column in [
+    for col in [
         "open",
         "high",
         "low",
-        "close"
+        "close",
     ]:
 
-        df[column] = pd.to_numeric(
-            df[column],
+        df[col] = pd.to_numeric(
+            df[col],
             errors="coerce"
         )
 
@@ -369,16 +538,19 @@ def get_market_data(
         "datetime"
     )
 
+    df = df.drop_duplicates(
+        subset=[
+            "datetime"
+        ]
+    )
+
     df = df.reset_index(
         drop=True
     )
 
-    if len(df) < 85:
+    if len(df) < 100:
 
-        raise RuntimeError(
-            f"{td_symbol} {interval} "
-            f"ข้อมูลไม่พอ: {len(df)}"
-        )
+        return None
 
     return df[
         required
@@ -386,83 +558,116 @@ def get_market_data(
 
 
 # =========================================================
-# CLOSED CANDLE
+# BUILD 15M FROM 5M
 # =========================================================
 
-def get_closed_candle(
-    df
+def build_15m_from_5m(
+    df5
 ):
 
-    if len(df) < 2:
+    df = df5.copy()
 
-        return None
+    df["datetime"] = pd.to_datetime(
+        df["datetime"]
+    )
 
-    return df[
+    df = df.set_index(
         "datetime"
-    ].iloc[-2]
+    )
+
+    df15 = df.resample(
+        "15min",
+        label="left",
+        closed="left"
+    ).agg({
+
+        "open":
+            "first",
+
+        "high":
+            "max",
+
+        "low":
+            "min",
+
+        "close":
+            "last",
+
+    })
+
+    df15 = df15.dropna()
+
+    df15 = df15.reset_index()
+
+    return df15
 
 
 # =========================================================
-# FETCH / CACHE
+# REMOVE INCOMPLETE CANDLE
 # =========================================================
 
-def refresh_market(
-    symbol,
-    timeframe
+def remove_incomplete_candle(
+    df,
+    minutes
 ):
 
-    key = (
-        symbol,
-        timeframe
+    if df.empty:
+
+        return df
+
+    now = thai_now()
+
+    current_bucket = (
+        now.replace(
+            minute=(
+                now.minute //
+                minutes
+            ) *
+            minutes,
+            second=0,
+            microsecond=0
+        )
     )
 
-    old_df = MARKET_CACHE.get(
-        key
+    df = df.copy()
+
+    df["datetime"] = pd.to_datetime(
+        df["datetime"]
     )
 
-    df = get_market_data(
-        symbol,
-        timeframe,
-        200
-    )
+    # datetime จาก Twelve Data
+    # ไม่มี timezone -> ตีความเป็น Bangkok
+    if df["datetime"].dt.tz is None:
 
-    MARKET_CACHE[key] = (
-        df.copy()
-    )
-
-    old_candle = None
-
-    if old_df is not None:
-
-        old_candle = (
-            get_closed_candle(
-                old_df
+        df["datetime"] = (
+            df["datetime"]
+            .dt.tz_localize(
+                THAI_TZ
             )
         )
 
-    new_candle = (
-        get_closed_candle(
-            df
+    else:
+
+        df["datetime"] = (
+            df["datetime"]
+            .dt.tz_convert(
+                THAI_TZ
+            )
         )
-    )
 
-    changed = (
-        old_candle !=
-        new_candle
+    return df[
+        df["datetime"] <
+        current_bucket
+    ].reset_index(
+        drop=True
     )
-
-    LAST_CLOSED_CANDLE[key] = (
-        new_candle
-    )
-
-    return df, changed
 
 
 # =========================================================
 # EMA
 # =========================================================
 
-def calculate_ema(
+def ema(
     series,
     period
 ):
@@ -477,7 +682,7 @@ def calculate_ema(
 # RSI
 # =========================================================
 
-def calculate_rsi(
+def rsi(
     series,
     period=14
 ):
@@ -510,15 +715,18 @@ def calculate_rsi(
         )
     )
 
-    result = (
+    value = (
         100 -
         (
             100 /
-            (1 + rs)
+            (
+                1 +
+                rs
+            )
         )
     )
 
-    return result.fillna(
+    return value.fillna(
         50
     )
 
@@ -533,53 +741,46 @@ def add_indicators(
 
     df = df.copy()
 
-    df["ema_fast"] = (
-        calculate_ema(
-            df["close"],
-            EMA_FAST_LEN
-        )
+    df["ema_fast"] = ema(
+        df["close"],
+        EMA_FAST_LEN
     )
 
-    df["ema_slow"] = (
-        calculate_ema(
-            df["close"],
-            EMA_SLOW_LEN
-        )
+    df["ema_slow"] = ema(
+        df["close"],
+        EMA_SLOW_LEN
     )
 
-    df["ema_trend"] = (
-        calculate_ema(
-            df["close"],
-            EMA_TREND_LEN
-        )
+    df["ema_trend"] = ema(
+        df["close"],
+        EMA_TREND_LEN
     )
 
-    df["rsi"] = (
-        calculate_rsi(
-            df["close"],
-            RSI_PERIOD
-        )
+    df["rsi"] = rsi(
+        df["close"],
+        RSI_PERIOD
     )
 
     return df
 
 
 # =========================================================
-# V8 SCORE ENGINE
+# SCORE
 # =========================================================
 
-def calculate_tf_score(
+def calculate_score(
     df
 ):
 
     if len(df) < 85:
 
         raise ValueError(
-            "V8 DATA NOT ENOUGH"
+            "ข้อมูลไม่พอสำหรับ V8"
         )
 
-    i = -2
-    p = -3
+    # ปิดแล้ว
+    i = -1
+    p = -2
 
     o = float(
         df["open"].iloc[i]
@@ -690,10 +891,6 @@ def calculate_tf_score(
         0.00000001
     )
 
-    body = abs(
-        c - o
-    )
-
     upper_wick = (
         h -
         max(
@@ -737,15 +934,15 @@ def calculate_tf_score(
     # =====================================================
 
     c1 = float(
-        df["close"].iloc[-2]
+        df["close"].iloc[-1]
     )
 
     c2 = float(
-        df["close"].iloc[-3]
+        df["close"].iloc[-2]
     )
 
     c3 = float(
-        df["close"].iloc[-4]
+        df["close"].iloc[-3]
     )
 
     flow_up = (
@@ -761,29 +958,23 @@ def calculate_tf_score(
     )
 
     # =====================================================
-    # SUPPORT RESISTANCE
+    # SR
     # =====================================================
 
-    history = df.iloc[:-1]
+    history = df.iloc[
+        :-1
+    ]
+
+    recent = history.tail(
+        SR_PERIOD
+    )
 
     support = float(
-        history[
-            "low"
-        ]
-        .tail(
-            SR_PERIOD
-        )
-        .min()
+        recent["low"].min()
     )
 
     resistance = float(
-        history[
-            "high"
-        ]
-        .tail(
-            SR_PERIOD
-        )
-        .max()
+        recent["high"].max()
     )
 
     sr_range = max(
@@ -855,6 +1046,7 @@ def calculate_tf_score(
     # =====================================================
 
     call_score = 0
+
     put_score = 0
 
     if trend_call:
@@ -910,11 +1102,9 @@ def calculate_tf_score(
     # =====================================================
 
     if near_resistance:
-
         call_score -= 8
 
     if near_support:
-
         put_score -= 8
 
     # =====================================================
@@ -941,10 +1131,6 @@ def calculate_tf_score(
         )
     )
 
-    # =====================================================
-    # GAP
-    # =====================================================
-
     gap = (
         call_score -
         put_score
@@ -965,7 +1151,7 @@ def calculate_tf_score(
     elif (
         put_score >= MIN_SCORE
         and
-        -gap >= MIN_GAP
+        gap <= -MIN_GAP
     ):
 
         direction = "PUT"
@@ -981,7 +1167,7 @@ def calculate_tf_score(
     elif (
         put_score >= PRE_SCORE
         and
-        -gap >= MIN_GAP
+        gap <= -MIN_GAP
     ):
 
         direction = "PRE PUT"
@@ -1040,12 +1226,6 @@ def calculate_tf_score(
         "near_resistance":
             near_resistance,
 
-        "room_call":
-            room_call,
-
-        "room_put":
-            room_put,
-
         "rsi":
             rsi_value,
 
@@ -1056,33 +1236,35 @@ def calculate_tf_score(
             support,
 
         "resistance":
-            resistance
+            resistance,
     }
 
 
 # =========================================================
-# MASTER + ENTRY
+# V8 MASTER + ENTRY
 # =========================================================
 
-def calculate_v8_score(
+def analyze_v8(
     df15,
     df5
 ):
 
-    master = calculate_tf_score(
+    master = calculate_score(
         df15
     )
 
-    entry = calculate_tf_score(
+    entry = calculate_score(
         df5
     )
 
     master_call = (
-        master["direction"] == "CALL"
+        master["direction"]
+        == "CALL"
     )
 
     master_put = (
-        master["direction"] == "PUT"
+        master["direction"]
+        == "PUT"
     )
 
     entry_call = (
@@ -1103,8 +1285,8 @@ def calculate_v8_score(
         entry["put_score"]
         >= MIN_SCORE
         and
-        -entry["gap"]
-        >= MIN_GAP
+        entry["gap"]
+        <= -MIN_GAP
         and
         entry["ema_put"]
         and
@@ -1126,10 +1308,6 @@ def calculate_v8_score(
             and
             entry["flow_down"]
         )
-
-    # =====================================================
-    # FINAL
-    # =====================================================
 
     final = "WAIT"
 
@@ -1197,32 +1375,6 @@ def calculate_v8_score(
             "5M กำลังยืนยัน"
         )
 
-    elif (
-        master_call
-        and
-        entry["direction"] == "PUT"
-    ):
-
-        final = "WAIT"
-
-        reason = (
-            "15M CALL / "
-            "5M PUT BLOCK"
-        )
-
-    elif (
-        master_put
-        and
-        entry["direction"] == "CALL"
-    ):
-
-        final = "WAIT"
-
-        reason = (
-            "15M PUT / "
-            "5M CALL BLOCK"
-        )
-
     return {
 
         "direction":
@@ -1235,12 +1387,12 @@ def calculate_v8_score(
             master,
 
         "entry":
-            entry
+            entry,
     }
 
 
 # =========================================================
-# DISCORD
+# DISCORD SAFE SEND
 # =========================================================
 
 def send_discord(
@@ -1249,47 +1401,99 @@ def send_discord(
 
     if not DISCORD_WEBHOOK_URL:
 
-        logger.error(
-            "DISCORD_WEBHOOK_URL NOT SET"
+        logger.warning(
+            "Discord webhook not set"
         )
 
         return False
 
-    try:
+    with DISCORD_LOCK:
 
-        response = requests.post(
-            DISCORD_WEBHOOK_URL,
-            json={
-                "content": message
-            },
-            timeout=15
-        )
-
-        if response.status_code in (
-            200,
-            204
+        for attempt in range(
+            4
         ):
 
-            logger.info(
-                "DISCORD SENT"
-            )
+            try:
 
-            return True
+                response = requests.post(
+                    DISCORD_WEBHOOK_URL,
+                    json={
+                        "content":
+                            message
+                    },
+                    timeout=15
+                )
 
-        logger.error(
-            "DISCORD ERROR %s | %s",
-            response.status_code,
-            response.text[:300]
-        )
+                if response.status_code in (
+                    200,
+                    204
+                ):
 
-    except Exception as e:
+                    logger.info(
+                        "DISCORD SENT"
+                    )
 
-        logger.error(
-            "DISCORD ERROR: %s",
-            e
-        )
+                    return True
 
-    return False
+                if response.status_code == 429:
+
+                    try:
+
+                        payload = (
+                            response.json()
+                        )
+
+                        retry_after = float(
+                            payload.get(
+                                "retry_after",
+                                2
+                            )
+                        )
+
+                    except Exception:
+
+                        retry_after = 2
+
+                    retry_after = min(
+                        max(
+                            retry_after,
+                            1
+                        ),
+                        30
+                    )
+
+                    logger.warning(
+                        "DISCORD 429 | "
+                        "sleep %.2fs",
+                        retry_after
+                    )
+
+                    time.sleep(
+                        retry_after
+                    )
+
+                    continue
+
+                logger.error(
+                    "DISCORD ERROR %s | %s",
+                    response.status_code,
+                    response.text[:300]
+                )
+
+                return False
+
+            except requests.RequestException as e:
+
+                logger.error(
+                    "DISCORD CONNECTION ERROR: %s",
+                    e
+                )
+
+                time.sleep(
+                    2
+                )
+
+        return False
 
 
 # =========================================================
@@ -1310,54 +1514,36 @@ def format_signal(
         "entry"
     ]
 
-    final = result[
-        "direction"
-    ]
-
-    gap15 = master[
-        "gap"
-    ]
-
-    gap5 = entry[
-        "gap"
-    ]
-
     return (
-        "🔥 **TRADEIFY V8 REAL FOREX**\n"
+        "🔥 **TRADEIFY V8.1 REAL FOREX**\n"
         f"💱 `{symbol}`\n"
         f"🕐 `{candle_time}`\n\n"
 
         "━━━━━━━━━━━━━━━━━━\n"
 
         "📊 **15M MASTER**\n"
-        f"Direction: **{master['direction']}**\n"
+        f"Direction: **"
+        f"{master['direction']}**\n"
         f"CALL Score: `{master['call_score']}`\n"
         f"PUT Score: `{master['put_score']}`\n"
-        f"GAP: `{gap15:+d}`\n"
+        f"GAP: `{master['gap']:+d}`\n"
         f"RSI: `{master['rsi']:.2f}`\n\n"
 
         "━━━━━━━━━━━━━━━━━━\n"
 
         "🎯 **5M ENTRY**\n"
-        f"Direction: **{entry['direction']}**\n"
+        f"Direction: **"
+        f"{entry['direction']}**\n"
         f"CALL Score: `{entry['call_score']}`\n"
         f"PUT Score: `{entry['put_score']}`\n"
-        f"GAP: `{gap5:+d}`\n"
-        f"RSI: `{entry['rsi']:.2f}`\n"
-        f"EMA CALL: `{entry['ema_call']}`\n"
-        f"EMA PUT: `{entry['ema_put']}`\n"
-        f"Rejection CALL: "
-        f"`{entry['bull_rejection']}`\n"
-        f"Rejection PUT: "
-        f"`{entry['bear_rejection']}`\n\n"
+        f"GAP: `{entry['gap']:+d}`\n"
+        f"RSI: `{entry['rsi']:.2f}`\n\n"
 
         "━━━━━━━━━━━━━━━━━━\n"
 
-        f"🚀 **FINAL: {final}**\n"
-        f"📝 `{result['reason']}`\n\n"
-
-        f"Minimum Score: `{MIN_SCORE}`\n"
-        f"Minimum GAP: `{MIN_GAP}`"
+        f"🚀 **FINAL: "
+        f"{result['direction']}**\n"
+        f"📝 `{result['reason']}`"
     )
 
 
@@ -1365,22 +1551,18 @@ def format_signal(
 # STARTUP
 # =========================================================
 
-def send_startup():
+def startup_message():
 
-    message = (
-        "🟢 **TRADEIFY V8 ONLINE**\n\n"
+    return (
+        "🟢 **TRADEIFY V8.1 ONLINE**\n\n"
         "ตลาด: **REAL FOREX**\n"
         "Pairs: **20**\n"
-        "15M: MASTER\n"
-        "5M: ENTRY\n"
-        "Score/GAP: ON\n"
-        "Twelve Data: ON\n"
-        "Discord: ON\n"
-        "Railway: ONLINE"
-    )
-
-    send_discord(
-        message
+        "Data: **Twelve Data Batch**\n"
+        "5M: **ENTRY**\n"
+        "15M: **BUILT FROM 5M**\n"
+        "Score/GAP: **ON**\n"
+        "Discord Rate Limit Guard: **ON**\n"
+        "Railway: **ONLINE**"
     )
 
 
@@ -1402,253 +1584,319 @@ def heartbeat():
 
         return
 
-    message = (
-        "💓 **TRADEIFY V8 HEARTBEAT**\n"
-        f"เวลา `{thai_now().strftime('%H:%M:%S')}`\n"
-        "20 REAL FOREX PAIRS\n"
-        "15M MASTER + 5M ENTRY\n"
-        "ระบบกำลังทำงาน"
-    )
-
     if send_discord(
-        message
+        "💓 **TRADEIFY V8.1 HEARTBEAT**\n"
+        f"เวลา `{thai_now().strftime('%Y-%m-%d %H:%M:%S')}`\n"
+        "20 REAL FOREX PAIRS\n"
+        "5M ENTRY + 15M MASTER\n"
+        "ระบบกำลังทำงาน"
     ):
 
         LAST_HEARTBEAT = now
 
 
 # =========================================================
-# PROCESS SYMBOL
+# PROCESS ALL
 # =========================================================
 
-def process_symbol(
-    symbol
-):
+def process_market():
 
-    try:
+    global LAST_5M_CANDLE
 
-        now = thai_now()
+    # =====================================================
+    # API BATCH
+    # =====================================================
 
-        # =================================================
-        # 5M REFRESH
-        # =================================================
+    batch = get_market_data_batch()
 
-        df5, new5 = refresh_market(
-            symbol,
-            "5m"
+    if not batch:
+
+        raise RuntimeError(
+            "Batch data empty"
         )
 
-        # =================================================
-        # 15M REFRESH
-        #
-        # refresh ทุก 15 นาที
-        # =================================================
+    # =====================================================
+    # หาแท่ง 5M ล่าสุดร่วม
+    # =====================================================
 
-        df15_cache = MARKET_CACHE.get(
-            (
-                symbol,
-                "15m"
-            )
-        )
+    newest_times = []
 
-        new15 = False
+    for symbol in SYMBOLS:
 
-        if df15_cache is None:
-
-            df15, new15 = refresh_market(
-                symbol,
-                "15m"
-            )
-
-        else:
-
-            if (
-                now.minute % 15 == 0
-                and
-                now.second >= 5
-            ):
-
-                df15, new15 = refresh_market(
-                    symbol,
-                    "15m"
-                )
-
-            else:
-
-                df15 = df15_cache
-
-        # =================================================
-        # ONLY NEW 5M CANDLE
-        # =================================================
-
-        if not new5:
-
-            return
-
-        logger.info(
-            "NEW 5M CANDLE | %s",
+        df = batch.get(
             symbol
         )
 
-        # =================================================
-        # INDICATORS
-        # =================================================
+        if df is None:
 
-        df5 = add_indicators(
-            df5
+            continue
+
+        df = remove_incomplete_candle(
+            df,
+            5
         )
 
-        df15 = add_indicators(
-            df15
+        if df.empty:
+
+            continue
+
+        newest_times.append(
+            df[
+                "datetime"
+            ].iloc[-1]
         )
 
-        # =================================================
-        # V8
-        # =================================================
+    if not newest_times:
 
-        result = calculate_v8_score(
-            df15,
-            df5
+        return
+
+    current_candle = max(
+        newest_times
+    )
+
+    # =====================================================
+    # ไม่ใช่แท่งใหม่
+    # =====================================================
+
+    if (
+        LAST_5M_CANDLE is not None
+        and
+        current_candle ==
+        LAST_5M_CANDLE
+    ):
+
+        logger.info(
+            "NO NEW 5M CANDLE | "
+            "API DATA CACHED"
         )
 
-        candle_time = (
-            get_closed_candle(
+        return
+
+    LAST_5M_CANDLE = (
+        current_candle
+    )
+
+    logger.info(
+        "NEW 5M CANDLE | %s",
+        current_candle
+    )
+
+    # =====================================================
+    # PROCESS 20 PAIRS
+    # =====================================================
+
+    signals = []
+
+    for symbol in SYMBOLS:
+
+        try:
+
+            df5 = batch.get(
+                symbol
+            )
+
+            if df5 is None:
+
+                logger.warning(
+                    "%s | NO DATA",
+                    symbol
+                )
+
+                continue
+
+            df5 = remove_incomplete_candle(
+                df5,
+                5
+            )
+
+            if len(df5) < 100:
+
+                logger.warning(
+                    "%s | DATA < 100",
+                    symbol
+                )
+
+                continue
+
+            # =================================================
+            # 15M
+            # =================================================
+
+            df15 = build_15m_from_5m(
                 df5
             )
-        )
 
-        # =================================================
-        # LOG
-        # =================================================
-
-        logger.info(
-            "V8 | %s | "
-            "15M=%s "
-            "CALL=%d "
-            "PUT=%d "
-            "GAP=%d | "
-            "5M=%s "
-            "CALL=%d "
-            "PUT=%d "
-            "GAP=%d | "
-            "FINAL=%s",
-
-            symbol,
-
-            result[
-                "master"
-            ][
-                "direction"
-            ],
-
-            result[
-                "master"
-            ][
-                "call_score"
-            ],
-
-            result[
-                "master"
-            ][
-                "put_score"
-            ],
-
-            result[
-                "master"
-            ][
-                "gap"
-            ],
-
-            result[
-                "entry"
-            ][
-                "direction"
-            ],
-
-            result[
-                "entry"
-            ][
-                "call_score"
-            ],
-
-            result[
-                "entry"
-            ][
-                "put_score"
-            ],
-
-            result[
-                "entry"
-            ][
-                "gap"
-            ],
-
-            result[
-                "direction"
-            ]
-        )
-
-        # =================================================
-        # DISCORD
-        #
-        # ส่งเฉพาะ PRE/CALL/PUT
-        # =================================================
-
-        final = result[
-            "direction"
-        ]
-
-        if final in (
-            "PRE CALL",
-            "PRE PUT",
-            "CALL",
-            "PUT"
-        ):
-
-            signal_key = (
-                symbol,
-                str(
-                    candle_time
-                ),
-                final
+            df15 = remove_incomplete_candle(
+                df15,
+                15
             )
 
-            if signal_key not in LAST_SIGNAL:
+            if len(df15) < 85:
 
-                message = format_signal(
-                    symbol,
-                    result,
-                    candle_time
+                logger.warning(
+                    "%s | 15M DATA < 85",
+                    symbol
                 )
 
-                if send_discord(
-                    message
-                ):
+                continue
 
-                    LAST_SIGNAL[
-                        signal_key
-                    ] = time.time()
+            # =================================================
+            # INDICATORS
+            # =================================================
 
-        # =================================================
-        # CHECK LOG
-        # =================================================
+            df5 = add_indicators(
+                df5
+            )
 
-        LAST_CHECK[
-            symbol
-        ] = time.time()
+            df15 = add_indicators(
+                df15
+            )
 
-    except Exception as e:
+            # =================================================
+            # ANALYZE
+            # =================================================
 
-        logger.exception(
-            "SYMBOL ERROR | %s",
-            symbol
+            result = analyze_v8(
+                df15,
+                df5
+            )
+
+            master = result[
+                "master"
+            ]
+
+            entry = result[
+                "entry"
+            ]
+
+            logger.info(
+                (
+                    "V8.1 | %s | "
+                    "15M=%s "
+                    "S=%d/%d "
+                    "G=%+d | "
+                    "5M=%s "
+                    "S=%d/%d "
+                    "G=%+d | "
+                    "FINAL=%s"
+                ),
+                symbol,
+
+                master[
+                    "direction"
+                ],
+
+                master[
+                    "call_score"
+                ],
+
+                master[
+                    "put_score"
+                ],
+
+                master[
+                    "gap"
+                ],
+
+                entry[
+                    "direction"
+                ],
+
+                entry[
+                    "call_score"
+                ],
+
+                entry[
+                    "put_score"
+                ],
+
+                entry[
+                    "gap"
+                ],
+
+                result[
+                    "direction"
+                ]
+            )
+
+            final = result[
+                "direction"
+            ]
+
+            if final in (
+                "CALL",
+                "PUT"
+            ) or (
+                SEND_PRE
+                and
+                final in (
+                    "PRE CALL",
+                    "PRE PUT"
+                )
+            ):
+
+                candle_time = (
+                    df5[
+                        "datetime"
+                    ].iloc[-1]
+                )
+
+                signal_id = (
+                    symbol,
+                    str(
+                        candle_time
+                    ),
+                    final
+                )
+
+                if signal_id not in LAST_SIGNAL:
+
+                    signals.append(
+                        (
+                            symbol,
+                            result,
+                            candle_time,
+                            signal_id
+                        )
+                    )
+
+        except Exception as e:
+
+            logger.exception(
+                "%s ANALYZE ERROR: %s",
+                symbol,
+                e
+            )
+
+    # =====================================================
+    # DISCORD
+    # =====================================================
+
+    for (
+        symbol,
+        result,
+        candle_time,
+        signal_id
+    ) in signals:
+
+        message = format_signal(
+            symbol,
+            result,
+            candle_time
         )
 
-        send_discord(
-            "⚠️ **TRADEIFY ERROR**\n"
-            f"Pair: `{symbol}`\n"
-            f"`{str(e)[:500]}`"
-        )
+        if send_discord(
+            message
+        ):
+
+            LAST_SIGNAL[
+                signal_id
+            ] = time.time()
+
+            # กัน Discord 429
+            time.sleep(
+                1.2
+            )
 
 
 # =========================================================
@@ -1662,60 +1910,61 @@ def scanner_loop():
     )
 
     logger.info(
-        "TRADEIFY V8 REAL FOREX START"
+        "TRADEIFY V8.1 START"
     )
 
     logger.info(
-        "20 PAIRS"
+        "MARKET: REAL FOREX"
     )
 
     logger.info(
-        "15M MASTER + 5M ENTRY"
+        "PAIRS: %d",
+        len(SYMBOLS)
+    )
+
+    logger.info(
+        "5M DATA -> 15M AGGREGATION"
+    )
+
+    logger.info(
+        "DISCORD RATE LIMIT GUARD: ON"
     )
 
     logger.info(
         "========================================"
     )
 
-    send_startup()
+    send_discord(
+        startup_message()
+    )
 
     while True:
 
-        start = time.time()
+        started = time.time()
 
         try:
 
-            for symbol in SYMBOLS:
-
-                process_symbol(
-                    symbol
-                )
-
-                # เว้นเล็กน้อย
-                # ลดการยิง API รวดเดียว
-                time.sleep(
-                    0.5
-                )
+            process_market()
 
             heartbeat()
 
         except Exception as e:
 
             logger.exception(
-                "SCANNER ERROR: %s",
+                "MARKET DATA ERROR: %s",
                 e
             )
 
         elapsed = (
             time.time()
             -
-            start
+            started
         )
 
         sleep_time = max(
-            1,
             SCAN_SECONDS -
-            elapsed
+            elapsed,
+            5
         )
 
         time.sleep(
@@ -1736,7 +1985,7 @@ class HealthHandler(
     ):
 
         body = (
-            "TRADEIFY V8 ONLINE"
+            "TRADEIFY V8.1 ONLINE"
         ).encode(
             "utf-8"
         )
@@ -1783,7 +2032,7 @@ def health_server():
     )
 
     logger.info(
-        "RAILWAY PORT %s",
+        "RAILWAY HEALTH PORT: %s",
         PORT
     )
 
@@ -1801,40 +2050,36 @@ def main():
     )
 
     logger.info(
-        "TRADEIFY V8 START"
+        "TRADEIFY V8.1 START"
     )
 
     logger.info(
-        "MARKET: REAL FOREX"
-    )
-
-    logger.info(
-        "PAIRS: %d",
-        len(SYMBOLS)
-    )
-
-    logger.info(
-        "TWELVE DATA API: %s",
+        "API KEY: %s",
         "SET"
         if TWELVE_DATA_API_KEY
         else "NOT SET"
     )
 
     logger.info(
-        "DISCORD: %s",
+        "Discord: %s",
         "SET"
         if DISCORD_WEBHOOK_URL
         else "NOT SET"
     )
 
     logger.info(
-        "PORT: %d",
+        "Port: %s",
         PORT
     )
 
     logger.info(
-        "SCAN: %d seconds",
+        "Scan: %s seconds",
         SCAN_SECONDS
+    )
+
+    logger.info(
+        "Pairs: %s",
+        len(SYMBOLS)
     )
 
     logger.info(
@@ -1844,18 +2089,15 @@ def main():
     if not TWELVE_DATA_API_KEY:
 
         logger.error(
+            "MARKET DATA DISABLED: "
             "TWELVE_DATA_API_KEY NOT SET"
         )
 
     if not DISCORD_WEBHOOK_URL:
 
-        logger.error(
+        logger.warning(
             "DISCORD_WEBHOOK_URL NOT SET"
         )
-
-    # =====================================================
-    # HEALTH
-    # =====================================================
 
     thread = threading.Thread(
         target=health_server,
@@ -1863,10 +2105,6 @@ def main():
     )
 
     thread.start()
-
-    # =====================================================
-    # SCANNER
-    # =====================================================
 
     scanner_loop()
 
